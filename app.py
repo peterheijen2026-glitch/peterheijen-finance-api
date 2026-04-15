@@ -262,6 +262,19 @@ Hieronder staan {len(df)} banktransacties.
 6. INTERNE VERSCHUIVINGEN:
    - Overboekingen eigen rekeningen (tussen eigen privé-, ondernemers-, spaar- en beleggingsrekeningen)
 
+## BELASTINGDIENST — BETALINGSKENMERKEN HERKENNEN
+Nederlandse belastingbetalingen bevatten een betalingskenmerk in de omschrijving.
+Gebruik deze kenmerken om het TYPE belasting te bepalen:
+- "IB" of "Inkomstenbelasting" of "Inkomstenbel" of "voorlopige aanslag IB" → Inkomstenbelasting/Voorlopige aanslag
+- "OB" of "Omzetbelasting" of "BTW" → BTW/Omzetbelasting
+- "MRB" of "Motorrijtuigenbelasting" of "wegenbelasting" → Overige belastingen
+- "ZVW" of "Zorgverzekeringswet" of "bijdrage Zvw" → Zorgverzekering
+- "Toeslagen" of "zorgtoeslag" of "huurtoeslag" of "kindgebonden" → Toeslagen (als INKOMSTEN)
+- "WOZ" of "OZB" of "gemeentelijke belasting" of "waterschapsbelasting" → Gemeentebelasting/OZB/Waterschapsbelasting
+- "Erfbelasting" of "schenkbelasting" → Overige belastingen
+- Belastingdienst TERUGGAVE (positief bedrag) → Belastingteruggave (als INKOMSTEN)
+- Belastingdienst BETALING (negatief bedrag) → juiste belastingcategorie hierboven
+
 ## CATEGORISATIE-HINTS VOOR DEZE DATA
 - Sevi B.V. / ENGELCKE B.V. → DGA-loon/Managementfee
 - UWV → UWV/Uitkeringen
@@ -270,21 +283,36 @@ Hieronder staan {len(df)} banktransacties.
 - Mintos Marketplace → Crowdlending
 - Brand New Day → Pensioenopbouw
 - bol.com / Coolblue / Amazon → Elektronica/Gadgets (tenzij duidelijk anders)
-- Albert Heijn / Jumbo / Lidl → Boodschappen/Supermarkt
-- Ziggo → Internet/TV
-- CZ Groep → Zorgverzekering
-- Frank Energie / Vattenfall → Energie
-- Belastingdienst → juiste belastingcategorie op basis van betalingskenmerk
-- BEA/GEA transacties bij restaurants → Restaurant/Uit eten
+- Albert Heijn / Jumbo / Lidl / Plus / Dirk → Boodschappen/Supermarkt
+- Etos / Kruidvat → Drogist
+- Ziggo / KPN / T-Mobile → Internet/TV of Mobiele telefonie (op basis van bedrag/context)
+- CZ Groep / Zilveren Kruis / Menzis → Zorgverzekering
+- Frank Energie / Vattenfall / Eneco / Essent / Budget Energie → Energie
+- Vitens / Brabant Water / PWN / Dunea → Water
+- Netflix / Spotify / Disney / Apple / iCloud / YouTube Premium → Streaming/Digitaal
+- NS / OV-chipkaart / Connexxion / Arriva → OV/Trein
+- Shell / BP / TotalEnergies / Tango / Tinq → Benzine/Diesel/Laden
+- BEA/GEA transacties bij restaurants/eetgelegenheden → Restaurant/Uit eten
 - BEA/GEA transacties bij tankstations → Benzine/Diesel/Laden
+- BEA/GEA transacties bij supermarkten → Boodschappen/Supermarkt
+- BEA/GEA transacties bij kledingwinkels (H&M, Zara, C&A, Primark) → Kleding
 - Overboekingen tussen eigen NL-rekeningen (zelfde naam) → Interne verschuivingen
-- GIVT / KWF / Partij voor de Dieren → Donaties/Goede doelen
+- GIVT / KWF / Partij voor de Dieren / Rode Kruis / Oxfam → Donaties/Goede doelen
+- Thuisbezorgd / Uber Eats / Deliveroo → Afhaal/Bezorging
+- Uber / Bolt (taxi) → Taxi/Uber
+- Booking.com / Airbnb / Transavia / KLM / Ryanair → Vakantie/Reizen
+- Action / HEMA / IKEA huishoudelijk → Huishoudelijke artikelen
+- IKEA meubels/inrichting → Meubels/Inrichting
+- Apotheek / BENU → Apotheek/Medicijnen
 
 ## BELANGRIJKE PRINCIPES
 - De TOTALEN hieronder zijn wiskundig berekend en 100% correct. Gebruik deze cijfers, reken NIETS zelf.
-- Wees SPECIFIEK: niet alles in "Overig" dumpen. Gebruik je kennis van Nederlandse bedrijfsnamen.
+- "Overig" categorieën mogen MAXIMAAL 3% van het totaalbedrag per sectie bevatten. Als er veel in "Overig" dreigt te belanden, zoek dan HARDER naar een passende categorie.
+- Wees SPECIFIEK: gebruik je kennis van Nederlandse bedrijfsnamen, winkelketens en dienstverleners.
 - Bij twijfel tussen twee categorieën: kies de meest specifieke.
-- Online aankopen (bol.com etc.) zijn NIET automatisch "Online winkelen" — categoriseer op basis van wat er waarschijnlijk gekocht is (standaard: Elektronica/Gadgets).
+- Online aankopen (bol.com etc.) zijn NIET automatisch "Overig" — categoriseer op basis van wat er waarschijnlijk gekocht is.
+- Elke transactie met een herkenbare tegenpartij MOET in een specifieke categorie, NOOIT in "Overig".
+- Bekijk het bedrag: kleine bedragen bij een onbekende tegenpartij passen vaak bij Boodschappen, Huishoudelijke artikelen, of Café. Grotere bedragen bij onbekenden passen vaak bij Onderhoud woning, Meubels, of Vakantie.
 
 ## CORRECTE TOTALEN
 {json.dumps(feiten, indent=2, ensure_ascii=False)}
@@ -319,10 +347,10 @@ Antwoord ALLEEN in valid JSON:
     }}
   }},
   "analyse": {{
-    "samenvatting": "3-4 alinea's financieel beeld",
-    "sterke_punten": ["..."],
-    "aandachtspunten": ["..."],
-    "aanbevelingen": ["..."]
+    "samenvatting": "3-4 alinea's: schets het complete financiële beeld. Noem concrete bedragen, vergelijk maanden, signaleer trends. Schrijf als een ervaren financieel adviseur die een vermogende particulier adviseert.",
+    "sterke_punten": ["Noem 3-5 sterke punten met concrete bedragen, bv: 'Stabiel DGA-inkomen van €X per maand'"],
+    "aandachtspunten": ["Noem 3-5 aandachtspunten met concrete bedragen en vergelijkingen, bv: 'Variabele kosten stegen van €X in mei naar €Y in juni'"],
+    "aanbevelingen": ["Geef 3-5 concrete, uitvoerbare aanbevelingen specifiek voor deze persoon, niet generiek"]
   }}
 }}"""
 

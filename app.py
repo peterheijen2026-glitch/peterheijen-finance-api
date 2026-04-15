@@ -171,22 +171,120 @@ def bouw_prompt(df: pd.DataFrame, feiten: dict, top: dict) -> str:
             f"{row['bedrag']:>10.2f}|{str(row['Omschrijving'])[:100]}"
         )
 
-    return f"""Je bent een financieel analist voor vermogende particulieren in Nederland.
+    return f"""Je bent een financieel analist voor vermogende particulieren en DGA's in Nederland.
 Hieronder staan {len(df)} banktransacties.
 
 ## REGELS
-1. Categoriseer ELKE transactie in precies één categorie.
-   Gebruik deze secties en categorieën:
+1. Categoriseer ELKE transactie in precies één categorie uit onderstaande lijst.
+   Gebruik EXACT deze categorienamen (niet afwijken, niet samenvoegen, niet verzinnen).
+   Als een transactie nergens past, gebruik dan de "Overig" variant van de juiste sectie.
+   BELANGRIJK: "Overig" categorieën mogen MAXIMAAL 5% van het totaalbedrag per sectie bevatten.
+   Als er veel in "Overig" dreigt te belanden, kies dan de best passende bestaande categorie.
 
-   INKOMSTEN: Salaris/Uitkering, Bedrijfsinkomsten, Huurinkomsten, Toeslagen, Belastingteruggave, Overig inkomen
-   VASTE LASTEN: Hypotheek/Huur, Energie, Telecom/Internet, Verzekeringen, Abonnementen, Belastingen, Donaties, Bankkosten
-   VARIABELE KOSTEN: Boodschappen, Horeca/Uit eten, Transport/Benzine, Kleding, Gezondheid/Apotheek, Huishoud, Online winkelen, Overig variabel
-   SPAREN & BELEGGEN: Beleggingen, Pensioen, Kindersparen, Spaarrekening
-   INTERNE VERSCHUIVINGEN: Overboekingen eigen rekeningen
+2. INKOMSTEN (10 categorieën):
+   - Netto salaris (loon van werkgever of eigen BV)
+   - UWV/Uitkeringen (WW, WIA, Ziektewet, bijstand)
+   - DGA-loon/Managementfee (vanuit eigen BV)
+   - Huurinkomsten (ontvangen huur van huurders)
+   - Toeslagen (zorgtoeslag, huurtoeslag, kindgebonden budget)
+   - Belastingteruggave (teruggave IB, BTW, voorlopige aanslag)
+   - Kinderbijslag/Kindregelingen
+   - Freelance/Opdrachten (losse inkomsten, facturen)
+   - Beleggingsinkomen (dividend, rente, uitkeringen)
+   - Overig inkomen
 
-2. De TOTALEN hieronder zijn wiskundig berekend en 100% correct. Gebruik deze cijfers, reken NIETS zelf.
-3. Maak een maandoverzicht per categorie (bedrag + aantal transacties).
-4. Geef een analyse: samenvatting, sterke punten, aandachtspunten, en 3-5 concrete aanbevelingen.
+3. VASTE LASTEN (20 categorieën):
+   - Hypotheek/Huur
+   - Energie (gas, elektra, warmte)
+   - Water
+   - Gemeentebelasting/OZB/Waterschapsbelasting
+   - Zorgverzekering (basis + aanvullend)
+   - Inkomstenbelasting/Voorlopige aanslag
+   - BTW/Omzetbelasting
+   - Overige belastingen (erfbelasting, schenkbelasting)
+   - Autoverzekering
+   - Woonverzekering/Inboedel
+   - Overige verzekeringen (reis, aansprakelijkheid, uitvaart)
+   - Internet/TV (Ziggo, KPN, glasvezel)
+   - Mobiele telefonie
+   - Streaming/Digitaal (Netflix, Spotify, Disney+, iCloud)
+   - Overige abonnementen (krant, tijdschrift, software)
+   - Kinderopvang/BSO/School
+   - Contributie/Lidmaatschap (sport, vereniging)
+   - Donaties/Goede doelen
+   - Bankkosten
+   - Overige vaste lasten
+
+4. VARIABELE KOSTEN (30 categorieën):
+   - Boodschappen/Supermarkt (Albert Heijn, Jumbo, Lidl etc.)
+   - Drogist (Etos, Kruidvat)
+   - Restaurant/Uit eten
+   - Café/Drinken
+   - Afhaal/Bezorging (Thuisbezorgd, Uber Eats)
+   - Benzine/Diesel/Laden
+   - OV/Trein (NS, OV-chipkaart)
+   - Parkeren
+   - Taxi/Uber
+   - Auto-onderhoud/APK
+   - Kleding
+   - Schoenen
+   - Huisarts/Tandarts/Specialist
+   - Apotheek/Medicijnen
+   - Ziekenhuiskosten/Eigen risico
+   - Fysiotherapie/Alternatief
+   - Brillen/Lenzen
+   - Huishoudelijke artikelen
+   - Meubels/Inrichting
+   - Tuin/Buiten
+   - Onderhoud woning/Klussen
+   - Elektronica/Gadgets (bol.com, Coolblue, Amazon)
+   - Boeken/Media
+   - Sport/Fitness
+   - Uitjes/Attracties/Bioscoop
+   - Vakantie/Reizen (accommodatie, vluchten, activiteiten)
+   - Cadeaus
+   - School/Studie/Cursussen
+   - Huisdieren
+   - Overig variabel
+
+5. SPAREN & BELEGGEN (10 categorieën):
+   - Effectenrekening (Saxo, DeGiro, IBKR)
+   - Crowdlending (Mintos, Lendahand, PeerBerry)
+   - Pensioenopbouw (Brand New Day, lijfrente)
+   - Kindersparen
+   - Spaarrekening
+   - Crypto
+   - Vastgoedinvestering
+   - Beleggingsfonds/ETF
+   - Levensverzekering/Kapitaalverzekering
+   - Overig sparen/beleggen
+
+6. INTERNE VERSCHUIVINGEN:
+   - Overboekingen eigen rekeningen (tussen eigen privé-, ondernemers-, spaar- en beleggingsrekeningen)
+
+## CATEGORISATIE-HINTS VOOR DEZE DATA
+- Sevi B.V. / ENGELCKE B.V. → DGA-loon/Managementfee
+- UWV → UWV/Uitkeringen
+- DHR M J C DE MONNINK → Huurinkomsten
+- Saxo Bank → Effectenrekening
+- Mintos Marketplace → Crowdlending
+- Brand New Day → Pensioenopbouw
+- bol.com / Coolblue / Amazon → Elektronica/Gadgets (tenzij duidelijk anders)
+- Albert Heijn / Jumbo / Lidl → Boodschappen/Supermarkt
+- Ziggo → Internet/TV
+- CZ Groep → Zorgverzekering
+- Frank Energie / Vattenfall → Energie
+- Belastingdienst → juiste belastingcategorie op basis van betalingskenmerk
+- BEA/GEA transacties bij restaurants → Restaurant/Uit eten
+- BEA/GEA transacties bij tankstations → Benzine/Diesel/Laden
+- Overboekingen tussen eigen NL-rekeningen (zelfde naam) → Interne verschuivingen
+- GIVT / KWF / Partij voor de Dieren → Donaties/Goede doelen
+
+## BELANGRIJKE PRINCIPES
+- De TOTALEN hieronder zijn wiskundig berekend en 100% correct. Gebruik deze cijfers, reken NIETS zelf.
+- Wees SPECIFIEK: niet alles in "Overig" dumpen. Gebruik je kennis van Nederlandse bedrijfsnamen.
+- Bij twijfel tussen twee categorieën: kies de meest specifieke.
+- Online aankopen (bol.com etc.) zijn NIET automatisch "Online winkelen" — categoriseer op basis van wat er waarschijnlijk gekocht is (standaard: Elektronica/Gadgets).
 
 ## CORRECTE TOTALEN
 {json.dumps(feiten, indent=2, ensure_ascii=False)}

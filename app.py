@@ -828,18 +828,28 @@ def genereer_pdf(rapport: dict) -> bytes:
 # ---------------------------------------------------------------------------
 
 def verstuur_rapport_email(email: str, pdf_bytes: bytes, report_id: str):
-    """Verstuur het PDF rapport per email via Resend."""
+    """Verstuur het PDF rapport per email via Resend.
+
+    Retourneert True bij succes, False bij falen.
+    Logt altijd de volledige Resend-response voor diagnose.
+    """
     resend_key = os.environ.get('RESEND_API_KEY')
     if not resend_key:
-        logger.warning("RESEND_API_KEY niet geconfigureerd, email wordt overgeslagen")
+        logger.error("RESEND_API_KEY ontbreekt in environment variables — email KAN NIET worden verstuurd")
+        return False
+
+    # Valideer dat de key er uitziet als een geldige Resend key
+    if not resend_key.startswith('re_'):
+        logger.error(f"RESEND_API_KEY lijkt ongeldig (begint niet met 're_') — controleer Railway variables")
         return False
 
     pdf_base64 = base64.b64encode(pdf_bytes).decode('utf-8')
+    logger.info(f"PDF bijlage: {len(pdf_bytes)} bytes, base64: {len(pdf_base64)} chars")
 
     payload = {
         "from": "PeterHeijen.com <rapport@peterheijen.com>",
         "to": [email],
-        "subject": "Uw Financieel Rapport — PeterHeijen.com",
+        "subject": f"Uw Financieel Rapport \u2014 PeterHeijen.com",
         "html": f"""
         <div style="font-family:Georgia,serif;max-width:600px;margin:0 auto;color:#1a1a2e">
             <div style="background:#1a1a2e;padding:30px;text-align:center">
@@ -848,7 +858,7 @@ def verstuur_rapport_email(email: str, pdf_bytes: bytes, report_id: str):
             <div style="padding:30px;background:#f7f6f2">
                 <h2 style="color:#1a1a2e;font-size:20px">Uw financieel rapport is klaar</h2>
                 <p style="color:#3d3d5c;line-height:1.7">
-                    Bijgevoegd vindt u uw persoonlijke financiële analyse.
+                    Bijgevoegd vindt u uw persoonlijke financi\u00eble analyse.
                     Het rapport bevat een overzicht van uw inkomsten en uitgaven,
                     gecategoriseerd per maand, met concrete inzichten en aanbevelingen.
                 </p>
@@ -888,13 +898,30 @@ def verstuur_rapport_email(email: str, pdf_bytes: bytes, report_id: str):
             timeout=30,
         )
         if resp.status_code in (200, 201):
-            logger.info(f"Email verstuurd naar {email}")
+            logger.info(f"Email SUCCESVOL verstuurd naar {email} (Resend status {resp.status_code})")
             return True
         else:
-            logger.error(f"Resend fout: {resp.status_code} {resp.text}")
+            # Log de volledige error voor diagnose
+            logger.error(
+                f"Resend FOUT: status={resp.status_code}, "
+                f"response={resp.text}, "
+                f"from=rapport@peterheijen.com, to={email}"
+            )
+            # Veelvoorkomende fouten loggen met uitleg
+            if resp.status_code == 403:
+                logger.error("DIAGNOSE: Domein peterheijen.com is waarschijnlijk niet geverifieerd in Resend. "
+                             "Ga naar resend.com/domains en voeg peterheijen.com toe met de juiste DNS records.")
+            elif resp.status_code == 422:
+                logger.error("DIAGNOSE: Ongeldige email parameters. Check of het 'from' adres correct is "
+                             "en het domein is geverifieerd.")
+            elif resp.status_code == 429:
+                logger.error("DIAGNOSE: Rate limit bereikt. Wacht even en probeer opnieuw.")
             return False
+    except httpx.TimeoutException:
+        logger.error(f"Resend TIMEOUT na 30 seconden voor email naar {email}")
+        return False
     except Exception as e:
-        logger.error(f"Email fout: {e}")
+        logger.error(f"Email FOUT (onverwacht): {type(e).__name__}: {e}")
         return False
 
 
@@ -1020,22 +1047,26 @@ async def rapport(bestand: UploadFile, email: str = Form(...)):
         logger.error(f"[{report_id}] PDF fout: {e}")
         raise HTTPException(status_code=500, detail=f"PDF generatie mislukt: {e}")
 
-    # 6. Email versturen
+    # 6. Email versturen — MOET slagen, anders is de service incompleet
     email_verstuurd = verstuur_rapport_email(email, pdf_bytes, report_id)
 
+    if not email_verstuurd:
+        logger.error(f"[{report_id}] Email naar {email} MISLUKT — klant krijgt geen rapport")
+        raise HTTPException(
+            status_code=502,
+            detail="Uw analyse is gelukt, maar het rapport kon niet per email worden verstuurd. "
+                   "Probeer het opnieuw of neem contact op via info@peterheijen.com."
+        )
+
+    logger.info(f"[{report_id}] Pipeline compleet — rapport verstuurd naar {email}")
+
+    # Retourneer ALLEEN bevestiging — geen financiële data in de response.
+    # Het rapport gaat uitsluitend per email/PDF naar de klant.
     return {
         'report_id': report_id,
         'status': 'compleet',
-        'email_verstuurd': email_verstuurd,
+        'email_verstuurd': True,
         'email': email,
-        'analyse': rapport_data['analyse'],
-        'feiten': feiten,
-        'maandoverzicht': rapport_data['maandoverzicht'],
-        'jaartotalen': rapport_data['jaartotalen'],
-        'ai': {
-            'model': claude_result.get('model'),
-            'tokens': claude_result.get('tokens'),
-        },
     }
 
 

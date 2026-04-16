@@ -630,6 +630,112 @@ def _markeer_interne_transfers(df: pd.DataFrame, eigen_rekeningen: set) -> pd.Da
     return df
 
 
+def _detecteer_huishoudleden(df: pd.DataFrame) -> pd.DataFrame:
+    """Detecteer automatisch overboekingen naar/van huishoudleden (partner, kinderen).
+
+    Werkt voor ALLE gezinnen — geen hardcoded namen nodig.
+
+    Heuristiek:
+    1. Groepeer transacties per tegenpartij (uit Tegenrekening of naam in omschrijving)
+    2. Een tegenpartij is waarschijnlijk een huishoudlid als:
+       a) Er ZOWEL positieve als negatieve transacties zijn (geld gaat heen-en-weer)
+       b) Er minstens 4 transacties per jaar zijn (regelmatig contact)
+       c) Het netto-effect < 40% van het bruto volume is (ongeveer in balans)
+       d) De tegenpartij NIET al door de merchant-mapping is herkend als bedrijf
+    3. Markeer deze transacties als 'is_intern' = True
+
+    Extra check: als een tegenpartij op dezelfde IBAN zit als een van de eigen rekeningen
+    van de klant, is het sowieso al een interne transfer (al afgevangen in methode 1/2).
+    """
+    if 'Tegenrekening' not in df.columns:
+        logger.info("HUISHOUDLEDEN: geen Tegenrekening kolom — skip detectie")
+        return df
+
+    # Alleen niet-interne, niet-merchant-mapped transacties bekijken
+    mask_kandidaat = ~df['is_intern']
+    df_kandidaat = df[mask_kandidaat].copy()
+
+    if len(df_kandidaat) == 0:
+        return df
+
+    # Groepeer per tegenrekening (genormaliseerd)
+    df_kandidaat['_tegen_norm'] = df_kandidaat['Tegenrekening'].apply(_normaliseer_iban)
+    # Filter lege tegenrekeningen
+    df_kandidaat = df_kandidaat[df_kandidaat['_tegen_norm'] != '']
+
+    # Bekende merchant-zoektermen om bedrijven eruit te filteren
+    bekende_merchants = set()
+    for zoekterm, _, _, _ in MERCHANT_MAPPING:
+        bekende_merchants.add(zoekterm)
+
+    huishoudleden_ibans = set()
+    huishoudleden_namen = []
+
+    for tegen_rek, groep in df_kandidaat.groupby('_tegen_norm'):
+        if len(groep) < 4:
+            continue  # Te weinig transacties
+
+        # Check of dit een bekende merchant is
+        omschr_sample = ' '.join(groep['Omschrijving'].astype(str).str.upper().head(3))
+        is_merchant = False
+        for merchant_zoek in bekende_merchants:
+            if merchant_zoek in omschr_sample:
+                is_merchant = True
+                break
+        if is_merchant:
+            continue
+
+        positief = groep[groep['bedrag'] > 0]['bedrag'].sum()
+        negatief = abs(groep[groep['bedrag'] < 0]['bedrag'].sum())
+        bruto = positief + negatief
+        netto = abs(positief - negatief)
+
+        if bruto < 500:
+            continue  # Te klein volume, niet significant
+
+        # Bidirectioneel: er moet geld BEIDE kanten op gaan
+        if positief == 0 or negatief == 0:
+            continue
+
+        # Netto-effect moet relatief klein zijn (< 40% van bruto)
+        if bruto > 0 and (netto / bruto) < 0.40:
+            huishoudleden_ibans.add(tegen_rek)
+            # Pak een leesbare naam uit de omschrijving
+            naam_sample = groep.iloc[0]['Omschrijving']
+            huishoudleden_namen.append(f"{tegen_rek} ({naam_sample[:40]}...)")
+            logger.info(
+                f"HUISHOUDLID GEDETECTEERD: {tegen_rek} — "
+                f"{len(groep)} transacties, positief EUR {positief:,.0f}, "
+                f"negatief EUR {negatief:,.0f}, netto EUR {netto:,.0f} "
+                f"({netto/bruto*100:.0f}% van bruto)"
+            )
+
+    # Markeer alle transacties met deze tegenrekeningen als intern
+    if huishoudleden_ibans:
+        df['_tegen_check'] = df['Tegenrekening'].apply(_normaliseer_iban)
+        mask_huishoud = df['_tegen_check'].isin(huishoudleden_ibans) & ~df['is_intern']
+        n_gemarkeerd = mask_huishoud.sum()
+        df.loc[mask_huishoud, 'is_intern'] = True
+        df.drop(columns=['_tegen_check'], inplace=True)
+
+        bedrag_huishoud = df.loc[mask_huishoud, 'bedrag'].apply(lambda x: abs(float(x))).sum() if n_gemarkeerd > 0 else 0
+        logger.info(
+            f"HUISHOUDLEDEN: {len(huishoudleden_ibans)} huishoudlid(en) gedetecteerd, "
+            f"{n_gemarkeerd} transacties als intern gemarkeerd "
+            f"(EUR {bedrag_huishoud:,.0f} bruto)"
+        )
+    else:
+        if '_tegen_check' in df.columns:
+            df.drop(columns=['_tegen_check'], inplace=True)
+        logger.info("HUISHOUDLEDEN: geen huishoudleden gedetecteerd via bidirectionele analyse")
+
+    # Cleanup
+    if '_tegen_norm' in df.columns:
+        df.drop(columns=['_tegen_norm'], errors='ignore', inplace=True)
+
+    return df
+
+
 # ---------------------------------------------------------------------------
 # STAP 1c: RULE-BASED CLASSIFICATIE (vóór AI)
 # ---------------------------------------------------------------------------
@@ -645,9 +751,6 @@ MERCHANT_MAPPING = [
     # --- INKOMEN ---
     # UWV
     ('UWV', 'inkomsten', 'UWV/Uitkeringen', 0.95),
-    # Huur
-    ('DE MONNINK', 'inkomsten', 'Huurinkomsten', 0.95),
-    ('MONNINK', 'inkomsten', 'Huurinkomsten', 0.95),
     # Kinderbijslag / Kindregelingen
     ('SVB KINDERBIJSLAG', 'inkomsten', 'Kinderbijslag/Kindregelingen', 0.99),
     ('SVB', 'inkomsten', 'Kinderbijslag/Kindregelingen', 0.80),
@@ -657,13 +760,9 @@ MERCHANT_MAPPING = [
     ('ZORGTOESLAG', 'inkomsten', 'Toeslagen', 0.99),
     ('HUURTOESLAG', 'inkomsten', 'Toeslagen', 0.99),
     ('KINDGEBONDEN BUDGET', 'inkomsten', 'Toeslagen', 0.99),
-    # DGA-loon (specifiek voor deze klant — generieke hints staan in prompt)
-    ('ENGELCKE', 'inkomsten', 'DGA-loon/Managementfee', 0.95),
-    ('SEVI B.V', 'inkomsten', 'DGA-loon/Managementfee', 0.95),
-    ('SEVI BV', 'inkomsten', 'DGA-loon/Managementfee', 0.95),
-    # OLVG (werkgever)
-    ('OLVG', 'inkomsten', 'Netto salaris', 0.95),
-    ('STICHTING OLVG', 'inkomsten', 'Netto salaris', 0.95),
+    # DGA-loon: generieke patronen die in heel Nederland voorkomen
+    # Specifieke BV-namen worden NIET hardcoded — AI herkent DGA-patronen
+    # op basis van vast maandelijks bedrag van een BV.
 
     # --- BELASTINGDIENST (negatief = betaling, positief = teruggave) ---
     # Wordt apart afgehandeld in de functie (bedrag-afhankelijk)
@@ -785,14 +884,9 @@ MERCHANT_MAPPING = [
     # --- TIKKIE (terugbetaling gedeelde kosten, geen inkomen) ---
     ('TIKKIE', 'intern', 'Tikkie-terugbetaling', 0.90),
 
-    # --- FAMILIELEDEN / HUISHOUDLEDEN (overboekingen binnen huishouden) ---
-    # Dit worden NIET als inkomen of uitgave geteld, maar als interne verschuivingen.
-    # TODO: In V2 dit dynamisch maken via gebruikersprofiel / intake.
-    ('E KOP', 'intern', 'Huishoudoverboeking (partner)', 0.85),
-    ('E. KOP', 'intern', 'Huishoudoverboeking (partner)', 0.90),
-    ('PCH HEIJEN', 'intern', 'Huishoudoverboeking (familielid)', 0.85),
-    ('P.C.H. HEIJEN', 'intern', 'Huishoudoverboeking (familielid)', 0.90),
-    ('P C H HEIJEN', 'intern', 'Huishoudoverboeking (familielid)', 0.85),
+    # --- FAMILIELEDEN / HUISHOUDLEDEN ---
+    # NIET hardcoded — wordt automatisch gedetecteerd door _detecteer_huishoudleden()
+    # op basis van bidirectionele geldstromen met persoonsnamen.
 ]
 
 
@@ -1169,12 +1263,10 @@ Gebruik deze kenmerken om het TYPE belasting te bepalen:
 - Belastingdienst TERUGGAVE (positief bedrag) → Belastingteruggave (als INKOMSTEN)
 - Belastingdienst BETALING (negatief bedrag) → juiste belastingcategorie hierboven
 
-## CATEGORISATIE-HINTS VOOR DEZE DATA
-- ENGELCKE B.V. → eigen BV van de gebruiker → DGA-loon/Managementfee
+## CATEGORISATIE-HINTS (generiek voor Nederlandse huishoudens)
 - UWV → UWV/Uitkeringen
-- DHR M J C DE MONNINK → Huurinkomsten
-- Saxo Bank → Effectenrekening
-- Mintos Marketplace → Crowdlending
+- Saxo Bank / DeGiro / IBKR → Effectenrekening
+- Mintos / Lendahand / PeerBerry → Crowdlending
 - Brand New Day → Pensioenopbouw
 - bol.com / Coolblue / Amazon → Elektronica/Gadgets (tenzij duidelijk anders)
 - Albert Heijn / Jumbo / Lidl / Plus / Dirk → Boodschappen/Supermarkt
@@ -1197,11 +1289,13 @@ Gebruik deze kenmerken om het TYPE belasting te bepalen:
 - Action / HEMA / IKEA huishoudelijk → Huishoudelijke artikelen
 - IKEA meubels/inrichting → Meubels/Inrichting
 - Apotheek / BENU → Apotheek/Medicijnen
+- DGA-LOON HERKENNING: Een vast maandelijks bedrag van een B.V. is waarschijnlijk DGA-loon/Managementfee. Herken dit aan: het is altijd hetzelfde bedrag, het komt maandelijks, en de afzender is een B.V. (bevat "B.V." of "BV" in de naam).
+- HUURINKOMSTEN HERKENNING: Regelmatige (maandelijkse) bijschrijvingen van dezelfde persoon met een vast bedrag zijn waarschijnlijk huurinkomsten.
 
 ## NEDERLANDSE FINANCIELE CONTEXT
 - HYPOTHEEK-GEKOPPELDE VERZEKERINGEN: Maandelijkse betalingen aan ASR, Nationale-Nederlanden, Aegon, Delta Lloyd, VIVAT, Reaal, a.s.r., NN Group die een levensverzekering of kapitaalverzekering betreffen, zijn in Nederland bijna altijd onderdeel van een hypotheekconstructie (spaarhypotheek, beleggingshypotheek). Categoriseer als Hypotheek/Huur, NIET als Sparen & Beleggen. Vermeld in de analyse dat het waarschijnlijk een hypotheek-gekoppelde verzekering betreft.
 - INTERNE VERSCHUIVINGEN: Overboekingen tussen eigen rekeningen zijn AL verwijderd uit de transactielijst. Ze tellen NIET mee als inkomen of uitgave. Categoriseer NOOIT een transactie als "Overig inkomen" als het eigenlijk een interne overboeking is.
-- DGA-LOON: Een maandelijks vast bedrag van een BV die in de CATEGORISATIE-HINTS staat als eigen BV is DGA-loon/Managementfee, niet "Overig inkomen".
+- DGA-LOON: Een maandelijks vast bedrag van een BV (herkenbaar aan "B.V." of "BV" in de naam) is waarschijnlijk DGA-loon/Managementfee, niet "Overig inkomen". Herken het patroon: vast bedrag, maandelijks, van een BV.
 - CREDITCARD-AFLOSSING: Een betaling aan een creditcardmaatschappij (ICS, VISA, Mastercard, American Express) is geen consumptie maar een aflossing. Categoriseer als Interne verschuivingen of negeer als de onderliggende transacties al apart staan.
 
 ## BELANGRIJKE PRINCIPES
@@ -2547,8 +2641,16 @@ def _run_rapport_pipeline(job_id: str, bestanden: list, email: str):
         update('Eigen rekeningen herkennen...', 17)
         eigen_rekeningen = _bouw_huishoudregister(df)
         df = _markeer_interne_transfers(df, eigen_rekeningen)
-        n_intern = df['is_intern'].sum()
-        update(f'{n_intern} interne overboekingen gedetecteerd', 19)
+        n_intern_rek = df['is_intern'].sum()
+        update(f'{n_intern_rek} interne overboekingen (eigen rekeningen) gedetecteerd', 19)
+
+        # 1b2. Huishoudleden-detectie (partner, kinderen — automatisch)
+        update('Huishoudleden detecteren...', 20)
+        df = _detecteer_huishoudleden(df)
+        n_intern_totaal = df['is_intern'].sum()
+        n_huishoud = n_intern_totaal - n_intern_rek
+        if n_huishoud > 0:
+            update(f'{n_huishoud} huishoudoverboeking(en) gedetecteerd', 21)
 
         # 1c. Rule-based classificatie (vóór AI)
         update('Transacties classificeren...', 22)

@@ -147,6 +147,12 @@ def _detecteer_formaat(df: pd.DataFrame) -> str:
     if 'IBAN/BBAN' in cols and ('Saldo na trn' in cols or 'Bedrag' in cols):
         return 'rabobank_csv'
 
+    # --- Triodos CSV (uit custom parser) ---
+    # Kolommen: Datum, Rekening, Bedrag, CreditDebet, Naam, Tegenrekening, Code, Omschrijving, Saldo
+    # Verschil met Knab: Triodos heeft 'Tegenrekening' + 'Naam', Knab heeft 'Tegenrekeningnummer' + 'Tegenrekeninghouder'
+    if 'CreditDebet' in cols and 'Bedrag' in cols and 'Tegenrekening' in cols and 'Naam' in cols:
+        return 'triodos_csv'
+
     # --- Knab CSV ---
     # Rekeningnummer;Transactiedatum;Valutacode;CreditDebet;Bedrag;Tegenrekeningnummer;Tegenrekeninghouder;...;Omschrijving
     if 'CreditDebet' in cols and 'Bedrag' in cols:
@@ -216,6 +222,25 @@ def _normaliseer(df: pd.DataFrame, formaat: str) -> pd.DataFrame:
         # Saldo
         if 'Saldo na trn' in df.columns:
             df = _gebruik_saldo_kolom(df, 'Saldo na trn')
+        else:
+            df = _bereken_saldos(df)
+        return df
+
+    elif formaat == 'triodos_csv':
+        df['Rekeningnummer'] = df['Rekening']
+        df['Transactiedatum'] = df['Datum'].astype(str).apply(_parse_datum)
+        bedrag = df['Bedrag'].apply(_parse_dutch_amount)
+        # CreditDebet: 'Credit' = positief, 'Debet' = negatief
+        df['Transactiebedrag'] = df.apply(
+            lambda r: -abs(_parse_dutch_amount(r['Bedrag'])) if str(r.get('CreditDebet', '')).strip().lower().startswith('d')
+            else abs(_parse_dutch_amount(r['Bedrag'])), axis=1)
+        # Omschrijving: Naam + Omschrijving
+        naam = df.get('Naam', pd.Series([''] * len(df))).fillna('')
+        omschr = df.get('Omschrijving', pd.Series([''] * len(df))).fillna('')
+        df['Omschrijving'] = (naam + ' ' + omschr).str.strip()
+        # Saldo
+        if 'Saldo' in df.columns:
+            df = _gebruik_saldo_kolom(df, 'Saldo')
         else:
             df = _bereken_saldos(df)
         return df
@@ -312,30 +337,142 @@ def _normaliseer(df: pd.DataFrame, formaat: str) -> pd.DataFrame:
     return df
 
 
+def _parse_triodos_csv(inhoud: bytes) -> pd.DataFrame:
+    """Parse Triodos Bank CSV - speciaal formaat zonder header, met dubbele quotes.
+
+    Triodos levert een CSV waar elke regel gewrapped is in outer quotes,
+    met escaped inner quotes en ;; aan het eind van elke regel.
+    9 velden: Datum, Rekening, Bedrag, Credit/Debet, Naam, Tegenrekening, Code, Omschrijving, Saldo
+    """
+    text = inhoud.decode('latin-1', errors='replace')
+    rows = []
+
+    for line in text.strip().split('\n'):
+        line = line.strip().rstrip(';')
+        if not line:
+            continue
+        # Strip buitenste quotes
+        if line.startswith('"') and line.endswith('"'):
+            line = line[1:-1]
+        # Unescape dubbele quotes
+        line = line.replace('""', '"')
+        # Parse met quote-aware comma splitting
+        parts = []
+        current = ''
+        in_quotes = False
+        for ch in line:
+            if ch == '"':
+                in_quotes = not in_quotes
+            elif ch == ',' and not in_quotes:
+                parts.append(current.strip())
+                current = ''
+            else:
+                current += ch
+        parts.append(current.strip())
+
+        if len(parts) >= 7:
+            rows.append(parts)
+
+    if not rows:
+        raise ValueError("Triodos CSV bevat geen transacties")
+
+    # Maak DataFrame met standaard kolomnamen
+    col_names = ['Datum', 'Rekening', 'Bedrag', 'CreditDebet', 'Naam', 'Tegenrekening', 'Code', 'Omschrijving', 'Saldo']
+    # Pas kolommen aan als er meer of minder zijn
+    df = pd.DataFrame(rows)
+    actual_cols = min(len(col_names), len(df.columns))
+    df.columns = col_names[:actual_cols] + [f'Extra_{i}' for i in range(actual_cols, len(df.columns))]
+
+    logger.info(f"Triodos CSV: {len(df)} transacties geparsed")
+    return df
+
+
+def _is_triodos_format(inhoud: bytes) -> bool:
+    """Detecteer of dit een Triodos CSV is: begint met quote, geen header, ;; aan einde."""
+    try:
+        first_line = inhoud.decode('latin-1', errors='replace').split('\n')[0].strip()
+        # Triodos: begint met ", bevat ""-escaped velden, eindigt op ;;
+        return first_line.startswith('"') and '""' in first_line and first_line.endswith(';;')
+    except Exception:
+        return False
+
+
 def lees_transacties(inhoud: bytes, bestandsnaam: str) -> pd.DataFrame:
-    """Lees transacties uit CSV/XLS/XLSX — herkent automatisch het bankformaat.
+    """Lees transacties uit CSV/XLS/XLSX - herkent automatisch het bankformaat.
 
     Ondersteunde banken: ABN AMRO, ING, Rabobank, SNS, ASN, Triodos,
-    Knab, Bunq, N26, RegioBank — zowel CSV als XLS/XLSX.
+    Knab, Bunq, N26, RegioBank - zowel CSV als XLS/XLSX.
     """
-    if bestandsnaam.endswith(('.xlsx', '.xls')):
-        df = pd.read_excel(io.BytesIO(inhoud))
-    elif bestandsnaam.endswith('.csv'):
-        # Probeer verschillende encodings en separators
-        parsed = False
-        for enc in ['utf-8', 'latin-1', 'cp1252']:
-            for sep in [';', ',', '\t']:
+    naam_lower = bestandsnaam.lower()
+
+    if naam_lower.endswith(('.xlsx', '.xls')):
+        try:
+            df = pd.read_excel(io.BytesIO(inhoud))
+        except Exception as e:
+            raise ValueError(f"Kan Excel-bestand niet lezen: {e}")
+    elif naam_lower.endswith('.csv'):
+        # Strip BOM (Byte Order Mark)
+        if inhoud.startswith(b'\xef\xbb\xbf'):
+            inhoud = inhoud[3:]
+        elif inhoud.startswith(b'\xff\xfe') or inhoud.startswith(b'\xfe\xff'):
+            inhoud = inhoud[2:]
+
+        # Fix problematische line endings (ING gebruikt \r\r\n)
+        inhoud = inhoud.replace(b'\r\r\n', b'\n').replace(b'\r\n', b'\n').replace(b'\r', b'\n')
+
+        # Log preview voor debugging
+        try:
+            preview = inhoud[:300].decode('utf-8', errors='replace')
+        except Exception:
+            preview = str(inhoud[:300])
+        logger.info(f"CSV preview: {preview[:150]}")
+
+        # Check speciaal Triodos-formaat (geen header, dubbele quotes)
+        if _is_triodos_format(inhoud):
+            logger.info("Triodos-formaat gedetecteerd — custom parser")
+            df = _parse_triodos_csv(inhoud)
+        else:
+            # Standaard CSV parsing — probeer combinaties
+            parsed = False
+            best_df = None
+            best_cols = 0
+
+            for enc in ['utf-8', 'latin-1', 'cp1252']:
+                for sep in [';', ',', '\t', '|']:
+                    try:
+                        test_df = pd.read_csv(io.BytesIO(inhoud), sep=sep, encoding=enc,
+                                              dtype=str, on_bad_lines='skip')
+                        n_cols = len(test_df.columns)
+                        if n_cols > best_cols:
+                            best_df = test_df
+                            best_cols = n_cols
+                        if n_cols > 3:
+                            parsed = True
+                            df = test_df
+                            logger.info(f"CSV geparsed: sep={repr(sep)}, enc={enc}, "
+                                        f"kolommen={n_cols}: {list(test_df.columns)}")
+                            break
+                    except Exception:
+                        continue
+                if parsed:
+                    break
+
+            if not parsed:
+                # Fallback: python engine met auto-detectie
                 try:
-                    df = pd.read_csv(io.BytesIO(inhoud), sep=sep, encoding=enc)
+                    df = pd.read_csv(io.BytesIO(inhoud), sep=None, engine='python',
+                                     encoding='utf-8', dtype=str, on_bad_lines='skip')
                     if len(df.columns) > 3:
                         parsed = True
-                        break
                 except Exception:
-                    continue
-            if parsed:
-                break
-        if not parsed:
-            raise ValueError("Kan CSV niet parsen — controleer of het een geldig bankafschrift is")
+                    pass
+
+            if not parsed:
+                cols_info = ""
+                if best_df is not None:
+                    cols_info = f" Beste poging: {best_cols} kolommen."
+                raise ValueError(
+                    f"Kan CSV niet parsen — controleer of het een geldig bankafschrift is.{cols_info}")
     else:
         raise ValueError(f"Onbekend bestandstype: {bestandsnaam}. Ondersteund: .csv, .xls, .xlsx")
 

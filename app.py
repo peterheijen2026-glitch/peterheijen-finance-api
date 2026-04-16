@@ -373,6 +373,7 @@ def vraag_claude(prompt: str) -> dict:
     response = client.messages.create(
         model=model,
         max_tokens=32000,
+        timeout=120,  # Max 2 minuten voor Claude — voorkomt eindeloos wachten
         messages=[{"role": "user", "content": prompt}],
     )
 
@@ -931,7 +932,43 @@ def verstuur_rapport_email(email: str, pdf_bytes: bytes, report_id: str):
 
 @app.get("/")
 def health():
+    """Basis health check."""
     return {"status": "ok", "versie": "0.1.0", "service": "peterheijen-finance"}
+
+
+@app.get("/health")
+def deep_health():
+    """Uitgebreide health check — test of alle afhankelijkheden geconfigureerd zijn."""
+    checks = {}
+
+    # Claude API key
+    api_key = os.environ.get('ANTHROPIC_API_KEY')
+    checks['claude_api_key'] = bool(api_key and api_key.startswith('sk-'))
+
+    # Claude model
+    model = os.environ.get('CLAUDE_MODEL', 'claude-sonnet-4-6')
+    checks['claude_model'] = model
+
+    # Resend API key
+    resend_key = os.environ.get('RESEND_API_KEY')
+    checks['resend_api_key'] = bool(resend_key and resend_key.startswith('re_'))
+
+    # Fonts directory
+    fonts_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'fonts')
+    fonts_present = os.path.exists(fonts_dir) and len([f for f in os.listdir(fonts_dir) if f.endswith('.ttf')]) >= 8
+    checks['premium_fonts'] = fonts_present
+
+    alles_ok = all([
+        checks['claude_api_key'],
+        checks['resend_api_key'],
+        checks['premium_fonts'],
+    ])
+
+    return {
+        "status": "ok" if alles_ok else "NIET KLAAR",
+        "checks": checks,
+        "bericht": "Alle systemen operationeel" if alles_ok else "Een of meer afhankelijkheden ontbreken — check Railway Variables",
+    }
 
 
 @app.post("/analyseer")
@@ -1002,11 +1039,15 @@ async def rapport(bestand: UploadFile, email: str = Form(...)):
     report_id = str(uuid.uuid4())[:8]
     logger.info(f"[{report_id}] Start rapport pipeline voor {email}")
 
-    # 1. Inlezen
+    # 1. Inlezen (max 10 MB)
     try:
         inhoud = await bestand.read()
+        if len(inhoud) > 10 * 1024 * 1024:
+            raise HTTPException(status_code=400, detail="Bestand is te groot (max 10 MB)")
         df = lees_transacties(inhoud, bestand.filename)
-        logger.info(f"[{report_id}] {len(df)} transacties ingelezen")
+        logger.info(f"[{report_id}] {len(df)} transacties ingelezen ({len(inhoud)} bytes)")
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"[{report_id}] Inleesfout: {e}")
         raise HTTPException(status_code=400, detail=f"Kan bestand niet lezen: {e}")
@@ -1014,16 +1055,17 @@ async def rapport(bestand: UploadFile, email: str = Form(...)):
     # 2. Deterministisch rekenen
     feiten = bereken_feiten(df)
     top = bereken_top(df)
-    logger.info(f"[{report_id}] Feiten berekend")
+    logger.info(f"[{report_id}] Feiten berekend voor {len(feiten)} rekening(en)")
 
     # 3. Claude categoriseren + analyseren
     try:
         prompt = bouw_prompt(df, feiten, top)
+        logger.info(f"[{report_id}] Prompt: {len(prompt)} tekens, {len(df)} transacties")
         claude_result = vraag_claude(prompt)
         logger.info(f"[{report_id}] Claude analyse compleet")
     except Exception as e:
-        logger.error(f"[{report_id}] Claude fout: {e}")
-        raise HTTPException(status_code=500, detail=f"AI-analyse mislukt: {e}")
+        logger.error(f"[{report_id}] Claude fout: {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail=f"AI-analyse mislukt. Probeer het opnieuw.")
 
     if not claude_result.get('data'):
         raise HTTPException(status_code=500, detail=f"AI-analyse ongeldig: {claude_result.get('error', 'onbekend')}")

@@ -983,21 +983,23 @@ def _classificeer_rule_based(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def _detecteer_dga_loon(df: pd.DataFrame) -> pd.DataFrame:
-    """Detecteer DGA-loon/Managementfee op basis van patronen — GEEN hardcoded namen.
+def _detecteer_salaris_uit_bv(df: pd.DataFrame) -> pd.DataFrame:
+    """Detecteer salaris/loon uit een B.V. op basis van patronen — GEEN hardcoded namen.
 
-    Werkt voor ALLE DGA-gezinnen in Nederland.
+    Werkt voor ALLE Nederlandse huishoudens: zowel DGA's als werknemers bij een B.V.
+
+    Slimme categorie-toewijzing:
+    - "HOLDING" / "HLDG" in naam → DGA-loon/Managementfee (waarschijnlijk eigen B.V.)
+    - "MANAGEMENT" + bedrijfscontext → DGA-loon/Managementfee
+    - Overige B.V.'s → Netto salaris (veilige default, meeste mensen zijn werknemer)
 
     Heuristiek:
-    1. Zoek tegenpartijen waarvan de naam een rechtsvorm bevat:
-       - "B.V." / "BV" (besloten vennootschap)
-       - "HOLDING" (holdingstructuur)
-       - "MANAGEMENT" + bedrijfscontext (managementfee)
+    1. Zoek tegenpartijen waarvan de naam "B.V.", "BV", "HOLDING" etc. bevat
     2. Die minstens 3x voorkomen met POSITIEF bedrag (geld ontvangt)
-    3. Waarvan het meeste bedrag (semi-)vast is (standaarddeviatie < 25% van gemiddelde)
+    3. Waarvan het bedrag (semi-)vast is (std < 25% van gemiddelde)
     4. Met gemiddeld ≥€500 per betaling
 
-    Classificeert als: inkomsten / DGA-loon/Managementfee
+    Classificeert als: inkomsten / DGA-loon/Managementfee OF Netto salaris
     """
     if 'Omschrijving' not in df.columns:
         return df
@@ -1009,7 +1011,8 @@ def _detecteer_dga_loon(df: pd.DataFrame) -> pd.DataFrame:
     if len(df_kandidaat) == 0:
         return df
 
-    n_gedetecteerd = 0
+    n_dga = 0
+    n_salaris = 0
 
     # Groepeer per tegenpartij (Tegenrekening als die er is, anders op naam in omschrijving)
     groepeer_col = 'Tegenrekening' if 'Tegenrekening' in df.columns else 'Omschrijving'
@@ -1021,20 +1024,17 @@ def _detecteer_dga_loon(df: pd.DataFrame) -> pd.DataFrame:
         omschr_alle = ' '.join(groep['Omschrijving'].astype(str).str.upper())
         tekst_check = key_str + ' ' + omschr_alle
 
-        # Patronen die wijzen op een vennootschap / DGA-structuur
+        # Patronen die wijzen op een vennootschap
         bv_markers = ['B.V.', ' BV ', ' BV,', 'B.V ', ' B.V', ' BV.']
         holding_markers = ['HOLDING', 'HLDG']
-        # "MANAGEMENT" alleen als er ook een bedrijfsindicator bij staat
         mgmt_met_bedrijf = ('MANAGEMENT' in tekst_check and
-                            any(m in tekst_check for m in bv_markers + holding_markers + ['CONSULTANCY', 'ADVIES', 'DIENSTEN']))
+                            any(m in tekst_check for m in bv_markers + holding_markers +
+                                ['CONSULTANCY', 'ADVIES', 'DIENSTEN']))
 
-        heeft_rechtsvorm = (
-            any(marker in tekst_check for marker in bv_markers) or
-            any(marker in tekst_check for marker in holding_markers) or
-            mgmt_met_bedrijf
-        )
+        heeft_bv = any(marker in tekst_check for marker in bv_markers)
+        heeft_holding = any(marker in tekst_check for marker in holding_markers)
 
-        if not heeft_rechtsvorm:
+        if not (heeft_bv or heeft_holding or mgmt_met_bedrijf):
             continue
 
         # Filter: alleen positieve transacties (inkomend geld)
@@ -1043,35 +1043,51 @@ def _detecteer_dga_loon(df: pd.DataFrame) -> pd.DataFrame:
             continue
 
         # Check: zijn de bedragen (semi-)vast?
-        # 25% tolerantie (ruimer dan 20%) om kleine variaties/vakantiegeld op te vangen
         bedragen = groep_pos['bedrag'].astype(float)
         gemiddeld = bedragen.mean()
         if gemiddeld < 500:
-            continue  # Minder dan €500 gemiddeld is waarschijnlijk geen loon
+            continue  # Minder dan €500 gemiddeld is waarschijnlijk geen loon/salaris
 
         std = bedragen.std()
         variatie = (std / gemiddeld) if gemiddeld > 0 else 1.0
-        if variatie < 0.25:
-            # Vast bedrag gedetecteerd: dit is waarschijnlijk DGA-loon
-            mask_dga = df.index.isin(groep_pos.index)
-            df.loc[mask_dga, 'regel_sectie'] = 'inkomsten'
-            df.loc[mask_dga, 'regel_categorie'] = 'DGA-loon/Managementfee'
-            df.loc[mask_dga, 'regel_confidence'] = 0.90
-            df.loc[mask_dga, 'classificatie_bron'] = 'rule'
+        if variatie >= 0.25:
+            continue  # Te variabel voor vast loon/salaris
 
-            totaal = bedragen.sum()
-            n_gedetecteerd += len(groep_pos)
-            logger.info(
-                f"DGA-LOON GEDETECTEERD: {key_str[:50]} — "
-                f"{len(groep_pos)} betalingen, gemiddeld EUR {gemiddeld:,.0f}, "
-                f"totaal EUR {totaal:,.0f}, std EUR {std:,.0f} "
-                f"({variatie*100:.0f}% variatie)"
-            )
+        # Bepaal categorie: DGA-loon of gewoon salaris?
+        # DGA-signalen: HOLDING, HLDG, MANAGEMENT+bedrijfscontext
+        is_dga = heeft_holding or mgmt_met_bedrijf
+        # Salaris-keyword in omschrijving versterkt "gewoon salaris"
+        salaris_keywords = ['SALARIS', 'LOON', 'SALARY', 'NETTO']
+        heeft_salaris_keyword = any(kw in tekst_check for kw in salaris_keywords)
 
-    if n_gedetecteerd > 0:
-        logger.info(f"DGA-LOON: {n_gedetecteerd} transacties als DGA-loon geclassificeerd")
+        if is_dga and not heeft_salaris_keyword:
+            categorie = 'DGA-loon/Managementfee'
+            confidence = 0.90
+        else:
+            categorie = 'Netto salaris'
+            confidence = 0.88
+
+        mask_match = df.index.isin(groep_pos.index)
+        df.loc[mask_match, 'regel_sectie'] = 'inkomsten'
+        df.loc[mask_match, 'regel_categorie'] = categorie
+        df.loc[mask_match, 'regel_confidence'] = confidence
+        df.loc[mask_match, 'classificatie_bron'] = 'rule'
+
+        totaal = bedragen.sum()
+        if categorie == 'DGA-loon/Managementfee':
+            n_dga += len(groep_pos)
+        else:
+            n_salaris += len(groep_pos)
+        logger.info(
+            f"{'DGA-LOON' if is_dga else 'SALARIS'} GEDETECTEERD: {key_str[:50]} — "
+            f"{len(groep_pos)} betalingen, gemiddeld EUR {gemiddeld:,.0f}, "
+            f"totaal EUR {totaal:,.0f}, {variatie*100:.0f}% variatie → {categorie}"
+        )
+
+    if n_dga + n_salaris > 0:
+        logger.info(f"BV-INKOMEN: {n_dga} DGA-loon + {n_salaris} Netto salaris transacties geclassificeerd")
     else:
-        logger.info("DGA-LOON: geen DGA-loon patroon gedetecteerd")
+        logger.info("BV-INKOMEN: geen vast inkomen uit B.V. gedetecteerd")
 
     return df
 
@@ -1524,13 +1540,13 @@ Gebruik deze kenmerken om het TYPE belasting te bepalen:
 - Action / HEMA / IKEA huishoudelijk → Huishoudelijke artikelen
 - IKEA meubels/inrichting → Meubels/Inrichting
 - Apotheek / BENU → Apotheek/Medicijnen
-- DGA-LOON HERKENNING: Een vast maandelijks bedrag van een B.V. is waarschijnlijk DGA-loon/Managementfee. Herken dit aan: het is altijd hetzelfde bedrag, het komt maandelijks, en de afzender is een B.V. (bevat "B.V." of "BV" in de naam).
+- SALARIS/LOON UIT B.V.: Een vast maandelijks bedrag van een B.V. (bevat "B.V." of "BV" in de naam) is waarschijnlijk salaris. Als de B.V.-naam "Holding" of "Management" bevat → classificeer als "DGA-loon/Managementfee". Anders → classificeer als "Netto salaris". Neem NIET aan dat iemand eigenaar is van een B.V. alleen omdat die persoon geld ontvangt.
 - HUURINKOMSTEN HERKENNING: Regelmatige (maandelijkse) bijschrijvingen van dezelfde persoon met een vast bedrag zijn waarschijnlijk huurinkomsten.
 
 ## NEDERLANDSE FINANCIELE CONTEXT
 - HYPOTHEEK-GEKOPPELDE VERZEKERINGEN: Maandelijkse betalingen aan ASR, Nationale-Nederlanden, Aegon, Delta Lloyd, VIVAT, Reaal, a.s.r., NN Group die een levensverzekering of kapitaalverzekering betreffen, zijn in Nederland bijna altijd onderdeel van een hypotheekconstructie (spaarhypotheek, beleggingshypotheek). Categoriseer als Hypotheek/Huur, NIET als Sparen & Beleggen. Vermeld in de analyse dat het waarschijnlijk een hypotheek-gekoppelde verzekering betreft.
 - INTERNE VERSCHUIVINGEN: Overboekingen tussen eigen rekeningen zijn AL verwijderd uit de transactielijst. Ze tellen NIET mee als inkomen of uitgave. Categoriseer NOOIT een transactie als "Overig inkomen" als het eigenlijk een interne overboeking is.
-- DGA-LOON: Een maandelijks vast bedrag van een BV (herkenbaar aan "B.V." of "BV" in de naam) is waarschijnlijk DGA-loon/Managementfee, niet "Overig inkomen". Herken het patroon: vast bedrag, maandelijks, van een BV.
+- SALARIS UIT B.V.: Een maandelijks vast bedrag van een BV (herkenbaar aan "B.V." of "BV" in de naam) is waarschijnlijk salaris of DGA-loon, niet "Overig inkomen". Alleen als "Holding" of "Management" in de naam staat → "DGA-loon/Managementfee". Anders → "Netto salaris".
 - CREDITCARD-AFLOSSING: Een betaling aan een creditcardmaatschappij (ICS, VISA, Mastercard, American Express) is geen consumptie maar een aflossing. Categoriseer als Interne verschuivingen of negeer als de onderliggende transacties al apart staan.
 
 ## BELANGRIJKE PRINCIPES
@@ -1576,7 +1592,7 @@ Antwoord ALLEEN in valid JSON:
     }}
   }},
   "analyse": {{
-    "samenvatting": "3-4 alinea's. Schrijf als een senior financieel adviseur die een vermogende particulier of DGA informeert — rustig, zakelijk, respectvol. Begin met het totaalbeeld: hoeveel komt er structureel binnen, hoeveel gaat er structureel uit, hoeveel gaat naar vermogensopbouw. Benoem dan de cashflowdynamiek: zijn er grote interne verschuivingen, beleggingstransacties, of seizoenseffecten die het beeld vertekenen? Eindig met de kern: waar zit de financiele kracht en waar de kwetsbaarheid. Noem altijd concrete bedragen. Gebruik NOOIT een oordelende of budgetcoach-achtige toon ('u geeft te veel uit', 'onnodige aankopen'). Gebruik in plaats daarvan neutrale financiele taal ('deze categorie vertoont spreiding', 'discretionair verbruik concentreert zich in...', 'uw liquiditeitsmarge is...').",
+    "samenvatting": "3-4 alinea's. Schrijf als een senior financieel adviseur die een vermogende particulier of DGA informeert — rustig, zakelijk, respectvol. Begin met het totaalbeeld: hoeveel komt er structureel binnen, hoeveel gaat er structureel uit, hoeveel gaat naar vermogensopbouw. Benoem dan de cashflowdynamiek: zijn er grote interne verschuivingen, beleggingstransacties, of seizoenseffecten die het beeld vertekenen? Eindig met de kern: waar zit de financiele kracht en waar de kwetsbaarheid. Noem altijd concrete bedragen. TOON-REGELS: (1) Gebruik NOOIT een oordelende of budgetcoach-achtige toon. Gebruik neutrale financiele taal. (2) Wees EERLIJK over onzekerheden: als een classificatie onzeker is, zeg dat. Schrijf 'Op basis van de transactiepatronen lijkt dit...' in plaats van stellige beweringen. (3) Spreek de gebruiker NOOIT aan met 'uw BV' tenzij je ZEKER weet dat het een eigen BV is. (4) Als er grote bedragen zijn die niet eenduidig te classificeren zijn, benoem dit expliciet als punt van aandacht. Een betrouwbaar rapport dat eerlijk is over zijn beperkingen is meer waard dan een zelfverzekerd rapport dat fouten bevat.",
     "sterke_punten": ["Noem 3-5 financiele sterktes met concrete bedragen. Schrijf bevestigend en zakelijk, bv: 'Stabiel structureel inkomen van gemiddeld €X/mnd via DGA-loon en huurinkomsten', 'Actieve vermogensopbouw: gemiddeld €X/mnd naar beleggingen en pensioen'"],
     "aandachtspunten": ["Noem 3-5 signalen die aandacht verdienen. Gebruik GEEN oordelende taal. Schrijf als observaties, bv: 'Discretionaire uitgaven vertonen maandelijkse spreiding van €X tot €Y — mogelijke grip-verbetering', 'Liquiditeitsmarge na vaste lasten en vermogensopbouw is beperkt tot ca. €X/mnd'"],
     "aanbevelingen": ["Geef 3-5 concrete, strategische aanbevelingen. Denk op het niveau van financieel advies, niet budgetcoaching. Bv: 'Overweeg een liquiditeitsbuffer van 3-6 maanden vaste lasten (ca. €X) aan te houden alvorens extra beleggingen', 'Consolidatie van beleggingsrekeningen kan beheerkosten en overzicht verbeteren'"],
@@ -1588,18 +1604,29 @@ Antwoord ALLEEN in valid JSON:
 def _rapport_kwaliteitscheck(data: dict, df: pd.DataFrame, eigen_rekeningen: set):
     """Blokkeer rapport als er grove classificatiefouten in zitten.
 
-    Controleert:
-    1. Of interne transfers niet als inkomen zijn gecategoriseerd
-    2. Of hypotheek-verzekeringen niet als belegging staan
-    3. Of 'Overig inkomen' niet onrealistisch hoog is
+    Controleert (BLOKKEREND - rapport wordt niet gegenereerd):
+    1. 'Overig inkomen' > 40% van totaal inkomen → classificatiefout
+    2. Transfer in inkomen → AI heeft interne transfer als inkomen gezet
+    3. Groot bedrag (>€2.000/jaar) in AI-only categorie zonder rule-backup
 
-    Raises ValueError als een check faalt (blokkeert rapport).
-    Logt waarschuwingen voor minder ernstige problemen.
+    Controleert (WAARSCHUWING - rapport wordt gegenereerd met disclaimer):
+    4. 'Overig inkomen' > 15% van totaal inkomen
+    5. Hypotheek-verzekeringen in beleggingen
+    6. Hoge AI-afhankelijkheid (>60% transacties alleen door AI geclassificeerd)
+
+    Raises ValueError als een blokkerende check faalt.
+    Retourneert lijst met waarschuwingen voor disclaimer in rapport.
     """
+    blockers = []
     warnings_found = []
 
-    # Check 1: 'Overig inkomen' mag niet groter zijn dan 30% van totaal inkomen
     jaartotalen = data.get('jaartotalen', {})
+
+    # =========================================================================
+    # BLOKKERENDE CHECKS — rapport wordt NIET gegenereerd
+    # =========================================================================
+
+    # Check 1: 'Overig inkomen' mag niet groter zijn dan 40% van totaal inkomen
     for rek, totalen in jaartotalen.items():
         inkomsten = totalen.get('inkomsten', {})
         if isinstance(inkomsten, dict):
@@ -1607,15 +1634,39 @@ def _rapport_kwaliteitscheck(data: dict, df: pd.DataFrame, eigen_rekeningen: set
             totaal_ink = sum(abs(float(v)) for v in inkomsten.values() if isinstance(v, (int, float)))
             if totaal_ink > 0 and overig > 0:
                 ratio = overig / totaal_ink
-                if ratio > 0.30:
+                if ratio > 0.40:
+                    blockers.append(
+                        f"BLOKKADE: Rekening {rek}: 'Overig inkomen' is {ratio:.0%} van totaal inkomen "
+                        f"(EUR {overig:,.0f} / EUR {totaal_ink:,.0f}). "
+                        f"Dit duidt op fout-geclassificeerde interne overboekingen."
+                    )
+                elif ratio > 0.15:
                     warnings_found.append(
                         f"Rekening {rek}: 'Overig inkomen' is {ratio:.0%} van totaal inkomen "
-                        f"(EUR {overig:,.0f} / EUR {totaal_ink:,.0f}). "
-                        f"Dit duidt mogelijk op fout-geclassificeerde interne overboekingen."
+                        f"(EUR {overig:,.0f}). Mogelijk zijn niet alle inkomstenbronnen herkend."
                     )
-                    logger.warning(f"KWALITEITSCHECK: {warnings_found[-1]}")
 
-    # Check 2: Hypotheek-verzekeringen in beleggingen
+    # Check 2: Transfer in inkomen of variabele kosten
+    # Controleer of eigen rekening-IBANs voorkomen als tegenpartij in AI-geclassificeerde transacties
+    if eigen_rekeningen and 'Tegenrekening' in df.columns:
+        df_ai_only = df[(df['classificatie_bron'] != 'rule') & (~df['is_intern'])]
+        for idx, row in df_ai_only.iterrows():
+            tegen = _normaliseer_iban(str(row.get('Tegenrekening', '')))
+            if tegen in eigen_rekeningen:
+                bedrag = abs(float(row.get('bedrag', 0)))
+                if bedrag > 100:
+                    blockers.append(
+                        f"BLOKKADE: Transfer naar eigen rekening ({tegen}) "
+                        f"niet als intern gemarkeerd (EUR {bedrag:,.0f}). "
+                        f"Dit mag nooit in het rapport als inkomen of uitgave staan."
+                    )
+                    break  # Eén blocker is genoeg
+
+    # =========================================================================
+    # WAARSCHUWINGS-CHECKS — rapport wordt gegenereerd MET disclaimer
+    # =========================================================================
+
+    # Check 3: Hypotheek-verzekeringen in beleggingen
     for rek, totalen in jaartotalen.items():
         sparen = totalen.get('sparen_beleggen', {})
         if isinstance(sparen, dict):
@@ -1623,27 +1674,62 @@ def _rapport_kwaliteitscheck(data: dict, df: pd.DataFrame, eigen_rekeningen: set
                 cat_lower = cat.lower()
                 if ('levensverzekering' in cat_lower or 'kapitaalverzekering' in cat_lower):
                     bedrag_abs = abs(float(bedrag)) if isinstance(bedrag, (int, float)) else 0
-                    if bedrag_abs > 500:  # Meer dan EUR 500/jaar = significant
+                    if bedrag_abs > 500:
                         warnings_found.append(
-                            f"Rekening {rek}: '{cat}' (EUR {bedrag_abs:,.0f}) staat onder Sparen & Beleggen. "
-                            f"In Nederland zijn levensverzekeringen vaak hypotheek-gekoppeld. "
-                            f"Dit hoort waarschijnlijk bij Hypotheek/Huur."
+                            f"'{cat}' (EUR {bedrag_abs:,.0f}) staat onder Sparen & Beleggen. "
+                            f"Levensverzekeringen zijn in Nederland vaak hypotheek-gekoppeld."
                         )
-                        logger.warning(f"KWALITEITSCHECK: {warnings_found[-1]}")
 
-    # Blokkeer rapport bij ernstige classificatiefouten
-    # ChatGPT CEO-plan: "liever even geen rapport dan een rapport dat vertrouwen sloopt"
+    # Check 4: Confidence / AI-afhankelijkheid
+    df_extern = df[~df.get('is_intern', False)]
+    n_totaal = len(df_extern)
+    n_rule = len(df_extern[df_extern['classificatie_bron'] == 'rule'])
+    n_ai = n_totaal - n_rule
+    pct_ai = (n_ai / n_totaal * 100) if n_totaal > 0 else 0
+    if pct_ai > 60:
+        warnings_found.append(
+            f"{pct_ai:.0f}% van de transacties is alleen door AI geclassificeerd "
+            f"({n_ai} van {n_totaal}). Overweeg meer merchants toe te voegen aan de regelslaag."
+        )
+
+    # Check 5: Grote AI-only bedragen (>€2.000/jaar per categorie)
+    # Dit zijn potentieel onbetrouwbare classificaties
+    # (voor nu waarschuwing, later mogelijk blokkade)
+    if n_ai > 0:
+        df_ai_bedragen = df_extern[df_extern['classificatie_bron'] != 'rule']
+        if len(df_ai_bedragen) > 0:
+            groot_ai_totaal = df_ai_bedragen['bedrag'].apply(lambda x: abs(float(x))).sum()
+            if groot_ai_totaal > 5000:
+                warnings_found.append(
+                    f"EUR {groot_ai_totaal:,.0f} aan transacties is alleen door AI geclassificeerd "
+                    f"zonder rule-based backup. Bij grote bedragen kan dit onbetrouwbaar zijn."
+                )
+
+    # =========================================================================
+    # RESULTAAT
+    # =========================================================================
+
+    # Blokkerende fouten → rapport NIET genereren
+    if blockers:
+        for b in blockers:
+            logger.error(f"KWALITEITSCHECK: {b}")
+        raise ValueError(
+            f"Rapport geblokkeerd door {len(blockers)} kwaliteitscheck(s): "
+            + " | ".join(blockers)
+        )
+
+    # Waarschuwingen → rapport WEL genereren, maar loggen
     if warnings_found:
-        logger.warning(f"KWALITEITSCHECK: {len(warnings_found)} waarschuwing(en) gevonden")
+        logger.warning(f"KWALITEITSCHECK: {len(warnings_found)} waarschuwing(en)")
         for w in warnings_found:
-            logger.warning(f"  - {w}")
-
-        # Bij 'Overig inkomen' > 30%: dit is een fundamenteel classificatieprobleem
-        # Rapport wordt WEL gegenereerd maar met disclaimer in de analyse
-        # In toekomstige versie: blokkeren en opnieuw proberen met strengere prompt
-        logger.warning("KWALITEITSCHECK: Rapport wordt gegenereerd MET waarschuwingen in analyse")
+            logger.warning(f"  ⚠ {w}")
+        # Sla waarschuwingen op zodat ze in het rapport kunnen worden verwerkt
+        data['_kwaliteitswaarschuwingen'] = warnings_found
     else:
-        logger.info("KWALITEITSCHECK: alle checks geslaagd")
+        logger.info("KWALITEITSCHECK: alle checks geslaagd, geen waarschuwingen")
+        data['_kwaliteitswaarschuwingen'] = []
+
+    return warnings_found
 
 
 def _forceer_rule_classificaties(ai_data: dict, df: pd.DataFrame) -> dict:
@@ -2895,7 +2981,7 @@ def _run_rapport_pipeline(job_id: str, bestanden: list, email: str):
 
         # 1d. Patroon-detectie: DGA-loon en huurinkomsten (vóór AI)
         update('DGA-loon en huurinkomsten detecteren...', 24)
-        df = _detecteer_dga_loon(df)
+        df = _detecteer_salaris_uit_bv(df)
         df = _detecteer_huurinkomsten(df)
         n_regel_na = len(df[df['classificatie_bron'] == 'rule'])
         n_patroon = n_regel_na - n_regel
@@ -2925,9 +3011,12 @@ def _run_rapport_pipeline(job_id: str, bestanden: list, email: str):
         claude_result['data'] = _forceer_rule_classificaties(claude_result['data'], df)
         update('Rule-based correcties toegepast', 65)
 
-        # 3c. Report quality checks (blokkeer bij grove fouten)
-        _rapport_kwaliteitscheck(claude_result['data'], df, eigen_rekeningen)
-        update('AI-analyse compleet, kwaliteitscheck geslaagd', 70)
+        # 3c. Report quality checks (blokkeer bij grove fouten, raises ValueError)
+        kwaliteitswaarschuwingen = _rapport_kwaliteitscheck(claude_result['data'], df, eigen_rekeningen)
+        if kwaliteitswaarschuwingen:
+            update(f'AI-analyse compleet, {len(kwaliteitswaarschuwingen)} waarschuwing(en)', 70)
+        else:
+            update('AI-analyse compleet, kwaliteitscheck geslaagd', 70)
 
         # 4. Rapport data samenstellen
         rapport_data = {

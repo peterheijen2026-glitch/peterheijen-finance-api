@@ -958,6 +958,10 @@ def _classificeer_rule_based(df: pd.DataFrame) -> pd.DataFrame:
                     df.at[idx, 'classificatie_bron'] = 'rule'
                     n_geclassificeerd += 1
                     break
+                # Tankstations: positief bedrag >€100 is GEEN benzine (Shell Energy etc.)
+                # Laat AI dit classificeren (vaak energie-terugbetaling)
+                elif categorie == 'Benzine/Diesel/Laden' and bedrag > 100:
+                    continue  # Skip, laat AI beslissen
                 else:
                     df.at[idx, 'regel_sectie'] = sectie
                     df.at[idx, 'regel_categorie'] = categorie
@@ -983,23 +987,19 @@ def _classificeer_rule_based(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def _detecteer_salaris_uit_bv(df: pd.DataFrame) -> pd.DataFrame:
-    """Detecteer salaris/loon uit een B.V. op basis van patronen — GEEN hardcoded namen.
+def _detecteer_vast_inkomen(df: pd.DataFrame) -> pd.DataFrame:
+    """Detecteer ALLE vormen van vast inkomen — GEEN hardcoded namen.
 
-    Werkt voor ALLE Nederlandse huishoudens: zowel DGA's als werknemers bij een B.V.
+    Werkt voor ALLE Nederlandse huishoudens:
+    - DGA's met Holding/Management B.V. → DGA-loon/Managementfee
+    - Werknemers bij B.V./N.V./Stichting/Gemeente/Overheid → Netto salaris
+    - Iedereen met "SALARIS"/"LOON" in transactieomschrijving → Netto salaris
+    - Onbekende bron maar vast maandelijks patroon ≥€800 → Netto salaris
 
-    Slimme categorie-toewijzing:
-    - "HOLDING" / "HLDG" in naam → DGA-loon/Managementfee (waarschijnlijk eigen B.V.)
-    - "MANAGEMENT" + bedrijfscontext → DGA-loon/Managementfee
-    - Overige B.V.'s → Netto salaris (veilige default, meeste mensen zijn werknemer)
-
-    Heuristiek:
-    1. Zoek tegenpartijen waarvan de naam "B.V.", "BV", "HOLDING" etc. bevat
-    2. Die minstens 3x voorkomen met POSITIEF bedrag (geld ontvangt)
-    3. Waarvan het bedrag (semi-)vast is (std < 25% van gemiddelde)
-    4. Met gemiddeld ≥€500 per betaling
-
-    Classificeert als: inkomsten / DGA-loon/Managementfee OF Netto salaris
+    Drie detectie-lagen (van meest naar minst betrouwbaar):
+    1. KEYWORD: "SALARIS"/"LOON" in omschrijving → confidence 0.95
+    2. RECHTSVORM: B.V./Stichting/N.V./Gemeente etc. → confidence 0.88-0.90
+    3. PATROON: onbekende bron, ≥6x vast bedrag ≥€800 → confidence 0.80
     """
     if 'Omschrijving' not in df.columns:
         return df
@@ -1011,56 +1011,101 @@ def _detecteer_salaris_uit_bv(df: pd.DataFrame) -> pd.DataFrame:
     if len(df_kandidaat) == 0:
         return df
 
+    # Bekende merchants uitsluiten
+    bekende_merchants = set()
+    for zoekterm, _, _, _ in MERCHANT_MAPPING:
+        bekende_merchants.add(zoekterm)
+
     n_dga = 0
     n_salaris = 0
+    n_keyword = 0
+    gevonden_ibans = set()
 
-    # Groepeer per tegenpartij (Tegenrekening als die er is, anders op naam in omschrijving)
+    # =========================================================================
+    # LAAG 1: KEYWORD — "SALARIS" / "LOON" in omschrijving
+    # =========================================================================
+    for idx, row in df_kandidaat.iterrows():
+        omschr = str(row.get('Omschrijving', '')).upper()
+        bedrag = float(row.get('bedrag', 0))
+
+        salaris_keywords = ['SALARIS', ' LOON ', 'LOON/', '/LOON', 'SALARY',
+                            'NETTO LOON', 'NETTOLOON', 'LOONBETALING',
+                            'SALARISBETALING', 'MAANDLOON']
+        if any(kw in omschr or omschr.startswith(kw.lstrip()) for kw in salaris_keywords):
+            if bedrag >= 200:
+                df.at[idx, 'regel_sectie'] = 'inkomsten'
+                df.at[idx, 'regel_categorie'] = 'Netto salaris'
+                df.at[idx, 'regel_confidence'] = 0.95
+                df.at[idx, 'classificatie_bron'] = 'rule'
+                n_keyword += 1
+                if 'Tegenrekening' in df.columns:
+                    tegen = _normaliseer_iban(str(row.get('Tegenrekening', '')))
+                    if tegen:
+                        gevonden_ibans.add(tegen)
+
+    if n_keyword > 0:
+        logger.info(f"SALARIS-KEYWORD: {n_keyword} transacties met 'SALARIS'/'LOON' in omschrijving")
+
+    # Update kandidaten
+    mask = (~df['is_intern']) & (df['classificatie_bron'].isna()) & (df['bedrag'] > 0)
+    df_kandidaat = df[mask].copy()
+
+    # =========================================================================
+    # LAAG 2: RECHTSVORM — B.V., Stichting, N.V., Gemeente, etc.
+    # =========================================================================
     groepeer_col = 'Tegenrekening' if 'Tegenrekening' in df.columns else 'Omschrijving'
 
     for key, groep in df_kandidaat.groupby(groepeer_col):
         key_str = str(key).upper().strip()
 
-        # Check: bevat de tegenpartij of omschrijving een rechtsvorm-indicator?
+        if 'Tegenrekening' in df.columns:
+            tegen_norm = _normaliseer_iban(key_str)
+            if tegen_norm in gevonden_ibans:
+                continue
+
         omschr_alle = ' '.join(groep['Omschrijving'].astype(str).str.upper())
         tekst_check = key_str + ' ' + omschr_alle
 
-        # Patronen die wijzen op een vennootschap
+        is_merchant = any(m in tekst_check for m in bekende_merchants)
+        if is_merchant:
+            continue
+
         bv_markers = ['B.V.', ' BV ', ' BV,', 'B.V ', ' B.V', ' BV.']
         holding_markers = ['HOLDING', 'HLDG']
+        werkgever_markers = ['STICHTING', 'GEMEENTE', 'MINISTERIE', 'PROVINCIE',
+                             'UNIVERSITEIT', 'HOGESCHOOL', 'POLITIE', 'RIJKS',
+                             'WATERSCHAP', 'GGD', 'GGZ', 'ZIEKENHUIS']
+        nv_markers = ['N.V.', ' NV ', ' NV,', 'N.V ']
         mgmt_met_bedrijf = ('MANAGEMENT' in tekst_check and
                             any(m in tekst_check for m in bv_markers + holding_markers +
                                 ['CONSULTANCY', 'ADVIES', 'DIENSTEN']))
 
         heeft_bv = any(marker in tekst_check for marker in bv_markers)
         heeft_holding = any(marker in tekst_check for marker in holding_markers)
+        heeft_werkgever = any(marker in tekst_check for marker in werkgever_markers)
+        heeft_nv = any(marker in tekst_check for marker in nv_markers)
 
-        if not (heeft_bv or heeft_holding or mgmt_met_bedrijf):
+        if not (heeft_bv or heeft_holding or mgmt_met_bedrijf or heeft_werkgever or heeft_nv):
             continue
 
-        # Filter: alleen positieve transacties (inkomend geld)
         groep_pos = groep[groep['bedrag'] > 0]
         if len(groep_pos) < 3:
             continue
 
-        # Check: zijn de bedragen (semi-)vast?
         bedragen = groep_pos['bedrag'].astype(float)
         gemiddeld = bedragen.mean()
         if gemiddeld < 500:
-            continue  # Minder dan €500 gemiddeld is waarschijnlijk geen loon/salaris
+            continue
 
         std = bedragen.std()
         variatie = (std / gemiddeld) if gemiddeld > 0 else 1.0
         if variatie >= 0.25:
-            continue  # Te variabel voor vast loon/salaris
+            continue
 
-        # Bepaal categorie: DGA-loon of gewoon salaris?
-        # DGA-signalen: HOLDING, HLDG, MANAGEMENT+bedrijfscontext
-        is_dga = heeft_holding or mgmt_met_bedrijf
-        # Salaris-keyword in omschrijving versterkt "gewoon salaris"
-        salaris_keywords = ['SALARIS', 'LOON', 'SALARY', 'NETTO']
-        heeft_salaris_keyword = any(kw in tekst_check for kw in salaris_keywords)
+        is_dga = (heeft_holding or mgmt_met_bedrijf) and not heeft_werkgever
+        heeft_salaris_kw = any(kw in tekst_check for kw in ['SALARIS', 'LOON', 'SALARY'])
 
-        if is_dga and not heeft_salaris_keyword:
+        if is_dga and not heeft_salaris_kw:
             categorie = 'DGA-loon/Managementfee'
             confidence = 0.90
         else:
@@ -1078,16 +1123,58 @@ def _detecteer_salaris_uit_bv(df: pd.DataFrame) -> pd.DataFrame:
             n_dga += len(groep_pos)
         else:
             n_salaris += len(groep_pos)
+        if 'Tegenrekening' in df.columns:
+            gevonden_ibans.add(_normaliseer_iban(key_str))
         logger.info(
             f"{'DGA-LOON' if is_dga else 'SALARIS'} GEDETECTEERD: {key_str[:50]} — "
-            f"{len(groep_pos)} betalingen, gemiddeld EUR {gemiddeld:,.0f}, "
-            f"totaal EUR {totaal:,.0f}, {variatie*100:.0f}% variatie → {categorie}"
+            f"{len(groep_pos)}x, gem EUR {gemiddeld:,.0f}, {variatie*100:.0f}% var → {categorie}"
         )
 
-    if n_dga + n_salaris > 0:
-        logger.info(f"BV-INKOMEN: {n_dga} DGA-loon + {n_salaris} Netto salaris transacties geclassificeerd")
+    # =========================================================================
+    # LAAG 3: PATROON — onbekende bron maar vast maandelijks bedrag
+    # Strengere eisen: ≥6 betalingen, ≥€800, <20% variatie
+    # =========================================================================
+    mask = (~df['is_intern']) & (df['classificatie_bron'].isna()) & (df['bedrag'] > 0)
+    df_rest = df[mask].copy()
+
+    if len(df_rest) > 0 and 'Tegenrekening' in df.columns:
+        df_rest['_tegen_norm'] = df_rest['Tegenrekening'].apply(_normaliseer_iban)
+        df_rest = df_rest[(df_rest['_tegen_norm'] != '') & (~df_rest['_tegen_norm'].isin(gevonden_ibans))]
+
+        for tegen_rek, groep in df_rest.groupby('_tegen_norm'):
+            groep_pos = groep[groep['bedrag'] > 0]
+            if len(groep_pos) < 6:
+                continue
+
+            omschr_check = ' '.join(groep_pos['Omschrijving'].astype(str).str.upper().head(5))
+            if any(m in omschr_check for m in bekende_merchants):
+                continue
+
+            bedragen = groep_pos['bedrag'].astype(float)
+            gemiddeld = bedragen.mean()
+            if gemiddeld < 800:
+                continue
+
+            std = bedragen.std()
+            variatie = (std / gemiddeld) if gemiddeld > 0 else 1.0
+            if variatie < 0.20:
+                mask_match = df.index.isin(groep_pos.index)
+                df.loc[mask_match, 'regel_sectie'] = 'inkomsten'
+                df.loc[mask_match, 'regel_categorie'] = 'Netto salaris'
+                df.loc[mask_match, 'regel_confidence'] = 0.80
+                df.loc[mask_match, 'classificatie_bron'] = 'rule'
+                n_salaris += len(groep_pos)
+                naam = groep_pos.iloc[0]['Omschrijving']
+                logger.info(
+                    f"SALARIS-PATROON: {tegen_rek} ({str(naam)[:30]}) — "
+                    f"{len(groep_pos)}x, gem EUR {gemiddeld:,.0f}, {variatie*100:.0f}% var"
+                )
+
+    totaal_gevonden = n_keyword + n_dga + n_salaris
+    if totaal_gevonden > 0:
+        logger.info(f"VAST INKOMEN: {totaal_gevonden} tx — {n_keyword} keyword, {n_dga} DGA, {n_salaris} salaris")
     else:
-        logger.info("BV-INKOMEN: geen vast inkomen uit B.V. gedetecteerd")
+        logger.info("VAST INKOMEN: geen vast inkomen gedetecteerd")
 
     return df
 
@@ -2979,9 +3066,9 @@ def _run_rapport_pipeline(job_id: str, bestanden: list, email: str):
         n_regel = len(df[df['classificatie_bron'] == 'rule'])
         update(f'{n_regel} transacties rule-based geclassificeerd', 24)
 
-        # 1d. Patroon-detectie: DGA-loon en huurinkomsten (vóór AI)
-        update('DGA-loon en huurinkomsten detecteren...', 24)
-        df = _detecteer_salaris_uit_bv(df)
+        # 1d. Patroon-detectie: vast inkomen en huurinkomsten (vóór AI)
+        update('Vast inkomen en huurinkomsten detecteren...', 24)
+        df = _detecteer_vast_inkomen(df)
         df = _detecteer_huurinkomsten(df)
         n_regel_na = len(df[df['classificatie_bron'] == 'rule'])
         n_patroon = n_regel_na - n_regel

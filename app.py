@@ -299,6 +299,7 @@ Gebruik deze kenmerken om het TYPE belasting te bepalen:
 - Belastingdienst BETALING (negatief bedrag) → juiste belastingcategorie hierboven
 
 ## CATEGORISATIE-HINTS VOOR DEZE DATA
+- ENGELCKE B.V. → eigen BV van de gebruiker → DGA-loon/Managementfee
 - UWV → UWV/Uitkeringen
 - DHR M J C DE MONNINK → Huurinkomsten
 - Saxo Bank → Effectenrekening
@@ -335,7 +336,7 @@ Gebruik deze kenmerken om het TYPE belasting te bepalen:
 - Online aankopen (bol.com etc.) zijn NIET automatisch "Overig" — categoriseer op basis van wat er waarschijnlijk gekocht is.
 - Elke transactie met een herkenbare tegenpartij MOET in een specifieke categorie, NOOIT in "Overig".
 - Bekijk het bedrag: kleine bedragen bij een onbekende tegenpartij passen vaak bij Boodschappen, Huishoudelijke artikelen, of Café. Grotere bedragen bij onbekenden passen vaak bij Onderhoud woning, Meubels, of Vakantie.
-- Neem NOOIT aan dat een BV (besloten vennootschap) eigendom is van de gebruiker. Als je transacties ziet naar/van een BV, beschrijf dan alleen de feitelijke geldstroom. Zeg NIET "uw BV", "uw vennootschap" of "uw onderneming" tenzij dit 100% duidelijk is uit de data (bijv. de rekening staat op naam van de BV). Een betaling AAN een BV betekent NIET dat de gebruiker eigenaar is van die BV.
+- BV-eigendom: zeg ALLEEN "uw BV" als de BV voorkomt in de CATEGORISATIE-HINTS als eigen BV van de gebruiker. Als een BV NIET in de hints staat, beschrijf dan alleen de feitelijke geldstroom zonder eigendom aan te nemen. Een betaling AAN een BV betekent NIET dat de gebruiker eigenaar is.
 
 ## CORRECTE TOTALEN
 {json.dumps(feiten, indent=2, ensure_ascii=False)}
@@ -370,10 +371,11 @@ Antwoord ALLEEN in valid JSON:
     }}
   }},
   "analyse": {{
-    "samenvatting": "3-4 alinea's: schets het complete financiële beeld. Noem concrete bedragen, vergelijk maanden, signaleer trends. Schrijf als een ervaren financieel adviseur die een vermogende particulier adviseert.",
-    "sterke_punten": ["Noem 3-5 sterke punten met concrete bedragen, bv: 'Stabiel DGA-inkomen van €X per maand'"],
-    "aandachtspunten": ["Noem 3-5 aandachtspunten met concrete bedragen en vergelijkingen, bv: 'Variabele kosten stegen van €X in mei naar €Y in juni'"],
-    "aanbevelingen": ["Geef 3-5 concrete, uitvoerbare aanbevelingen specifiek voor deze persoon, niet generiek"]
+    "samenvatting": "3-4 alinea's. Schrijf als een senior financieel adviseur die een vermogende particulier of DGA informeert — rustig, zakelijk, respectvol. Begin met het totaalbeeld: hoeveel komt er structureel binnen, hoeveel gaat er structureel uit, hoeveel gaat naar vermogensopbouw. Benoem dan de cashflowdynamiek: zijn er grote interne verschuivingen, beleggingstransacties, of seizoenseffecten die het beeld vertekenen? Eindig met de kern: waar zit de financiele kracht en waar de kwetsbaarheid. Noem altijd concrete bedragen. Gebruik NOOIT een oordelende of budgetcoach-achtige toon ('u geeft te veel uit', 'onnodige aankopen'). Gebruik in plaats daarvan neutrale financiele taal ('deze categorie vertoont spreiding', 'discretionair verbruik concentreert zich in...', 'uw liquiditeitsmarge is...').",
+    "sterke_punten": ["Noem 3-5 financiele sterktes met concrete bedragen. Schrijf bevestigend en zakelijk, bv: 'Stabiel structureel inkomen van gemiddeld €X/mnd via DGA-loon en huurinkomsten', 'Actieve vermogensopbouw: gemiddeld €X/mnd naar beleggingen en pensioen'"],
+    "aandachtspunten": ["Noem 3-5 signalen die aandacht verdienen. Gebruik GEEN oordelende taal. Schrijf als observaties, bv: 'Discretionaire uitgaven vertonen maandelijkse spreiding van €X tot €Y — mogelijke grip-verbetering', 'Liquiditeitsmarge na vaste lasten en vermogensopbouw is beperkt tot ca. €X/mnd'"],
+    "aanbevelingen": ["Geef 3-5 concrete, strategische aanbevelingen. Denk op het niveau van financieel advies, niet budgetcoaching. Bv: 'Overweeg een liquiditeitsbuffer van 3-6 maanden vaste lasten (ca. €X) aan te houden alvorens extra beleggingen', 'Consolidatie van beleggingsrekeningen kan beheerkosten en overzicht verbeteren'"],
+    "verrassende_inzichten": ["Geef 2-3 patronen of inzichten die een drukke vermogende particulier NIET zelf zou zien maar die een AI wel opvalt. Denk aan: seizoenspatronen in cashflow, verborgen belastingoptimalisatie-mogelijkheden, structurele mismatch tussen inkomen en vermogensopbouw, ongewone correlaties, DGA-loon vs dividendoptimalisatie, effectief belastingtarief dat te hoog lijkt, categorieën die relatief hoog zijn vergeleken met vergelijkbare huishoudens. Dit is de WOW-factor van het rapport — maak het concreet met bedragen en vertel iets dat de klant verrast."]
   }}
 }}"""
 
@@ -534,8 +536,12 @@ class RapportPDF(FPDF):
         self.set_text_color(*INK_SOFT)
         self.cell(0, 10, 'Dit rapport is gegenereerd door PeterHeijen.com  |  Vertrouwelijk', 0, 0, 'C')
 
-    def cover_page(self, feiten: dict, rapport_datum: str):
-        """Pagina 1: Cover met samenvatting — premium uitstraling."""
+    def cover_page(self, feiten: dict, rapport_datum: str, jaartotalen: dict = None, maandoverzicht: dict = None):
+        """Pagina 1: Executive summary op huishoudniveau — premium uitstraling.
+
+        Toont niet per rekening, maar het totaalbeeld:
+        structureel inkomen, vaste lasten, vrij besteedbaar, vermogensopbouw.
+        """
         # Donkere header
         self.set_fill_color(*INK)
         self.rect(0, 0, 210, 80, 'F')
@@ -545,70 +551,124 @@ class RapportPDF(FPDF):
         self.set_line_width(0.8)
         self.line(15, 72, 55, 72)
 
-        # Titel — Playfair Display voor premium serif look
+        # Titel
         self.set_font(self.HEADING, '', 28)
         self.set_text_color(*WHITE)
         self.set_xy(15, 22)
-        self.cell(0, 12, 'Financieel Rapport', 0, 1, 'L')
+        self.cell(0, 12, 'Financieel Overzicht', 0, 1, 'L')
 
-        # Subtitel — Source Serif voor warme leesbaarheid
+        # Subtitel
         self.set_font(self.BODY, '', 12)
         self.set_text_color(200, 200, 210)
         self.set_xy(15, 38)
-        self.cell(0, 7, 'Persoonlijk overzicht van uw inkomsten, uitgaven en vermogen', 0, 1, 'L')
+        self.cell(0, 7, 'Uw persoonlijke financiele situatie in een oogopslag', 0, 1, 'L')
 
-        # Datum
+        # Datum + scope
         self.set_font(self.DATA, '', 9)
         self.set_text_color(150, 150, 170)
         self.set_xy(15, 52)
         self.cell(0, 6, f'Gegenereerd op {rapport_datum}', 0, 1, 'L')
-
-        # Rekening info
         self.set_xy(15, 58)
-        rek_list = list(feiten.keys())
-        self.cell(0, 6, f'{len(rek_list)} rekening(en) geanalyseerd', 0, 1, 'L')
+        periodes = []
+        for f in feiten.values():
+            periodes.extend([f['periode']['van'], f['periode']['tot']])
+        van = min(periodes) if periodes else ''
+        tot = max(periodes) if periodes else ''
+        self.cell(0, 6, f'{len(feiten)} rekening(en) geanalyseerd  |  {van} t/m {tot}', 0, 1, 'L')
 
-        # Quick stats onder de header
-        self.set_y(88)
-        self.set_text_color(*INK)
+        # --- Executive metrics: gecombineerde cijfers ---
+        # Bereken totalen over alle rekeningen (excl. interne verschuivingen)
+        n_maanden = 1
+        if maandoverzicht:
+            all_months = set()
+            for rek_m in maandoverzicht.values():
+                all_months.update(rek_m.keys())
+            n_maanden = max(len(all_months), 1)
 
-        for rek, info in feiten.items():
+        totaal_inkomen = 0
+        totaal_vaste = 0
+        totaal_variabel = 0
+        totaal_sparen = 0
+
+        if jaartotalen:
+            for rek, totalen in jaartotalen.items():
+                for cat, bedrag in totalen.get('inkomsten', {}).items():
+                    totaal_inkomen += abs(bedrag or 0)
+                for cat, bedrag in totalen.get('vaste_lasten', {}).items():
+                    totaal_vaste += abs(bedrag or 0)
+                for cat, bedrag in totalen.get('variabele_kosten', {}).items():
+                    totaal_variabel += abs(bedrag or 0)
+                for cat, bedrag in totalen.get('sparen_beleggen', {}).items():
+                    totaal_sparen += abs(bedrag or 0)
+
+        pm_inkomen = totaal_inkomen / n_maanden
+        pm_vaste = totaal_vaste / n_maanden
+        pm_variabel = totaal_variabel / n_maanden
+        pm_sparen = totaal_sparen / n_maanden
+        pm_vrij = pm_inkomen - pm_vaste - pm_variabel - pm_sparen
+
+        # Metrics grid — 5 blokken
+        self.set_y(90)
+        metrics = [
+            ('Structureel inkomen', pm_inkomen, '/mnd', ACCENT),
+            ('Vaste lasten', pm_vaste, '/mnd', (139, 69, 19)),
+            ('Variabele kosten', pm_variabel, '/mnd', (74, 85, 104)),
+            ('Vermogensopbouw', pm_sparen, '/mnd', (26, 107, 60)),
+            ('Vrij besteedbaar', pm_vrij, '/mnd', GREEN if pm_vrij >= 0 else RED),
+        ]
+
+        box_w = 85
+        box_h = 28
+        gap = 10
+        start_x = 15
+
+        for i, (label, value, suffix, color) in enumerate(metrics):
+            col = i % 2
+            row = i // 2
+            x = start_x + col * (box_w + gap)
+            y = 90 + row * (box_h + 6)
+
+            # Achtergrond
             self.set_fill_color(*SURFACE)
-            self.rect(15, self.get_y(), 180, 26, 'F')
             self.set_draw_color(*BORDER)
-            self.rect(15, self.get_y(), 180, 26, 'D')
+            self.rect(x, y, box_w, box_h, 'FD')
 
-            y = self.get_y() + 3
-            self.set_font(self.DATA, 'B', 9)
-            self.set_text_color(*INK)
-            self.set_xy(20, y)
-            self.cell(50, 5, f'Rekening {rek}', 0, 0, 'L')
-
-            self.set_font(self.DATA, '', 8)
+            # Label
+            self.set_font(self.DATA, '', 7.5)
             self.set_text_color(*INK_SOFT)
-            self.set_xy(20, y + 7)
-            self.cell(40, 5, f'{info["periode"]["van"]} t/m {info["periode"]["tot"]}', 0, 0, 'L')
+            self.set_xy(x + 8, y + 5)
+            self.cell(box_w - 16, 4, label, 0, 0, 'L')
 
-            col_x = [85, 115, 150]
-            labels = ['Inkomsten', 'Uitgaven', 'Netto']
-            values = [info['totalen']['inkomsten'], info['totalen']['uitgaven'], info['totalen']['netto']]
-            colors = [GREEN, RED, GREEN if values[2] >= 0 else RED]
+            # Bedrag
+            self.set_font(self.DATA, 'B', 13)
+            self.set_text_color(*color)
+            self.set_xy(x + 8, y + 13)
+            self.cell(box_w - 16, 7, eur(value) + suffix, 0, 0, 'L')
 
-            for i in range(3):
-                self.set_text_color(*INK_SOFT)
-                self.set_font(self.DATA, '', 7)
-                self.set_xy(col_x[i], y)
-                self.cell(30, 5, labels[i], 0, 0, 'C')
-                self.set_text_color(*colors[i])
-                self.set_font(self.DATA, 'B', 9)
-                self.set_xy(col_x[i], y + 7)
-                self.cell(30, 5, eur(values[i]), 0, 0, 'C')
+        # Laatste blok (Vrij besteedbaar) centraal als het oneven is
+        if len(metrics) % 2 == 1:
+            pass  # Al correct geplaatst door grid logica
 
-            self.set_y(self.get_y() + 30)
+        # --- Cashflow-reconciliatie uitleg ---
+        self.set_y(90 + 3 * (box_h + 6) + 4)
+        self.set_draw_color(*GOLD)
+        self.set_line_width(0.4)
+        self.line(15, self.get_y(), 195, self.get_y())
+        self.ln(4)
+
+        self.set_font(self.BODY, 'I', 8.5)
+        self.set_text_color(*INK_SOFT)
+        uitleg = (
+            f'Dit overzicht toont uw gemiddelde maandelijkse geldstromen over {n_maanden} maanden, '
+            f'berekend op basis van {len(feiten)} rekening(en). '
+            f'Interne overboekingen tussen uw eigen rekeningen zijn hierin niet meegerekend — '
+            f'zij verschuiven geld maar veranderen uw financiele positie niet.'
+        )
+        self.multi_cell(180, 4.5, uitleg, 0, 'L')
 
         # Disclaimer onderaan cover
-        self.set_y(255)
-        self.set_font(self.DATA, '', 7)
+        self.set_y(258)
+        self.set_font(self.DATA, '', 6.5)
         self.set_text_color(*INK_SOFT)
         self.cell(180, 4, 'Dit rapport is uitsluitend bedoeld als financieel inzicht en vormt geen financieel advies.', 0, 1, 'C')
         self.cell(180, 4, 'Raadpleeg altijd een erkend financieel adviseur voor persoonlijke beslissingen.', 0, 1, 'C')
@@ -641,6 +701,49 @@ class RapportPDF(FPDF):
         # Aanbevelingen
         if analyse.get('aanbevelingen'):
             self._bullet_section('Aanbevelingen', analyse['aanbevelingen'], ACCENT)
+
+        # Verrassende inzichten — de WOW-factor
+        if analyse.get('verrassende_inzichten'):
+            self._insight_section('Wat valt op?', analyse['verrassende_inzichten'])
+
+    def _insight_section(self, title: str, items: list):
+        """Premium sectie voor verrassende inzichten — visueel onderscheidend."""
+        if self.get_y() + 25 > 270:
+            self.add_page()
+
+        # Gouden accent balk
+        self.set_fill_color(*GOLD)
+        self.rect(15, self.get_y(), 3, 8, 'F')
+        self.set_font(self.HEADING, '', 12)
+        self.set_text_color(*INK)
+        self.set_x(22)
+        self.cell(0, 8, title, 0, 1, 'L')
+        self.ln(2)
+
+        self.set_font(self.BODY, '', 9.5)
+        self.set_text_color(*INK)
+        for i, item in enumerate(items):
+            est_lines = max(1, len(item) // 80 + 1)
+            est_h = est_lines * 5 + 8
+            if self.get_y() + est_h > 270:
+                self.add_page()
+
+            # Genummerd met gouden cirkel
+            y = self.get_y()
+            self.set_fill_color(*GOLD)
+            self.set_text_color(*WHITE)
+            self.set_font(self.DATA, 'B', 8)
+            # Kleine gouden cirkel met nummer
+            cx = 20
+            self.set_xy(cx - 3, y)
+            self.cell(8, 5, str(i + 1), 0, 0, 'C')
+            # Tekst
+            self.set_text_color(*INK)
+            self.set_font(self.BODY, '', 9.5)
+            self.set_xy(30, y)
+            self.multi_cell(165, 5, item)
+            self.ln(2)
+        self.ln(3)
 
     def _section_title(self, title: str):
         self.set_font(self.HEADING, '', 16)
@@ -928,6 +1031,75 @@ class RapportPDF(FPDF):
                 self.ln(6)
 
 
+def _combineer_maandoverzichten(maandoverzicht: dict) -> dict:
+    """Combineer maandoverzichten van alle rekeningen tot één geheel.
+
+    Telt bedragen per categorie per maand op over alle rekeningen.
+    Slaat interne_verschuivingen over — die vallen weg in het totaalbeeld.
+    Retourneert: {'TOTAAL': {maand: {sectie: {cat: {bedrag: x}}}}}
+    """
+    gecombineerd = {}
+
+    for rek, maanden in maandoverzicht.items():
+        for maand, secties in maanden.items():
+            if maand not in gecombineerd:
+                gecombineerd[maand] = {}
+            for sec_key, cats in secties.items():
+                if not isinstance(cats, dict):
+                    continue
+                # Interne verschuivingen overslaan in gecombineerd overzicht
+                if sec_key == 'interne_verschuivingen':
+                    continue
+                if sec_key not in gecombineerd[maand]:
+                    gecombineerd[maand][sec_key] = {}
+                for cat, val in cats.items():
+                    b = val.get('bedrag', 0) if isinstance(val, dict) else (val or 0)
+                    if cat not in gecombineerd[maand][sec_key]:
+                        gecombineerd[maand][sec_key][cat] = {'bedrag': 0}
+                    gecombineerd[maand][sec_key][cat]['bedrag'] += b
+
+    return {'TOTAAL': gecombineerd}
+
+
+def _combineer_jaartotalen(jaartotalen: dict) -> dict:
+    """Combineer jaartotalen van alle rekeningen tot één geheel.
+
+    Slaat interne_verschuivingen over.
+    """
+    gecombineerd = {}
+
+    for rek, totalen in jaartotalen.items():
+        for sec_key, cats in totalen.items():
+            if not isinstance(cats, dict):
+                continue
+            # Interne verschuivingen overslaan
+            if sec_key == 'interne_verschuivingen':
+                continue
+            if sec_key not in gecombineerd:
+                gecombineerd[sec_key] = {}
+            for cat, bedrag in cats.items():
+                if cat not in gecombineerd[sec_key]:
+                    gecombineerd[sec_key][cat] = 0
+                gecombineerd[sec_key][cat] += (bedrag or 0)
+
+    return {'TOTAAL': gecombineerd}
+
+
+def _combineer_feiten(feiten: dict) -> dict:
+    """Combineer feiten van alle rekeningen voor cover-stats."""
+    totaal_ink = sum(f['totalen']['inkomsten'] for f in feiten.values())
+    totaal_uit = sum(f['totalen']['uitgaven'] for f in feiten.values())
+    periodes = []
+    for f in feiten.values():
+        periodes.append(f['periode']['van'])
+        periodes.append(f['periode']['tot'])
+
+    return {
+        'totalen': {'inkomsten': totaal_ink, 'uitgaven': totaal_uit, 'netto': totaal_ink + totaal_uit},
+        'periode': {'van': min(periodes), 'tot': max(periodes)},
+    }
+
+
 def genereer_pdf(rapport: dict) -> bytes:
     """Genereer een premium PDF rapport."""
     pdf = RapportPDF()
@@ -938,21 +1110,48 @@ def genereer_pdf(rapport: dict) -> bytes:
     jaartotalen = rapport.get('jaartotalen', {})
     datum = datetime.now().strftime('%d-%m-%Y')
 
-    # Pagina 1: Cover + quick stats
+    # Pagina 1: Executive summary op huishoudniveau
     pdf.add_page()
-    pdf.cover_page(feiten, datum)
+    pdf.cover_page(feiten, datum, jaartotalen=jaartotalen, maandoverzicht=maandoverzicht)
 
     # Pagina 2: Analyse & Inzichten
     if analyse and analyse.get('samenvatting'):
         pdf.analyse_page(analyse)
 
-    # Pagina 3+: Maandoverzicht (spreadsheet)
-    if maandoverzicht:
-        pdf.maandoverzicht_page(maandoverzicht, feiten)
+    # --- BIJLAGE: Gedetailleerd overzicht ---
+    # Scheidingspagina
+    pdf.add_page()
+    pdf.set_fill_color(*INK)
+    pdf.rect(0, 0, 210, 297, 'F')
+    pdf.set_font(pdf.HEADING, '', 22)
+    pdf.set_text_color(*WHITE)
+    pdf.set_xy(15, 120)
+    pdf.cell(180, 12, 'Bijlage', 0, 1, 'C')
+    pdf.set_font(pdf.BODY, '', 11)
+    pdf.set_text_color(180, 180, 195)
+    pdf.set_xy(15, 138)
+    pdf.cell(180, 7, 'Gedetailleerd maand- en jaaroverzicht', 0, 1, 'C')
+    pdf.set_draw_color(*GOLD)
+    pdf.set_line_width(0.6)
+    pdf.line(85, 150, 125, 150)
 
-    # Pagina 4+: Jaartotalen
-    if jaartotalen:
-        pdf.jaartotalen_page(jaartotalen, maandoverzicht)
+    # Gecombineerd overzicht (alle rekeningen samen)
+    if maandoverzicht and len(feiten) >= 1:
+        combi_maand = _combineer_maandoverzichten(maandoverzicht)
+        combi_feiten = {'TOTAAL': _combineer_feiten(feiten)}
+        pdf.maandoverzicht_page(combi_maand, combi_feiten)
+
+    if jaartotalen and len(feiten) >= 1:
+        combi_jaar = _combineer_jaartotalen(jaartotalen)
+        combi_maand_count = _combineer_maandoverzichten(maandoverzicht) if maandoverzicht else {}
+        pdf.jaartotalen_page(combi_jaar, combi_maand_count)
+
+    # Detail per rekening (alleen als er meerdere rekeningen zijn)
+    if len(feiten) > 1:
+        if maandoverzicht:
+            pdf.maandoverzicht_page(maandoverzicht, feiten)
+        if jaartotalen:
+            pdf.jaartotalen_page(jaartotalen, maandoverzicht)
 
     return pdf.output()
 

@@ -495,10 +495,13 @@ def lees_transacties(inhoud: bytes, bestandsnaam: str) -> pd.DataFrame:
     if ontbreekt:
         raise ValueError(f"Kolommen ontbreken na normalisatie: {ontbreekt}. Gevonden: {list(df.columns)}")
 
+    # Rekeningnummer altijd als string (ABN AMRO levert int, andere banken string)
+    df['Rekeningnummer'] = df['Rekeningnummer'].astype(str).str.strip()
+
     # Saldo's toevoegen als die nog ontbreken
     df = _bereken_saldos(df)
 
-    # Datum parsing — flexibel (YYYYMMDD)
+    # Datum parsing - flexibel (YYYYMMDD)
     df['Transactiedatum'] = df['Transactiedatum'].astype(str)
     try:
         df['datum'] = pd.to_datetime(df['Transactiedatum'], format='%Y%m%d')

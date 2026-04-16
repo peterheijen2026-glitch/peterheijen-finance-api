@@ -823,17 +823,21 @@ def vraag_claude(prompt: str) -> dict:
     if not api_key:
         raise ValueError("ANTHROPIC_API_KEY niet geconfigureerd")
 
-    client = Anthropic(api_key=api_key)
+    import httpx
+    # Ruime timeout voor Opus met grote prompts (66K+ tokens kan 5-8 min duren)
+    client = Anthropic(
+        api_key=api_key,
+        timeout=httpx.Timeout(600.0, connect=30.0),
+    )
     # Gebruik het slimste model voor de beste kwaliteit.
-    # Kwaliteit > snelheid. Timeouts zijn ruim genoeg (10 min frontend, 5 min Claude).
+    # Kwaliteit > snelheid.
     model = os.environ.get('CLAUDE_MODEL', 'claude-opus-4-6')
 
-    logger.info(f"Claude aanroepen ({model}), prompt: {len(prompt)} tekens")
+    logger.info(f"Claude aanroepen ({model}), prompt: {len(prompt)} tekens (~{len(prompt)//4} tokens)")
 
     response = client.messages.create(
         model=model,
         max_tokens=32000,
-        timeout=300,  # 5 minuten — Opus heeft meer tijd nodig voor grote bestanden
         messages=[{"role": "user", "content": prompt}],
     )
 

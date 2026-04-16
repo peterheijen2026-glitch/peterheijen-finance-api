@@ -299,7 +299,6 @@ Gebruik deze kenmerken om het TYPE belasting te bepalen:
 - Belastingdienst BETALING (negatief bedrag) → juiste belastingcategorie hierboven
 
 ## CATEGORISATIE-HINTS VOOR DEZE DATA
-- Sevi B.V. / ENGELCKE B.V. → DGA-loon/Managementfee
 - UWV → UWV/Uitkeringen
 - DHR M J C DE MONNINK → Huurinkomsten
 - Saxo Bank → Effectenrekening
@@ -336,6 +335,7 @@ Gebruik deze kenmerken om het TYPE belasting te bepalen:
 - Online aankopen (bol.com etc.) zijn NIET automatisch "Overig" — categoriseer op basis van wat er waarschijnlijk gekocht is.
 - Elke transactie met een herkenbare tegenpartij MOET in een specifieke categorie, NOOIT in "Overig".
 - Bekijk het bedrag: kleine bedragen bij een onbekende tegenpartij passen vaak bij Boodschappen, Huishoudelijke artikelen, of Café. Grotere bedragen bij onbekenden passen vaak bij Onderhoud woning, Meubels, of Vakantie.
+- Neem NOOIT aan dat een BV (besloten vennootschap) eigendom is van de gebruiker. Als je transacties ziet naar/van een BV, beschrijf dan alleen de feitelijke geldstroom. Zeg NIET "uw BV", "uw vennootschap" of "uw onderneming" tenzij dit 100% duidelijk is uit de data (bijv. de rekening staat op naam van de BV). Een betaling AAN een BV betekent NIET dat de gebruiker eigenaar is van die BV.
 
 ## CORRECTE TOTALEN
 {json.dumps(feiten, indent=2, ensure_ascii=False)}
@@ -526,6 +526,10 @@ class RapportPDF(FPDF):
 
     def footer(self):
         self.set_y(-15)
+        # Subtiele scheidslijn boven footer
+        self.set_draw_color(*BORDER)
+        self.set_line_width(0.2)
+        self.line(15, self.get_y(), 195 if self.cur_orientation == 'P' else 282, self.get_y())
         self.set_font(self.DATA, '', 7)
         self.set_text_color(*INK_SOFT)
         self.cell(0, 10, 'Dit rapport is gegenereerd door PeterHeijen.com  |  Vertrouwelijk', 0, 0, 'C')
@@ -602,6 +606,13 @@ class RapportPDF(FPDF):
 
             self.set_y(self.get_y() + 30)
 
+        # Disclaimer onderaan cover
+        self.set_y(255)
+        self.set_font(self.DATA, '', 7)
+        self.set_text_color(*INK_SOFT)
+        self.cell(180, 4, 'Dit rapport is uitsluitend bedoeld als financieel inzicht en vormt geen financieel advies.', 0, 1, 'C')
+        self.cell(180, 4, 'Raadpleeg altijd een erkend financieel adviseur voor persoonlijke beslissingen.', 0, 1, 'C')
+
     def analyse_page(self, analyse: dict):
         """Pagina met AI-analyse: samenvatting, sterke punten, etc."""
         self.add_page()
@@ -636,31 +647,65 @@ class RapportPDF(FPDF):
         self.set_text_color(*INK)
         self.cell(0, 10, title, 0, 1, 'L')
         self.set_draw_color(*GOLD)
-        self.set_line_width(0.6)
-        self.line(15, self.get_y(), 50, self.get_y())
-        self.ln(5)
+        self.set_line_width(0.5)
+        self.line(15, self.get_y(), 60, self.get_y())
+        self.ln(6)
 
     def _bullet_section(self, title: str, items: list, color: tuple):
+        # Check of titel + eerste item past, anders nieuwe pagina
+        if self.get_y() + 20 > 270:
+            self.add_page()
         self.set_font(self.HEADING, '', 11)
         self.set_text_color(*color)
         self.cell(0, 7, title, 0, 1, 'L')
         self.set_font(self.BODY, '', 9.5)
         self.set_text_color(*INK)
         for item in items:
+            # Schat hoogte: ~5mm per 80 tekens
+            est_lines = max(1, len(item) // 80 + 1)
+            est_h = est_lines * 5 + 2
+            if self.get_y() + est_h > 270:
+                self.add_page()
             self.set_x(20)
             self.cell(4, 5, '\u2022', 0, 0, 'L')
             self.multi_cell(170, 5, f'  {item}')
             self.ln(1)
         self.ln(4)
 
+    def _maand_table_header(self, sec_label, sec_key, months, cat_w, m_w, total_w, continued=False):
+        """Render sectie-header + maand-kolomheaders voor maandoverzicht tabel."""
+        color = SEC_COLORS.get(sec_key, INK)
+        self.set_fill_color(*color)
+        self.set_text_color(*WHITE)
+        self.set_font(self.DATA, 'B', 7)
+        label = f'  {sec_label}' + (' (vervolg)' if continued else '')
+        self.cell(total_w, 5, label, 1, 1, 'L', True)
+
+        # Maand headers
+        self.set_fill_color(*SURFACE)
+        self.set_text_color(*INK_SOFT)
+        self.set_font(self.DATA, 'B', 6)
+        self.cell(cat_w, 5, '  Categorie', 1, 0, 'L', True)
+        for m in months:
+            parts = m.split('-')
+            label = MAAND_NAMEN.get(parts[1], parts[1]) + ' ' + parts[0][2:]
+            self.cell(m_w, 5, label, 1, 0, 'C', True)
+        self.ln()
+
     def maandoverzicht_page(self, maandoverzicht: dict, feiten: dict):
-        """Pagina's met maandelijks overzicht per rekening in spreadsheet-stijl."""
+        """Pagina's met maandelijks overzicht per rekening in spreadsheet-stijl.
+
+        Slimme page-breaks: als een sectie niet op de huidige pagina past,
+        wordt de tabel gesplitst met herhaalde headers op de nieuwe pagina.
+        """
         sections_config = [
             ('inkomsten', 'INKOMSTEN'),
             ('vaste_lasten', 'VASTE LASTEN'),
             ('variabele_kosten', 'VARIABELE KOSTEN'),
             ('sparen_beleggen', 'SPAREN & BELEGGEN'),
         ]
+
+        PAGE_BOTTOM = 185  # landscape max Y voor content
 
         for rek, maanden in maandoverzicht.items():
             self.add_page('L')  # Landscape voor brede tabel
@@ -670,7 +715,11 @@ class RapportPDF(FPDF):
             if not months:
                 continue
 
-            # Verzamel categorieën per sectie
+            # Kolom breedte — vast voor alle secties op deze rekening
+            cat_w = 55
+            m_w = min((277 - cat_w - 22) / len(months), 22)
+            total_w = cat_w + m_w * len(months)
+
             for sec_key, sec_label in sections_config:
                 cats = set()
                 for m in months:
@@ -684,43 +733,64 @@ class RapportPDF(FPDF):
                 if not cats:
                     continue
 
-                # Check of er ruimte is op de pagina
-                needed = (len(cats) + 2) * 5 + 10
-                if self.get_y() + needed > 185:
-                    self.add_page('L')
+                # Benodigde hoogte: header (10mm) + rijen (4.5mm elk) + totaal (5mm) + spacing (7mm)
+                row_h = 4.5
+                header_h = 10
+                footer_h = 12  # totaal rij + spacing
+                needed = header_h + len(cats) * row_h + footer_h
 
-                # Sectie header
-                color = SEC_COLORS.get(sec_key, INK)
-                self.set_fill_color(*color)
-                self.set_text_color(*WHITE)
-                self.set_font(self.DATA, 'B', 7)
+                # Past de hele sectie op de huidige pagina?
+                if self.get_y() + needed > PAGE_BOTTOM:
+                    # Past het op een NIEUWE pagina?
+                    fresh_start = 22  # na page header
+                    if fresh_start + needed <= PAGE_BOTTOM:
+                        # Hele sectie past op nieuwe pagina
+                        self.add_page('L')
+                    else:
+                        # Te groot — we moeten splitsen. Start op nieuwe pagina
+                        # als er minder dan 5 rijen ruimte over is
+                        remaining = PAGE_BOTTOM - self.get_y()
+                        if remaining < header_h + 5 * row_h + footer_h:
+                            self.add_page('L')
 
-                # Kolom breedte berekenen
-                cat_w = 55
-                m_w = min((277 - cat_w - 22) / len(months), 22)  # max 22mm per maand
-                total_w = cat_w + m_w * len(months)
+                # Render header
+                self._maand_table_header(sec_label, sec_key, months, cat_w, m_w, total_w)
 
-                # Sectie label
-                self.cell(total_w, 5, f'  {sec_label}', 1, 1, 'L', True)
-
-                # Maand headers
-                self.set_fill_color(*SURFACE)
-                self.set_text_color(*INK_SOFT)
-                self.set_font(self.DATA, 'B', 6)
-                self.cell(cat_w, 5, '  Categorie', 1, 0, 'L', True)
-                for m in months:
-                    parts = m.split('-')
-                    label = MAAND_NAMEN.get(parts[1], parts[1]) + ' ' + parts[0][2:]
-                    self.cell(m_w, 5, label, 1, 0, 'C', True)
-                self.ln()
-
-                # Data rijen
+                # Data rijen — met slimme page-break
                 section_totals = [0.0] * len(months)
                 self.set_font(self.DATA, '', 7)
+                rows_on_page = 0
 
-                for cat in cats:
+                for ci, cat in enumerate(cats):
+                    # Check of deze rij + eventuele totaalrij past
+                    is_last = (ci == len(cats) - 1)
+                    space_needed = row_h + (footer_h if is_last else 0)
+
+                    if self.get_y() + space_needed > PAGE_BOTTOM:
+                        # Page break nodig — eerst subtotaal-tussenstand tonen
+                        self.set_fill_color(*SURFACE)
+                        self.set_font(self.DATA, 'B', 6)
+                        self.set_text_color(*INK_SOFT)
+                        self.cell(cat_w, 4, '  (vervolg op volgende pagina)', 'T', 0, 'L', True)
+                        for mi in range(len(months)):
+                            self.cell(m_w, 4, '', 'T', 0, 'R', True)
+                        self.ln()
+
+                        # Nieuwe pagina met herhaalde header
+                        self.add_page('L')
+                        self._maand_table_header(sec_label, sec_key, months, cat_w, m_w, total_w, continued=True)
+                        self.set_font(self.DATA, '', 7)
+                        rows_on_page = 0
+
+                    # Render data rij — zebra-strepen voor leesbaarheid
+                    is_even = (rows_on_page % 2 == 0)
+                    if is_even:
+                        self.set_fill_color(252, 251, 249)  # Heel subtiel warm grijs
+                    else:
+                        self.set_fill_color(*WHITE)
+
                     self.set_text_color(*INK)
-                    self.cell(cat_w, 4.5, f'  {cat[:35]}', 0, 0, 'L')
+                    self.cell(cat_w, row_h, f'  {cat[:35]}', 0, 0, 'L', True)
 
                     for mi, m in enumerate(months):
                         sd = maanden[m].get(sec_key, {})
@@ -731,11 +801,12 @@ class RapportPDF(FPDF):
 
                         if abs(b) > 0.01:
                             self.set_text_color(*(GREEN if b > 0 else RED))
-                            self.cell(m_w, 4.5, eur(b), 0, 0, 'R')
+                            self.cell(m_w, row_h, eur(b), 0, 0, 'R', True)
                         else:
                             self.set_text_color(*INK_SOFT)
-                            self.cell(m_w, 4.5, '', 0, 0, 'R')
+                            self.cell(m_w, row_h, '', 0, 0, 'R', True)
                     self.ln()
+                    rows_on_page += 1
 
                 # Subtotaal rij
                 self.set_fill_color(*SURFACE)
@@ -748,14 +819,36 @@ class RapportPDF(FPDF):
                     self.cell(m_w, 5, eur(t), 'T', 0, 'R', True)
                 self.ln(7)
 
+    def _jaar_table_header(self, sec_label, sec_key, continued=False):
+        """Render sectie-header + kolomheaders voor jaartotalen tabel."""
+        color = SEC_COLORS.get(sec_key, INK)
+        self.set_fill_color(*color)
+        self.set_text_color(*WHITE)
+        self.set_font(self.DATA, 'B', 8)
+        label = f'  {sec_label}' + (' (vervolg)' if continued else '')
+        self.cell(180, 6, label, 0, 1, 'L', True)
+
+        self.set_fill_color(*SURFACE)
+        self.set_text_color(*INK_SOFT)
+        self.set_font(self.DATA, 'B', 7)
+        self.cell(90, 5, '  Categorie', 'B', 0, 'L', True)
+        self.cell(45, 5, 'Jaarbedrag', 'B', 0, 'R', True)
+        self.cell(45, 5, 'Per maand', 'B', 1, 'R', True)
+
     def jaartotalen_page(self, jaartotalen: dict, maandoverzicht: dict):
-        """Pagina met jaartotalen per categorie."""
+        """Pagina met jaartotalen per categorie.
+
+        Slimme page-breaks: secties die te lang zijn worden gesplitst
+        met herhaalde headers op de nieuwe pagina.
+        """
         sections_config = [
             ('inkomsten', 'Inkomsten'),
             ('vaste_lasten', 'Vaste Lasten'),
             ('variabele_kosten', 'Variabele Kosten'),
             ('sparen_beleggen', 'Sparen & Beleggen'),
         ]
+
+        PAGE_BOTTOM = 270  # portrait max Y
 
         for rek, totalen in jaartotalen.items():
             self.add_page()
@@ -772,37 +865,55 @@ class RapportPDF(FPDF):
                 if not entries:
                     continue
 
-                needed = (len(entries) + 2) * 5.5 + 10
-                if self.get_y() + needed > 270:
-                    self.add_page()
+                row_h = 5
+                header_h = 11  # sectie header + kolom headers
+                footer_h = 12  # totaal rij + spacing
+                needed = header_h + len(entries) * row_h + footer_h
 
-                # Sectie header
-                color = SEC_COLORS.get(sec_key, INK)
-                self.set_fill_color(*color)
-                self.set_text_color(*WHITE)
-                self.set_font(self.DATA, 'B', 8)
-                self.cell(180, 6, f'  {sec_label}', 0, 1, 'L', True)
+                # Past de hele sectie?
+                if self.get_y() + needed > PAGE_BOTTOM:
+                    fresh_start = 22
+                    if fresh_start + needed <= PAGE_BOTTOM:
+                        self.add_page()
+                    else:
+                        remaining = PAGE_BOTTOM - self.get_y()
+                        if remaining < header_h + 3 * row_h + footer_h:
+                            self.add_page()
 
-                # Kolom headers
-                self.set_fill_color(*SURFACE)
-                self.set_text_color(*INK_SOFT)
-                self.set_font(self.DATA, 'B', 7)
-                self.cell(90, 5, '  Categorie', 'B', 0, 'L', True)
-                self.cell(45, 5, 'Jaarbedrag', 'B', 0, 'R', True)
-                self.cell(45, 5, 'Per maand', 'B', 1, 'R', True)
+                # Render header
+                self._jaar_table_header(sec_label, sec_key)
 
-                # Data
+                # Data rijen met slimme page-break
                 self.set_font(self.DATA, '', 8)
                 section_total = 0
-                for cat, bedrag in entries:
+
+                row_count = 0
+                for ei, (cat, bedrag) in enumerate(entries):
                     section_total += bedrag
                     pm = bedrag / n_maanden
+                    is_last = (ei == len(entries) - 1)
+                    space_needed = row_h + (footer_h if is_last else 0)
+
+                    if self.get_y() + space_needed > PAGE_BOTTOM:
+                        # Page break — nieuwe pagina met herhaalde header
+                        self.add_page()
+                        self._jaar_table_header(sec_label, sec_key, continued=True)
+                        self.set_font(self.DATA, '', 8)
+                        row_count = 0
+
+                    # Zebra-strepen
+                    if row_count % 2 == 0:
+                        self.set_fill_color(252, 251, 249)
+                    else:
+                        self.set_fill_color(*WHITE)
+
                     self.set_text_color(*INK)
-                    self.cell(90, 5, f'  {cat}', 0, 0, 'L')
+                    self.cell(90, row_h, f'  {cat}', 0, 0, 'L', True)
                     self.set_text_color(*(GREEN if bedrag > 0 else RED))
-                    self.cell(45, 5, eur(bedrag), 0, 0, 'R')
+                    self.cell(45, row_h, eur(bedrag), 0, 0, 'R', True)
                     self.set_text_color(*(GREEN if pm > 0 else RED))
-                    self.cell(45, 5, eur(pm), 0, 1, 'R')
+                    self.cell(45, row_h, eur(pm), 0, 1, 'R', True)
+                    row_count += 1
 
                 # Totaal
                 self.set_font(self.DATA, 'B', 8)

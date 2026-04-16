@@ -3,7 +3,12 @@ peterheijen.com — Finance API v1
 =================================
 Simpel, werkend, robuust.
 
-Upload CSV/XLSX → Python rekent → Claude categoriseert & analyseert → JSON rapport
+Upload CSV/XLSX → Python rekent → Claude categoriseert & analyseert → PDF rapport per email.
+
+ARCHITECTUUR: Async job-model
+  POST /rapport  → start achtergrond-job, retourneert direct job_id (< 1 sec)
+  GET  /rapport/{job_id}/status → poll voor voortgang
+  Geen lange HTTP-requests meer → geen Railway/proxy timeout issues.
 """
 
 import os
@@ -13,6 +18,7 @@ import uuid
 import logging
 import base64
 import httpx
+import threading
 from datetime import datetime
 
 import pandas as pd
@@ -26,14 +32,22 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="PeterHeijen Finance API", version="0.1.0")
+app = FastAPI(title="PeterHeijen Finance API", version="0.2.0")
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # In productie: alleen je eigen domein
-    allow_methods=["POST"],
+    allow_methods=["POST", "GET"],
     allow_headers=["*"],
 )
+
+
+# ---------------------------------------------------------------------------
+# JOB STORE — in-memory tracking van achtergrond-analyses
+# ---------------------------------------------------------------------------
+# Thread-safe dict: {job_id: {status, fase, email, error, ...}}
+jobs: dict = {}
+jobs_lock = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -1041,82 +1055,155 @@ async def analyseer(bestand: UploadFile):
     return rapport
 
 
+def _run_rapport_pipeline(job_id: str, inhoud: bytes, bestandsnaam: str, email: str):
+    """Achtergrond-thread: volledige pipeline upload → analyse → PDF → email.
+
+    Schrijft voortgang naar jobs[job_id] zodat de status-endpoint het kan serveren.
+    Draait NIET in een HTTP-request — dus geen proxy timeout meer.
+    """
+    def update(fase: str, pct: int):
+        with jobs_lock:
+            jobs[job_id]['fase'] = fase
+            jobs[job_id]['voortgang'] = pct
+        logger.info(f"[{job_id}] {fase}")
+
+    try:
+        # 1. Inlezen
+        update('Transacties inlezen...', 10)
+        df = lees_transacties(inhoud, bestandsnaam)
+        update(f'{len(df)} transacties ingelezen', 15)
+
+        # 2. Deterministisch rekenen
+        update('Bedragen berekenen en controleren...', 20)
+        feiten = bereken_feiten(df)
+        top = bereken_top(df)
+        update(f'Feiten berekend voor {len(feiten)} rekening(en)', 30)
+
+        # 3. Claude categoriseren + analyseren (langste stap: 30s-300s)
+        update('AI analyseert uw transacties...', 35)
+        prompt = bouw_prompt(df, feiten, top)
+        logger.info(f"[{job_id}] Prompt: {len(prompt)} tekens, {len(df)} transacties")
+        claude_result = vraag_claude(prompt)
+
+        if not claude_result.get('data'):
+            raise ValueError(f"AI-analyse ongeldig: {claude_result.get('error', 'onbekend')}")
+        update('AI-analyse compleet', 70)
+
+        # 4. Rapport data samenstellen
+        rapport_data = {
+            'report_id': job_id,
+            'gegenereerd': datetime.now().isoformat(),
+            'bestand': bestandsnaam,
+            'feiten': feiten,
+            'maandoverzicht': claude_result['data'].get('maandoverzicht', {}),
+            'jaartotalen': claude_result['data'].get('jaartotalen', {}),
+            'analyse': claude_result['data'].get('analyse', {}),
+        }
+
+        # 5. PDF genereren
+        update('Premium PDF-rapport genereren...', 75)
+        pdf_bytes = genereer_pdf(rapport_data)
+        logger.info(f"[{job_id}] PDF gegenereerd ({len(pdf_bytes)} bytes)")
+        update('PDF klaar', 85)
+
+        # 6. Email versturen
+        update('Rapport per email versturen...', 90)
+        email_verstuurd = verstuur_rapport_email(email, pdf_bytes, job_id)
+
+        if not email_verstuurd:
+            raise ValueError(
+                "Uw analyse is gelukt, maar het rapport kon niet per email worden verstuurd. "
+                "Probeer het opnieuw of neem contact op via info@peterheijen.com."
+            )
+
+        # Klaar!
+        with jobs_lock:
+            jobs[job_id]['status'] = 'compleet'
+            jobs[job_id]['fase'] = 'Rapport verstuurd!'
+            jobs[job_id]['voortgang'] = 100
+        logger.info(f"[{job_id}] Pipeline compleet — rapport verstuurd naar {email}")
+
+    except Exception as e:
+        logger.error(f"[{job_id}] Pipeline FOUT: {type(e).__name__}: {e}")
+        with jobs_lock:
+            jobs[job_id]['status'] = 'fout'
+            jobs[job_id]['error'] = str(e)
+            jobs[job_id]['voortgang'] = 0
+
+
 @app.post("/rapport")
 async def rapport(bestand: UploadFile, email: str = Form(...)):
-    """Volledige pipeline: upload → analyse → PDF → email."""
-    report_id = str(uuid.uuid4())[:8]
-    logger.info(f"[{report_id}] Start rapport pipeline voor {email}")
+    """Start de rapport-pipeline als achtergrond-job.
 
-    # 1. Inlezen (max 10 MB)
+    Retourneert DIRECT (< 1 sec) met een job_id.
+    Client pollt /rapport/{job_id}/status voor voortgang.
+    Geen lange HTTP-requests = geen Railway/proxy timeout.
+    """
+    job_id = str(uuid.uuid4())[:8]
+    logger.info(f"[{job_id}] Rapport aangevraagd voor {email}")
+
+    # Bestand direct inlezen (dit is snel, < 1 sec)
     try:
         inhoud = await bestand.read()
         if len(inhoud) > 10 * 1024 * 1024:
             raise HTTPException(status_code=400, detail="Bestand is te groot (max 10 MB)")
-        df = lees_transacties(inhoud, bestand.filename)
-        logger.info(f"[{report_id}] {len(df)} transacties ingelezen ({len(inhoud)} bytes)")
+        # Quick validatie: check of het bestand gelezen kan worden
+        df_test = lees_transacties(inhoud, bestand.filename)
+        n_transacties = len(df_test)
+        del df_test  # Geheugen vrijgeven
+        logger.info(f"[{job_id}] {n_transacties} transacties, {len(inhoud)} bytes — bestand OK")
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"[{report_id}] Inleesfout: {e}")
+        logger.error(f"[{job_id}] Inleesfout: {e}")
         raise HTTPException(status_code=400, detail=f"Kan bestand niet lezen: {e}")
 
-    # 2. Deterministisch rekenen
-    feiten = bereken_feiten(df)
-    top = bereken_top(df)
-    logger.info(f"[{report_id}] Feiten berekend voor {len(feiten)} rekening(en)")
+    # Job registreren
+    with jobs_lock:
+        jobs[job_id] = {
+            'status': 'bezig',
+            'fase': 'Gestart...',
+            'voortgang': 5,
+            'email': email,
+            'bestand': bestand.filename,
+            'gestart': datetime.now().isoformat(),
+        }
 
-    # 3. Claude categoriseren + analyseren
-    try:
-        prompt = bouw_prompt(df, feiten, top)
-        logger.info(f"[{report_id}] Prompt: {len(prompt)} tekens, {len(df)} transacties")
-        claude_result = vraag_claude(prompt)
-        logger.info(f"[{report_id}] Claude analyse compleet")
-    except Exception as e:
-        logger.error(f"[{report_id}] Claude fout: {type(e).__name__}: {e}")
-        raise HTTPException(status_code=500, detail=f"AI-analyse mislukt. Probeer het opnieuw.")
+    # Start achtergrond-thread — de eigenlijke analyse
+    thread = threading.Thread(
+        target=_run_rapport_pipeline,
+        args=(job_id, inhoud, bestand.filename, email),
+        daemon=True,
+    )
+    thread.start()
 
-    if not claude_result.get('data'):
-        raise HTTPException(status_code=500, detail=f"AI-analyse ongeldig: {claude_result.get('error', 'onbekend')}")
-
-    # 4. Rapport data samenstellen
-    rapport_data = {
-        'report_id': report_id,
-        'gegenereerd': datetime.now().isoformat(),
-        'bestand': bestand.filename,
-        'feiten': feiten,
-        'maandoverzicht': claude_result['data'].get('maandoverzicht', {}),
-        'jaartotalen': claude_result['data'].get('jaartotalen', {}),
-        'analyse': claude_result['data'].get('analyse', {}),
+    # Direct terug — client gaat pollen op /rapport/{job_id}/status
+    return {
+        'job_id': job_id,
+        'status': 'gestart',
     }
 
-    # 5. PDF genereren
-    try:
-        pdf_bytes = genereer_pdf(rapport_data)
-        logger.info(f"[{report_id}] PDF gegenereerd ({len(pdf_bytes)} bytes)")
-    except Exception as e:
-        logger.error(f"[{report_id}] PDF fout: {e}")
-        raise HTTPException(status_code=500, detail=f"PDF generatie mislukt: {e}")
 
-    # 6. Email versturen — MOET slagen, anders is de service incompleet
-    email_verstuurd = verstuur_rapport_email(email, pdf_bytes, report_id)
+@app.get("/rapport/{job_id}/status")
+def rapport_status(job_id: str):
+    """Poll-endpoint voor voortgang van een rapport-job.
 
-    if not email_verstuurd:
-        logger.error(f"[{report_id}] Email naar {email} MISLUKT — klant krijgt geen rapport")
-        raise HTTPException(
-            status_code=502,
-            detail="Uw analyse is gelukt, maar het rapport kon niet per email worden verstuurd. "
-                   "Probeer het opnieuw of neem contact op via info@peterheijen.com."
-        )
+    Retourneert altijd snel (< 100ms).
+    Client pollt elke 3 seconden tot status == 'compleet' of 'fout'.
+    """
+    with jobs_lock:
+        job = jobs.get(job_id)
 
-    logger.info(f"[{report_id}] Pipeline compleet — rapport verstuurd naar {email}")
+    if not job:
+        raise HTTPException(status_code=404, detail="Job niet gevonden")
 
-    # Retourneer ALLEEN bevestiging — geen financiële data in de response.
-    # Het rapport gaat uitsluitend per email/PDF naar de klant.
     return {
-        'report_id': report_id,
-        'status': 'compleet',
-        'email_verstuurd': True,
-        'email': email,
+        'job_id': job_id,
+        'status': job['status'],
+        'fase': job.get('fase', ''),
+        'voortgang': job.get('voortgang', 0),
+        'email': job.get('email', ''),
+        'error': job.get('error'),
     }
 
 

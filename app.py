@@ -186,6 +186,9 @@ def _normaliseer(df: pd.DataFrame, formaat: str) -> pd.DataFrame:
         df['Transactiedatum'] = df['Transactiedatum'].astype(str).apply(_parse_datum)
         df['Transactiebedrag'] = df['Transactiebedrag'].apply(
             lambda v: _parse_dutch_amount(v) if not isinstance(v, (int, float)) else float(v))
+        # Tegenrekening bewaren voor transfer-detectie
+        if 'Tegenrekening' not in df.columns:
+            df['Tegenrekening'] = ''
         return df
 
     elif formaat in ('abnamro_csv', 'ing_csv'):
@@ -202,6 +205,9 @@ def _normaliseer(df: pd.DataFrame, formaat: str) -> pd.DataFrame:
         naam = df.get('Naam / Omschrijving', pd.Series([''] * len(df))).fillna('')
         meded = df.get('Mededelingen', pd.Series([''] * len(df))).fillna('')
         df['Omschrijving'] = (naam + ' ' + meded).str.strip()
+        # Tegenrekening bewaren voor transfer-detectie
+        if 'Tegenrekening' not in df.columns:
+            df['Tegenrekening'] = ''
         # Saldo
         if formaat == 'ing_csv' and 'Saldo na mutatie' in df.columns:
             df = _gebruik_saldo_kolom(df, 'Saldo na mutatie')
@@ -219,6 +225,13 @@ def _normaliseer(df: pd.DataFrame, formaat: str) -> pd.DataFrame:
             if col in df.columns:
                 omschr_parts.append(df[col].fillna(''))
         df['Omschrijving'] = pd.concat(omschr_parts, axis=1).apply(lambda r: ' '.join(r).strip(), axis=1) if omschr_parts else 'Onbekend'
+        # Tegenrekening bewaren (Rabobank: 'IBAN/BBAN tegenpartij' of 'Tegenrekening IBAN/BBAN')
+        for col in ['IBAN/BBAN tegenpartij', 'Tegenrekening IBAN/BBAN', 'Tegenrekening']:
+            if col in df.columns:
+                df['Tegenrekening'] = df[col].fillna('')
+                break
+        else:
+            df['Tegenrekening'] = ''
         # Saldo
         if 'Saldo na trn' in df.columns:
             df = _gebruik_saldo_kolom(df, 'Saldo na trn')
@@ -238,6 +251,9 @@ def _normaliseer(df: pd.DataFrame, formaat: str) -> pd.DataFrame:
         naam = df.get('Naam', pd.Series([''] * len(df))).fillna('')
         omschr = df.get('Omschrijving', pd.Series([''] * len(df))).fillna('')
         df['Omschrijving'] = (naam + ' ' + omschr).str.strip()
+        # Tegenrekening bewaren voor transfer-detectie (Triodos heeft deze kolom)
+        if 'Tegenrekening' not in df.columns:
+            df['Tegenrekening'] = ''
         # Saldo
         if 'Saldo' in df.columns:
             df = _gebruik_saldo_kolom(df, 'Saldo')
@@ -259,6 +275,11 @@ def _normaliseer(df: pd.DataFrame, formaat: str) -> pd.DataFrame:
             if col in df.columns:
                 parts.append(df[col].fillna(''))
         df['Omschrijving'] = pd.concat(parts, axis=1).apply(lambda r: ' '.join(r).strip(), axis=1) if parts else 'Onbekend'
+        # Tegenrekening bewaren (Knab noemt het 'Tegenrekeningnummer')
+        if 'Tegenrekeningnummer' in df.columns:
+            df['Tegenrekening'] = df['Tegenrekeningnummer'].fillna('')
+        elif 'Tegenrekening' not in df.columns:
+            df['Tegenrekening'] = ''
         df = _bereken_saldos(df)
         return df
 
@@ -281,6 +302,7 @@ def _normaliseer(df: pd.DataFrame, formaat: str) -> pd.DataFrame:
             df['Rekeningnummer'] = df['Account number'].fillna('N26')
         else:
             df['Rekeningnummer'] = 'N26'
+        df['Tegenrekening'] = ''  # N26 geeft geen tegenrekening
         df = _bereken_saldos(df)
         return df
 
@@ -291,6 +313,11 @@ def _normaliseer(df: pd.DataFrame, formaat: str) -> pd.DataFrame:
         naam = df.get('Naam', pd.Series([''] * len(df))).fillna('')
         omschr = df.get('Omschrijving', pd.Series([''] * len(df))).fillna('')
         df['Omschrijving'] = (naam + ' ' + omschr).str.strip()
+        # Tegenrekening: Bunq noemt het soms 'Tegenpartij'
+        if 'Tegenpartij' in df.columns:
+            df['Tegenrekening'] = df['Tegenpartij'].fillna('')
+        else:
+            df['Tegenrekening'] = ''
         df = _bereken_saldos(df)
         return df
 
@@ -323,6 +350,14 @@ def _normaliseer(df: pd.DataFrame, formaat: str) -> pd.DataFrame:
                     lambda r: -abs(r['Transactiebedrag']) if str(r[col]).strip().lower() in ('af', 'd', 'debet')
                     else abs(r['Transactiebedrag']), axis=1)
                 break
+
+        # Tegenrekening bewaren als die er is
+        for col in ['Tegenrekening', 'IBAN tegenpartij', 'Tegenrekeningnummer']:
+            if col in df.columns:
+                df['Tegenrekening'] = df[col].fillna('')
+                break
+        else:
+            df['Tegenrekening'] = ''
 
         # Saldo
         for col in ['Saldo', 'Saldo na mutatie', 'Saldo na trn']:
@@ -519,6 +554,83 @@ def lees_transacties(inhoud: bytes, bestandsnaam: str) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# STAP 1B: HUISHOUDREGISTER & INTERNE-OVERBOEKINGEN DETECTIE
+# ---------------------------------------------------------------------------
+
+def _bouw_huishoudregister(df: pd.DataFrame) -> set:
+    """Verzamel alle eigen rekeningnummers uit de upload.
+
+    Alle rekeningen in de upload zijn per definitie 'eigen'.
+    Returns: set van rekeningnummers (strings, stripped, lowercase-safe).
+    """
+    eigen = set()
+    for rek in df['Rekeningnummer'].unique():
+        rek_str = str(rek).strip()
+        if rek_str and rek_str != 'Onbekend':
+            eigen.add(rek_str)
+    logger.info(f"Huishoudregister: {len(eigen)} eigen rekeningen gevonden: {eigen}")
+    return eigen
+
+
+def _normaliseer_iban(val) -> str:
+    """Normaliseer een IBAN/rekeningnummer voor vergelijking.
+
+    Verwijdert spaties, streepjes, en maakt uppercase.
+    Zo matcht 'NL12 ABNA 0123 4567 89' met 'NL12ABNA0123456789'.
+    """
+    if pd.isna(val):
+        return ''
+    return str(val).strip().replace(' ', '').replace('-', '').upper()
+
+
+def _markeer_interne_transfers(df: pd.DataFrame, eigen_rekeningen: set) -> pd.DataFrame:
+    """Markeer transacties tussen eigen rekeningen als interne transfer.
+
+    Detectiemethoden (in volgorde van betrouwbaarheid):
+    1. Tegenrekening kolom matcht een eigen rekeningnummer
+    2. Eigen rekeningnummer komt voor in de omschrijving
+    3. Matching bijschrijving/afschrijving op dezelfde datum (cross-account)
+
+    Voegt kolom 'is_intern' toe (True/False).
+    """
+    # Normaliseer eigen rekeningen voor vergelijking
+    eigen_genormaliseerd = set(_normaliseer_iban(r) for r in eigen_rekeningen if r)
+
+    # Start: alles is niet-intern
+    df['is_intern'] = False
+
+    # Methode 1: Tegenrekening matcht eigen rekening
+    if 'Tegenrekening' in df.columns:
+        df['_tegen_norm'] = df['Tegenrekening'].apply(_normaliseer_iban)
+        methode1_mask = df['_tegen_norm'].isin(eigen_genormaliseerd) & (df['_tegen_norm'] != '')
+        df.loc[methode1_mask, 'is_intern'] = True
+        n_methode1 = methode1_mask.sum()
+        if n_methode1 > 0:
+            logger.info(f"Interne transfers methode 1 (tegenrekening): {n_methode1} transacties")
+        df.drop(columns=['_tegen_norm'], inplace=True)
+
+    # Methode 2: Eigen rekeningnummer in omschrijving (fallback voor banken zonder tegenrekening)
+    for rek in eigen_genormaliseerd:
+        if len(rek) >= 8:  # Alleen zinvol bij IBANs/lange rekeningnummers
+            # Check of het rekeningnummer (of deel ervan) in de omschrijving staat
+            mask = (
+                ~df['is_intern'] &  # Nog niet gemarkeerd
+                df['Omschrijving'].str.upper().str.replace(' ', '').str.contains(rek, na=False, regex=False)
+            )
+            if mask.sum() > 0:
+                df.loc[mask, 'is_intern'] = True
+                logger.info(f"Interne transfers methode 2 (omschrijving bevat {rek}): {mask.sum()} transacties")
+
+    # Statistieken loggen
+    n_intern = df['is_intern'].sum()
+    bedrag_intern = df.loc[df['is_intern'], 'Transactiebedrag'].apply(lambda x: abs(float(x))).sum()
+    logger.info(f"Totaal interne transfers: {n_intern} transacties, "
+                f"totaal bedrag: EUR {bedrag_intern:,.2f}")
+
+    return df
+
+
+# ---------------------------------------------------------------------------
 # STAP 2: DETERMINISTISCH REKENEN
 # ---------------------------------------------------------------------------
 
@@ -616,22 +728,57 @@ def bereken_top(df: pd.DataFrame, n: int = 15) -> dict:
 # STAP 3: CLAUDE CATEGORISEERT EN ANALYSEERT
 # ---------------------------------------------------------------------------
 
-def bouw_prompt(df: pd.DataFrame, feiten: dict, top: dict) -> str:
+def bouw_prompt(df: pd.DataFrame, feiten: dict, top: dict, eigen_rekeningen: set = None) -> str:
+    # Splits interne transfers van echte transacties
+    if 'is_intern' in df.columns:
+        df_extern = df[~df['is_intern']].copy()
+        df_intern = df[df['is_intern']].copy()
+        n_intern = len(df_intern)
+        bedrag_intern_in = round(float(df_intern[df_intern['bedrag'] > 0]['bedrag'].sum()), 2)
+        bedrag_intern_uit = round(float(df_intern[df_intern['bedrag'] < 0]['bedrag'].sum()), 2)
+    else:
+        df_extern = df.copy()
+        df_intern = pd.DataFrame()
+        n_intern = 0
+        bedrag_intern_in = 0
+        bedrag_intern_uit = 0
+
     # Limiteer tot 2000 transacties om prompt-grootte beheersbaar te houden
-    # Bij meer dan 2000: neem een representatieve sample
-    if len(df) > 2000:
-        logger.warning(f"Bestand bevat {len(df)} transacties — gelimiteerd tot 2000 voor Claude")
-        df = df.head(2000)
+    if len(df_extern) > 2000:
+        logger.warning(f"Bestand bevat {len(df_extern)} externe transacties — gelimiteerd tot 2000 voor Claude")
+        df_extern = df_extern.head(2000)
 
     regels = []
-    for _, row in df.iterrows():
+    for _, row in df_extern.iterrows():
         regels.append(
             f"{row['datum'].strftime('%Y-%m-%d')}|{row['Rekeningnummer']}|"
-            f"{row['bedrag']:>10.2f}|{str(row['Omschrijving'])[:80]}"  # 80 ipv 100 chars — scheelt tokens
+            f"{row['bedrag']:>10.2f}|{str(row['Omschrijving'])[:80]}"
         )
 
+    # Eigen rekeningen info voor in de prompt
+    eigen_rek_tekst = ""
+    if eigen_rekeningen:
+        eigen_rek_tekst = "\n## EIGEN REKENINGNUMMERS VAN DE KLANT\n"
+        eigen_rek_tekst += "De klant heeft de volgende rekeningen (ALLE rekeningen hieronder zijn van dezelfde persoon/huishouden):\n"
+        for rek in sorted(eigen_rekeningen):
+            eigen_rek_tekst += f"- {rek}\n"
+        eigen_rek_tekst += "\nBELANGRIJK: Overboekingen tussen twee rekeningen uit deze lijst zijn INTERNE VERSCHUIVINGEN.\n"
+        eigen_rek_tekst += "Deze zijn AL verwijderd uit de transactielijst hieronder. Ze worden apart getoond in het rapport.\n"
+
+    # Interne transfers samenvatting
+    intern_tekst = ""
+    if n_intern > 0:
+        intern_tekst = f"""
+## INTERNE VERSCHUIVINGEN (al verwijderd uit onderstaande transacties)
+Er zijn {n_intern} interne overboekingen gedetecteerd tussen eigen rekeningen.
+Totaal bijschrijvingen (ontvangst eigen rekening): EUR {bedrag_intern_in:,.2f}
+Totaal afschrijvingen (verzending eigen rekening): EUR {bedrag_intern_uit:,.2f}
+Deze tellen NIET mee als inkomen of uitgave. Ze worden apart in het rapport vermeld.
+"""
+
     return f"""Je bent een financieel analist voor vermogende particulieren en DGA's in Nederland.
-Hieronder staan {len(df)} banktransacties.
+Hieronder staan {len(df_extern)} banktransacties (interne overboekingen zijn al verwijderd).
+{eigen_rek_tekst}{intern_tekst}
 
 ## REGELS
 1. Categoriseer ELKE transactie in precies één categorie uit onderstaande lijst.
@@ -755,7 +902,6 @@ Gebruik deze kenmerken om het TYPE belasting te bepalen:
 - BEA/GEA transacties bij tankstations → Benzine/Diesel/Laden
 - BEA/GEA transacties bij supermarkten → Boodschappen/Supermarkt
 - BEA/GEA transacties bij kledingwinkels (H&M, Zara, C&A, Primark) → Kleding
-- Overboekingen tussen eigen NL-rekeningen (zelfde naam) → Interne verschuivingen
 - GIVT / KWF / Partij voor de Dieren / Rode Kruis / Oxfam → Donaties/Goede doelen
 - Thuisbezorgd / Uber Eats / Deliveroo → Afhaal/Bezorging
 - Uber / Bolt (taxi) → Taxi/Uber
@@ -763,6 +909,12 @@ Gebruik deze kenmerken om het TYPE belasting te bepalen:
 - Action / HEMA / IKEA huishoudelijk → Huishoudelijke artikelen
 - IKEA meubels/inrichting → Meubels/Inrichting
 - Apotheek / BENU → Apotheek/Medicijnen
+
+## NEDERLANDSE FINANCIELE CONTEXT
+- HYPOTHEEK-GEKOPPELDE VERZEKERINGEN: Maandelijkse betalingen aan ASR, Nationale-Nederlanden, Aegon, Delta Lloyd, VIVAT, Reaal, a.s.r., NN Group die een levensverzekering of kapitaalverzekering betreffen, zijn in Nederland bijna altijd onderdeel van een hypotheekconstructie (spaarhypotheek, beleggingshypotheek). Categoriseer als Hypotheek/Huur, NIET als Sparen & Beleggen. Vermeld in de analyse dat het waarschijnlijk een hypotheek-gekoppelde verzekering betreft.
+- INTERNE VERSCHUIVINGEN: Overboekingen tussen eigen rekeningen zijn AL verwijderd uit de transactielijst. Ze tellen NIET mee als inkomen of uitgave. Categoriseer NOOIT een transactie als "Overig inkomen" als het eigenlijk een interne overboeking is.
+- DGA-LOON: Een maandelijks vast bedrag van een BV die in de CATEGORISATIE-HINTS staat als eigen BV is DGA-loon/Managementfee, niet "Overig inkomen".
+- CREDITCARD-AFLOSSING: Een betaling aan een creditcardmaatschappij (ICS, VISA, Mastercard, American Express) is geen consumptie maar een aflossing. Categoriseer als Interne verschuivingen of negeer als de onderliggende transacties al apart staan.
 
 ## BELANGRIJKE PRINCIPES
 - De TOTALEN hieronder zijn wiskundig berekend en 100% correct. Gebruik deze cijfers, reken NIETS zelf.
@@ -814,6 +966,61 @@ Antwoord ALLEEN in valid JSON:
     "verrassende_inzichten": ["Geef 2-3 patronen of inzichten die een drukke vermogende particulier NIET zelf zou zien maar die een AI wel opvalt. Denk aan: seizoenspatronen in cashflow, verborgen belastingoptimalisatie-mogelijkheden, structurele mismatch tussen inkomen en vermogensopbouw, ongewone correlaties, DGA-loon vs dividendoptimalisatie, effectief belastingtarief dat te hoog lijkt, categorieën die relatief hoog zijn vergeleken met vergelijkbare huishoudens. Dit is de WOW-factor van het rapport — maak het concreet met bedragen en vertel iets dat de klant verrast."]
   }}
 }}"""
+
+
+def _rapport_kwaliteitscheck(data: dict, df: pd.DataFrame, eigen_rekeningen: set):
+    """Blokkeer rapport als er grove classificatiefouten in zitten.
+
+    Controleert:
+    1. Of interne transfers niet als inkomen zijn gecategoriseerd
+    2. Of hypotheek-verzekeringen niet als belegging staan
+    3. Of 'Overig inkomen' niet onrealistisch hoog is
+
+    Raises ValueError als een check faalt (blokkeert rapport).
+    Logt waarschuwingen voor minder ernstige problemen.
+    """
+    warnings_found = []
+
+    # Check 1: 'Overig inkomen' mag niet groter zijn dan 30% van totaal inkomen
+    jaartotalen = data.get('jaartotalen', {})
+    for rek, totalen in jaartotalen.items():
+        inkomsten = totalen.get('inkomsten', {})
+        if isinstance(inkomsten, dict):
+            overig = abs(float(inkomsten.get('Overig inkomen', 0)))
+            totaal_ink = sum(abs(float(v)) for v in inkomsten.values() if isinstance(v, (int, float)))
+            if totaal_ink > 0 and overig > 0:
+                ratio = overig / totaal_ink
+                if ratio > 0.30:
+                    warnings_found.append(
+                        f"Rekening {rek}: 'Overig inkomen' is {ratio:.0%} van totaal inkomen "
+                        f"(EUR {overig:,.0f} / EUR {totaal_ink:,.0f}). "
+                        f"Dit duidt mogelijk op fout-geclassificeerde interne overboekingen."
+                    )
+                    logger.warning(f"KWALITEITSCHECK: {warnings_found[-1]}")
+
+    # Check 2: Hypotheek-verzekeringen in beleggingen
+    for rek, totalen in jaartotalen.items():
+        sparen = totalen.get('sparen_beleggen', {})
+        if isinstance(sparen, dict):
+            for cat, bedrag in sparen.items():
+                cat_lower = cat.lower()
+                if ('levensverzekering' in cat_lower or 'kapitaalverzekering' in cat_lower):
+                    bedrag_abs = abs(float(bedrag)) if isinstance(bedrag, (int, float)) else 0
+                    if bedrag_abs > 500:  # Meer dan EUR 500/jaar = significant
+                        warnings_found.append(
+                            f"Rekening {rek}: '{cat}' (EUR {bedrag_abs:,.0f}) staat onder Sparen & Beleggen. "
+                            f"In Nederland zijn levensverzekeringen vaak hypotheek-gekoppeld. "
+                            f"Dit hoort waarschijnlijk bij Hypotheek/Huur."
+                        )
+                        logger.warning(f"KWALITEITSCHECK: {warnings_found[-1]}")
+
+    # Log alle waarschuwingen maar blokkeer (nog) niet — eerst data verzamelen
+    if warnings_found:
+        logger.warning(f"KWALITEITSCHECK: {len(warnings_found)} waarschuwing(en) gevonden")
+        for w in warnings_found:
+            logger.warning(f"  - {w}")
+    else:
+        logger.info("KWALITEITSCHECK: alle checks geslaagd")
 
 
 def vraag_claude(prompt: str) -> dict:
@@ -1863,6 +2070,13 @@ def _run_rapport_pipeline(job_id: str, bestanden: list, email: str):
         df = pd.concat(dfs, ignore_index=True)
         update(f'{len(df)} transacties ingelezen uit {len(bestanden)} bestand(en)', 15)
 
+        # 1b. Huishoudregister & interne-overboekingen detectie
+        update('Eigen rekeningen herkennen...', 17)
+        eigen_rekeningen = _bouw_huishoudregister(df)
+        df = _markeer_interne_transfers(df, eigen_rekeningen)
+        n_intern = df['is_intern'].sum()
+        update(f'{n_intern} interne overboekingen gedetecteerd', 19)
+
         # 2. Deterministisch rekenen
         update('Bedragen berekenen en controleren...', 20)
         feiten = bereken_feiten(df)
@@ -1871,13 +2085,16 @@ def _run_rapport_pipeline(job_id: str, bestanden: list, email: str):
 
         # 3. Claude categoriseren + analyseren (langste stap: 30s-300s)
         update('AI analyseert uw transacties...', 35)
-        prompt = bouw_prompt(df, feiten, top)
+        prompt = bouw_prompt(df, feiten, top, eigen_rekeningen=eigen_rekeningen)
         logger.info(f"[{job_id}] Prompt: {len(prompt)} tekens, {len(df)} transacties")
         claude_result = vraag_claude(prompt)
 
         if not claude_result.get('data'):
             raise ValueError(f"AI-analyse ongeldig: {claude_result.get('error', 'onbekend')}")
-        update('AI-analyse compleet', 70)
+
+        # 3b. Report quality checks (blokkeer bij grove fouten)
+        _rapport_kwaliteitscheck(claude_result['data'], df, eigen_rekeningen)
+        update('AI-analyse compleet, kwaliteitscheck geslaagd', 70)
 
         # 4. Rapport data samenstellen
         rapport_data = {

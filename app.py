@@ -11,11 +11,14 @@ import io
 import json
 import uuid
 import logging
+import base64
+import httpx
 from datetime import datetime
 
 import pandas as pd
-from fastapi import FastAPI, UploadFile, HTTPException
+from fastapi import FastAPI, UploadFile, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
+from fpdf import FPDF
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -369,7 +372,7 @@ def vraag_claude(prompt: str) -> dict:
 
     response = client.messages.create(
         model=model,
-        max_tokens=16000,
+        max_tokens=32000,
         messages=[{"role": "user", "content": prompt}],
     )
 
@@ -399,6 +402,472 @@ def vraag_claude(prompt: str) -> dict:
             'tokens': {'input': tokens_in, 'output': tokens_out},
             'model': model,
         }
+
+
+# ---------------------------------------------------------------------------
+# STAP 4: PDF RAPPORT GENEREREN
+# ---------------------------------------------------------------------------
+
+# V2 Kleuren
+INK = (26, 26, 46)
+INK_SOFT = (61, 61, 92)
+ACCENT = (31, 92, 139)
+GOLD = (201, 168, 76)
+WHITE = (255, 255, 255)
+SURFACE = (247, 246, 242)
+GREEN = (39, 174, 96)
+RED = (192, 57, 43)
+BORDER = (221, 217, 208)
+
+SEC_COLORS = {
+    'inkomsten': (26, 107, 60),
+    'vaste_lasten': (139, 69, 19),
+    'variabele_kosten': (74, 85, 104),
+    'sparen_beleggen': (31, 92, 139),
+    'interne_verschuivingen': (107, 91, 115),
+}
+
+SEC_LABELS = {
+    'inkomsten': 'INKOMSTEN',
+    'vaste_lasten': 'VASTE LASTEN',
+    'variabele_kosten': 'VARIABELE KOSTEN',
+    'sparen_beleggen': 'SPAREN & BELEGGEN',
+    'interne_verschuivingen': 'INTERNE VERSCHUIVINGEN',
+}
+
+MAAND_NAMEN = {
+    '01': 'jan', '02': 'feb', '03': 'mrt', '04': 'apr',
+    '05': 'mei', '06': 'jun', '07': 'jul', '08': 'aug',
+    '09': 'sep', '10': 'okt', '11': 'nov', '12': 'dec',
+}
+
+
+def eur(n: float) -> str:
+    """Format getal als Euro bedrag."""
+    if abs(n) < 0.01:
+        return ''
+    return f"\u20ac {n:,.0f}".replace(',', '.')
+
+
+class RapportPDF(FPDF):
+    """Premium financieel rapport PDF met V2-styling."""
+
+    def __init__(self):
+        super().__init__('P', 'mm', 'A4')
+        self.set_auto_page_break(auto=True, margin=20)
+
+    def header(self):
+        if self.page_no() > 1:
+            self.set_fill_color(*INK)
+            self.rect(0, 0, 210, 14, 'F')
+            self.set_font('Helvetica', 'B', 8)
+            self.set_text_color(*WHITE)
+            self.set_xy(10, 4)
+            self.cell(0, 6, 'PeterHeijen.com  |  Financieel Rapport', 0, 0, 'L')
+            self.set_font('Helvetica', '', 7)
+            self.set_xy(10, 4)
+            self.cell(190, 6, f'Pagina {self.page_no()}', 0, 0, 'R')
+            self.set_y(18)
+        else:
+            self.set_y(10)
+
+    def footer(self):
+        self.set_y(-15)
+        self.set_font('Helvetica', '', 7)
+        self.set_text_color(*INK_SOFT)
+        self.cell(0, 10, 'Dit rapport is gegenereerd door PeterHeijen.com  |  Vertrouwelijk', 0, 0, 'C')
+
+    def cover_page(self, feiten: dict, rapport_datum: str):
+        """Pagina 1: Cover met samenvatting."""
+        # Donkere header
+        self.set_fill_color(*INK)
+        self.rect(0, 0, 210, 80, 'F')
+
+        # Gouden lijn
+        self.set_draw_color(*GOLD)
+        self.set_line_width(0.8)
+        self.line(15, 72, 55, 72)
+
+        # Titel
+        self.set_font('Helvetica', 'B', 28)
+        self.set_text_color(*WHITE)
+        self.set_xy(15, 22)
+        self.cell(0, 12, 'Financieel Rapport', 0, 1, 'L')
+
+        # Subtitel
+        self.set_font('Helvetica', '', 12)
+        self.set_text_color(200, 200, 210)
+        self.set_xy(15, 38)
+        self.cell(0, 7, 'Persoonlijk overzicht van uw inkomsten, uitgaven en vermogen', 0, 1, 'L')
+
+        # Datum
+        self.set_font('Helvetica', '', 9)
+        self.set_text_color(150, 150, 170)
+        self.set_xy(15, 52)
+        self.cell(0, 6, f'Gegenereerd op {rapport_datum}', 0, 1, 'L')
+
+        # Rekening info
+        self.set_xy(15, 58)
+        rek_list = list(feiten.keys())
+        self.cell(0, 6, f'{len(rek_list)} rekening(en) geanalyseerd', 0, 1, 'L')
+
+        # Quick stats onder de header
+        self.set_y(88)
+        self.set_font('Helvetica', 'B', 9)
+        self.set_text_color(*INK)
+
+        for rek, info in feiten.items():
+            self.set_fill_color(*SURFACE)
+            self.rect(15, self.get_y(), 180, 26, 'F')
+            self.set_draw_color(*BORDER)
+            self.rect(15, self.get_y(), 180, 26, 'D')
+
+            y = self.get_y() + 3
+            self.set_font('Helvetica', 'B', 9)
+            self.set_text_color(*INK)
+            self.set_xy(20, y)
+            self.cell(50, 5, f'Rekening {rek}', 0, 0, 'L')
+
+            self.set_font('Helvetica', '', 8)
+            self.set_text_color(*INK_SOFT)
+            self.set_xy(20, y + 7)
+            self.cell(40, 5, f'{info["periode"]["van"]} t/m {info["periode"]["tot"]}', 0, 0, 'L')
+
+            self.set_font('Helvetica', 'B', 9)
+            col_x = [85, 115, 150]
+            labels = ['Inkomsten', 'Uitgaven', 'Netto']
+            values = [info['totalen']['inkomsten'], info['totalen']['uitgaven'], info['totalen']['netto']]
+            colors = [GREEN, RED, GREEN if values[2] >= 0 else RED]
+
+            for i in range(3):
+                self.set_text_color(*INK_SOFT)
+                self.set_font('Helvetica', '', 7)
+                self.set_xy(col_x[i], y)
+                self.cell(30, 5, labels[i], 0, 0, 'C')
+                self.set_text_color(*colors[i])
+                self.set_font('Helvetica', 'B', 9)
+                self.set_xy(col_x[i], y + 7)
+                self.cell(30, 5, eur(values[i]), 0, 0, 'C')
+
+            self.set_y(self.get_y() + 30)
+
+    def analyse_page(self, analyse: dict):
+        """Pagina met AI-analyse: samenvatting, sterke punten, etc."""
+        self.add_page()
+
+        # Sectie header
+        self._section_title('Analyse & Inzichten')
+
+        # Samenvatting
+        if analyse.get('samenvatting'):
+            self.set_font('Helvetica', 'B', 10)
+            self.set_text_color(*ACCENT)
+            self.cell(0, 7, 'Samenvatting', 0, 1, 'L')
+            self.set_font('Helvetica', '', 9)
+            self.set_text_color(*INK)
+            self.multi_cell(180, 5, analyse['samenvatting'])
+            self.ln(6)
+
+        # Sterke punten
+        if analyse.get('sterke_punten'):
+            self._bullet_section('Sterke punten', analyse['sterke_punten'], GREEN)
+
+        # Aandachtspunten
+        if analyse.get('aandachtspunten'):
+            self._bullet_section('Aandachtspunten', analyse['aandachtspunten'], RED)
+
+        # Aanbevelingen
+        if analyse.get('aanbevelingen'):
+            self._bullet_section('Aanbevelingen', analyse['aanbevelingen'], ACCENT)
+
+    def _section_title(self, title: str):
+        self.set_font('Helvetica', 'B', 14)
+        self.set_text_color(*INK)
+        self.cell(0, 10, title, 0, 1, 'L')
+        self.set_draw_color(*GOLD)
+        self.set_line_width(0.6)
+        self.line(15, self.get_y(), 50, self.get_y())
+        self.ln(5)
+
+    def _bullet_section(self, title: str, items: list, color: tuple):
+        self.set_font('Helvetica', 'B', 10)
+        self.set_text_color(*color)
+        self.cell(0, 7, title, 0, 1, 'L')
+        self.set_font('Helvetica', '', 9)
+        self.set_text_color(*INK)
+        for item in items:
+            self.set_x(20)
+            self.cell(4, 5, '\u2022', 0, 0, 'L')
+            self.multi_cell(170, 5, f'  {item}')
+            self.ln(1)
+        self.ln(4)
+
+    def maandoverzicht_page(self, maandoverzicht: dict, feiten: dict):
+        """Pagina's met maandelijks overzicht per rekening in spreadsheet-stijl."""
+        sections_config = [
+            ('inkomsten', 'INKOMSTEN'),
+            ('vaste_lasten', 'VASTE LASTEN'),
+            ('variabele_kosten', 'VARIABELE KOSTEN'),
+            ('sparen_beleggen', 'SPAREN & BELEGGEN'),
+        ]
+
+        for rek, maanden in maandoverzicht.items():
+            self.add_page('L')  # Landscape voor brede tabel
+            self._section_title(f'Maandoverzicht — Rekening {rek}')
+
+            months = sorted(maanden.keys())
+            if not months:
+                continue
+
+            # Verzamel categorieën per sectie
+            for sec_key, sec_label in sections_config:
+                cats = set()
+                for m in months:
+                    md = maanden[m].get(sec_key, {})
+                    if isinstance(md, dict):
+                        for cat, val in md.items():
+                            b = val.get('bedrag', 0) if isinstance(val, dict) else (val or 0)
+                            if abs(b) > 0.01:
+                                cats.add(cat)
+                cats = sorted(cats)
+                if not cats:
+                    continue
+
+                # Check of er ruimte is op de pagina
+                needed = (len(cats) + 2) * 5 + 10
+                if self.get_y() + needed > 185:
+                    self.add_page('L')
+
+                # Sectie header
+                color = SEC_COLORS.get(sec_key, INK)
+                self.set_fill_color(*color)
+                self.set_text_color(*WHITE)
+                self.set_font('Helvetica', 'B', 7)
+
+                # Kolom breedte berekenen
+                cat_w = 55
+                m_w = min((277 - cat_w - 22) / len(months), 22)  # max 22mm per maand
+                total_w = cat_w + m_w * len(months)
+
+                # Sectie label
+                self.cell(total_w, 5, f'  {sec_label}', 1, 1, 'L', True)
+
+                # Maand headers
+                self.set_fill_color(*SURFACE)
+                self.set_text_color(*INK_SOFT)
+                self.set_font('Helvetica', 'B', 6)
+                self.cell(cat_w, 5, '  Categorie', 1, 0, 'L', True)
+                for m in months:
+                    parts = m.split('-')
+                    label = MAAND_NAMEN.get(parts[1], parts[1]) + ' ' + parts[0][2:]
+                    self.cell(m_w, 5, label, 1, 0, 'C', True)
+                self.ln()
+
+                # Data rijen
+                section_totals = [0.0] * len(months)
+                self.set_font('Helvetica', '', 7)
+
+                for cat in cats:
+                    self.set_text_color(*INK)
+                    self.cell(cat_w, 4.5, f'  {cat[:35]}', 0, 0, 'L')
+
+                    for mi, m in enumerate(months):
+                        sd = maanden[m].get(sec_key, {})
+                        b = 0
+                        if cat in sd:
+                            b = sd[cat].get('bedrag', 0) if isinstance(sd[cat], dict) else (sd[cat] or 0)
+                        section_totals[mi] += b
+
+                        if abs(b) > 0.01:
+                            self.set_text_color(*(GREEN if b > 0 else RED))
+                            self.cell(m_w, 4.5, eur(b), 0, 0, 'R')
+                        else:
+                            self.set_text_color(*INK_SOFT)
+                            self.cell(m_w, 4.5, '', 0, 0, 'R')
+                    self.ln()
+
+                # Subtotaal rij
+                self.set_fill_color(*SURFACE)
+                self.set_font('Helvetica', 'B', 7)
+                self.set_text_color(*INK)
+                self.cell(cat_w, 5, f'  Totaal', 'T', 0, 'L', True)
+                for mi in range(len(months)):
+                    t = section_totals[mi]
+                    self.set_text_color(*(GREEN if t > 0 else RED if t < 0 else INK))
+                    self.cell(m_w, 5, eur(t), 'T', 0, 'R', True)
+                self.ln(7)
+
+    def jaartotalen_page(self, jaartotalen: dict, maandoverzicht: dict):
+        """Pagina met jaartotalen per categorie."""
+        sections_config = [
+            ('inkomsten', 'Inkomsten'),
+            ('vaste_lasten', 'Vaste Lasten'),
+            ('variabele_kosten', 'Variabele Kosten'),
+            ('sparen_beleggen', 'Sparen & Beleggen'),
+        ]
+
+        for rek, totalen in jaartotalen.items():
+            self.add_page()
+            n_maanden = len(maandoverzicht.get(rek, {})) or 12
+            self._section_title(f'Jaartotalen — Rekening {rek}')
+
+            for sec_key, sec_label in sections_config:
+                data = totalen.get(sec_key)
+                if not data or not isinstance(data, dict):
+                    continue
+
+                entries = [(cat, b) for cat, b in data.items() if abs(b or 0) > 0.01]
+                entries.sort(key=lambda x: abs(x[1]), reverse=True)
+                if not entries:
+                    continue
+
+                needed = (len(entries) + 2) * 5.5 + 10
+                if self.get_y() + needed > 270:
+                    self.add_page()
+
+                # Sectie header
+                color = SEC_COLORS.get(sec_key, INK)
+                self.set_fill_color(*color)
+                self.set_text_color(*WHITE)
+                self.set_font('Helvetica', 'B', 8)
+                self.cell(180, 6, f'  {sec_label}', 0, 1, 'L', True)
+
+                # Kolom headers
+                self.set_fill_color(*SURFACE)
+                self.set_text_color(*INK_SOFT)
+                self.set_font('Helvetica', 'B', 7)
+                self.cell(90, 5, '  Categorie', 'B', 0, 'L', True)
+                self.cell(45, 5, 'Jaarbedrag', 'B', 0, 'R', True)
+                self.cell(45, 5, 'Per maand', 'B', 1, 'R', True)
+
+                # Data
+                self.set_font('Helvetica', '', 8)
+                section_total = 0
+                for cat, bedrag in entries:
+                    section_total += bedrag
+                    pm = bedrag / n_maanden
+                    self.set_text_color(*INK)
+                    self.cell(90, 5, f'  {cat}', 0, 0, 'L')
+                    self.set_text_color(*(GREEN if bedrag > 0 else RED))
+                    self.cell(45, 5, eur(bedrag), 0, 0, 'R')
+                    self.set_text_color(*(GREEN if pm > 0 else RED))
+                    self.cell(45, 5, eur(pm), 0, 1, 'R')
+
+                # Totaal
+                self.set_font('Helvetica', 'B', 8)
+                self.set_fill_color(*SURFACE)
+                self.set_text_color(*INK)
+                self.cell(90, 5.5, '  Totaal', 'T', 0, 'L', True)
+                self.set_text_color(*(GREEN if section_total > 0 else RED))
+                self.cell(45, 5.5, eur(section_total), 'T', 0, 'R', True)
+                pm_total = section_total / n_maanden
+                self.set_text_color(*(GREEN if pm_total > 0 else RED))
+                self.cell(45, 5.5, eur(pm_total), 'T', 1, 'R', True)
+                self.ln(6)
+
+
+def genereer_pdf(rapport: dict) -> bytes:
+    """Genereer een premium PDF rapport."""
+    pdf = RapportPDF()
+
+    feiten = rapport.get('feiten', {})
+    analyse = rapport.get('analyse', {})
+    maandoverzicht = rapport.get('maandoverzicht', {})
+    jaartotalen = rapport.get('jaartotalen', {})
+    datum = datetime.now().strftime('%d-%m-%Y')
+
+    # Pagina 1: Cover + quick stats
+    pdf.add_page()
+    pdf.cover_page(feiten, datum)
+
+    # Pagina 2: Analyse & Inzichten
+    if analyse and analyse.get('samenvatting'):
+        pdf.analyse_page(analyse)
+
+    # Pagina 3+: Maandoverzicht (spreadsheet)
+    if maandoverzicht:
+        pdf.maandoverzicht_page(maandoverzicht, feiten)
+
+    # Pagina 4+: Jaartotalen
+    if jaartotalen:
+        pdf.jaartotalen_page(jaartotalen, maandoverzicht)
+
+    return pdf.output()
+
+
+# ---------------------------------------------------------------------------
+# STAP 5: EMAIL VERSTUREN VIA RESEND
+# ---------------------------------------------------------------------------
+
+def verstuur_rapport_email(email: str, pdf_bytes: bytes, report_id: str):
+    """Verstuur het PDF rapport per email via Resend."""
+    resend_key = os.environ.get('RESEND_API_KEY')
+    if not resend_key:
+        logger.warning("RESEND_API_KEY niet geconfigureerd, email wordt overgeslagen")
+        return False
+
+    pdf_base64 = base64.b64encode(pdf_bytes).decode('utf-8')
+
+    payload = {
+        "from": "PeterHeijen.com <rapport@peterheijen.com>",
+        "to": [email],
+        "subject": "Uw Financieel Rapport — PeterHeijen.com",
+        "html": f"""
+        <div style="font-family:Georgia,serif;max-width:600px;margin:0 auto;color:#1a1a2e">
+            <div style="background:#1a1a2e;padding:30px;text-align:center">
+                <h1 style="color:#fff;font-size:22px;margin:0">Peter<span style="color:#c9a84c">Heijen</span>.com</h1>
+            </div>
+            <div style="padding:30px;background:#f7f6f2">
+                <h2 style="color:#1a1a2e;font-size:20px">Uw financieel rapport is klaar</h2>
+                <p style="color:#3d3d5c;line-height:1.7">
+                    Bijgevoegd vindt u uw persoonlijke financiële analyse.
+                    Het rapport bevat een overzicht van uw inkomsten en uitgaven,
+                    gecategoriseerd per maand, met concrete inzichten en aanbevelingen.
+                </p>
+                <p style="color:#3d3d5c;line-height:1.7">
+                    Rapport ID: <strong>{report_id}</strong>
+                </p>
+                <hr style="border:none;border-top:1px solid #ddd9d0;margin:20px 0">
+                <p style="color:#3d3d5c;font-size:13px">
+                    Heeft u vragen over uw rapport? Neem contact op via
+                    <a href="mailto:info@peterheijen.com" style="color:#1f5c8b">info@peterheijen.com</a>
+                </p>
+            </div>
+            <div style="background:#1a1a2e;padding:15px;text-align:center">
+                <p style="color:rgba(255,255,255,0.5);font-size:12px;margin:0">
+                    &copy; 2025-2026 PeterHeijen.com | Vertrouwelijk
+                </p>
+            </div>
+        </div>
+        """,
+        "attachments": [
+            {
+                "filename": f"financieel-rapport-{report_id}.pdf",
+                "content": pdf_base64,
+                "type": "application/pdf",
+            }
+        ],
+    }
+
+    try:
+        resp = httpx.post(
+            "https://api.resend.com/emails",
+            headers={
+                "Authorization": f"Bearer {resend_key}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=30,
+        )
+        if resp.status_code in (200, 201):
+            logger.info(f"Email verstuurd naar {email}")
+            return True
+        else:
+            logger.error(f"Resend fout: {resp.status_code} {resp.text}")
+            return False
+    except Exception as e:
+        logger.error(f"Email fout: {e}")
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -470,6 +939,76 @@ async def analyseer(bestand: UploadFile):
 
     logger.info(f"[{report_id}] Rapport klaar")
     return rapport
+
+
+@app.post("/rapport")
+async def rapport(bestand: UploadFile, email: str = Form(...)):
+    """Volledige pipeline: upload → analyse → PDF → email."""
+    report_id = str(uuid.uuid4())[:8]
+    logger.info(f"[{report_id}] Start rapport pipeline voor {email}")
+
+    # 1. Inlezen
+    try:
+        inhoud = await bestand.read()
+        df = lees_transacties(inhoud, bestand.filename)
+        logger.info(f"[{report_id}] {len(df)} transacties ingelezen")
+    except Exception as e:
+        logger.error(f"[{report_id}] Inleesfout: {e}")
+        raise HTTPException(status_code=400, detail=f"Kan bestand niet lezen: {e}")
+
+    # 2. Deterministisch rekenen
+    feiten = bereken_feiten(df)
+    top = bereken_top(df)
+    logger.info(f"[{report_id}] Feiten berekend")
+
+    # 3. Claude categoriseren + analyseren
+    try:
+        prompt = bouw_prompt(df, feiten, top)
+        claude_result = vraag_claude(prompt)
+        logger.info(f"[{report_id}] Claude analyse compleet")
+    except Exception as e:
+        logger.error(f"[{report_id}] Claude fout: {e}")
+        raise HTTPException(status_code=500, detail=f"AI-analyse mislukt: {e}")
+
+    if not claude_result.get('data'):
+        raise HTTPException(status_code=500, detail=f"AI-analyse ongeldig: {claude_result.get('error', 'onbekend')}")
+
+    # 4. Rapport data samenstellen
+    rapport_data = {
+        'report_id': report_id,
+        'gegenereerd': datetime.now().isoformat(),
+        'bestand': bestand.filename,
+        'feiten': feiten,
+        'maandoverzicht': claude_result['data'].get('maandoverzicht', {}),
+        'jaartotalen': claude_result['data'].get('jaartotalen', {}),
+        'analyse': claude_result['data'].get('analyse', {}),
+    }
+
+    # 5. PDF genereren
+    try:
+        pdf_bytes = genereer_pdf(rapport_data)
+        logger.info(f"[{report_id}] PDF gegenereerd ({len(pdf_bytes)} bytes)")
+    except Exception as e:
+        logger.error(f"[{report_id}] PDF fout: {e}")
+        raise HTTPException(status_code=500, detail=f"PDF generatie mislukt: {e}")
+
+    # 6. Email versturen
+    email_verstuurd = verstuur_rapport_email(email, pdf_bytes, report_id)
+
+    return {
+        'report_id': report_id,
+        'status': 'compleet',
+        'email_verstuurd': email_verstuurd,
+        'email': email,
+        'analyse': rapport_data['analyse'],
+        'feiten': feiten,
+        'maandoverzicht': rapport_data['maandoverzicht'],
+        'jaartotalen': rapport_data['jaartotalen'],
+        'ai': {
+            'model': claude_result.get('model'),
+            'tokens': claude_result.get('tokens'),
+        },
+    }
 
 
 @app.post("/feiten")

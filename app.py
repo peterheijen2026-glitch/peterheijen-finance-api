@@ -1434,10 +1434,11 @@ def bouw_prompt(df: pd.DataFrame, feiten: dict, top: dict, eigen_rekeningen: set
         bedrag_intern_in = 0
         bedrag_intern_uit = 0
 
-    # Limiteer tot 2000 transacties om prompt-grootte beheersbaar te houden
-    if len(df_extern) > 2000:
-        logger.warning(f"Bestand bevat {len(df_extern)} externe transacties — gelimiteerd tot 2000 voor Claude")
-        df_extern = df_extern.head(2000)
+    # Geen harde limiet meer — moderne LLMs (Claude Opus, GPT-5.4) hebben
+    # 200K+ context window. 3000 transacties × ~200 tokens = 600K tokens, past ruim.
+    if len(df_extern) > 5000:
+        logger.warning(f"Bestand bevat {len(df_extern)} externe transacties — gelimiteerd tot 5000")
+        df_extern = df_extern.head(5000)
 
     # Transacties die rule-based als 'intern' zijn geclassificeerd (Tikkie, creditcard)
     # worden ook uit de lijst voor AI verwijderd
@@ -1456,7 +1457,7 @@ def bouw_prompt(df: pd.DataFrame, feiten: dict, top: dict, eigen_rekeningen: set
             pre_class = f'|[REGEL:{row["regel_sectie"]}:{row["regel_categorie"]}]'
         regels.append(
             f"{row['datum'].strftime('%Y-%m-%d')}|{row['Rekeningnummer']}|"
-            f"{row['bedrag']:>10.2f}|{str(row['Omschrijving'])[:80]}{pre_class}"
+            f"{row['bedrag']:>10.2f}|{str(row['Omschrijving'])[:200]}{pre_class}"
         )
 
     # Eigen rekeningen info voor in de prompt

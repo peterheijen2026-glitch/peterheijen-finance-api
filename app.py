@@ -1507,6 +1507,18 @@ ABSOLUUT VERPLICHT:
    BELANGRIJK: "Overig" categorieën mogen MAXIMAAL 5% van het totaalbedrag per sectie bevatten.
    Als er veel in "Overig" dreigt te belanden, kies dan de best passende bestaande categorie.
 
+## CONSISTENTIE — KRITIEK
+- Dezelfde tegenpartij MOET ALTIJD dezelfde categorie krijgen.
+- Zoek patronen: als "Sevi B.V." 12x voorkomt met vast bedrag, classificeer ze ALLEMAAL hetzelfde.
+- RICHTING: Positief bedrag van een winkel/tankstation = Retour/Terugbetaling, NIET een inkomstencategorie.
+  Positief bedrag van een B.V./Stichting/werkgever = wél inkomen.
+
+## ABN AMRO TRANSACTIEFORMAAT
+ABN-omschrijvingen zijn lang (150-200 tekens). De tegenpartijnaam staat vaak PAS NA "Naam:" of "NAME/".
+Voorbeeld: "/TRTP/SEPA OVERBOEKING/IBAN/NL50BUNQ2208185153/BIC/BUNQNL2A/NAME/Sevi B.V./REMI/2025 12 Sevi"
+→ De naam "Sevi B.V." staat pas op positie ~90. LEES ALTIJD DE HELE OMSCHRIJVING.
+ING-omschrijvingen bevatten de naam juist aan het BEGIN.
+
 2. INKOMSTEN (12 categorieën):
    - Netto salaris (loon van werkgever of eigen BV)
    - UWV/Uitkeringen (WW, WIA, Ziektewet, bijstand)

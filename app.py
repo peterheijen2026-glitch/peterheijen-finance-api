@@ -631,6 +631,256 @@ def _markeer_interne_transfers(df: pd.DataFrame, eigen_rekeningen: set) -> pd.Da
 
 
 # ---------------------------------------------------------------------------
+# STAP 1c: RULE-BASED CLASSIFICATIE (vóór AI)
+# ---------------------------------------------------------------------------
+# ChatGPT CEO-plan: "AI mag pas aan zet nadat het systeem al heeft vastgesteld
+# wat inkomen is, wat transfer is, wat belasting is, wat hypotheek is."
+#
+# Deze laag classificeert transacties op basis van harde regels.
+# AI mag daarna samenvatten en restcategorieën invullen, maar NIET overrulen.
+
+# Merchant mapping: bekende tegenpartijen → vaste categorie
+# Format: (zoekterm_in_omschrijving_uppercase, sectie, categorie, confidence)
+MERCHANT_MAPPING = [
+    # --- INKOMEN ---
+    # UWV
+    ('UWV', 'inkomsten', 'UWV/Uitkeringen', 0.95),
+    # Huur
+    ('DE MONNINK', 'inkomsten', 'Huurinkomsten', 0.95),
+    ('MONNINK', 'inkomsten', 'Huurinkomsten', 0.95),
+    # Kinderbijslag / Kindregelingen
+    ('SVB KINDERBIJSLAG', 'inkomsten', 'Kinderbijslag/Kindregelingen', 0.99),
+    ('SVB', 'inkomsten', 'Kinderbijslag/Kindregelingen', 0.80),
+    # Belastingteruggave (positieve bedragen van Belastingdienst)
+    # → wordt apart afgehandeld in de functie (bedrag-afhankelijk)
+    # Toeslagen
+    ('ZORGTOESLAG', 'inkomsten', 'Toeslagen', 0.99),
+    ('HUURTOESLAG', 'inkomsten', 'Toeslagen', 0.99),
+    ('KINDGEBONDEN BUDGET', 'inkomsten', 'Toeslagen', 0.99),
+    # DGA-loon (specifiek voor deze klant — generieke hints staan in prompt)
+    ('ENGELCKE', 'inkomsten', 'DGA-loon/Managementfee', 0.95),
+    ('SEVI B.V', 'inkomsten', 'DGA-loon/Managementfee', 0.95),
+    ('SEVI BV', 'inkomsten', 'DGA-loon/Managementfee', 0.95),
+    # OLVG (werkgever)
+    ('OLVG', 'inkomsten', 'Netto salaris', 0.95),
+    ('STICHTING OLVG', 'inkomsten', 'Netto salaris', 0.95),
+
+    # --- BELASTINGDIENST (negatief = betaling, positief = teruggave) ---
+    # Wordt apart afgehandeld in de functie (bedrag-afhankelijk)
+
+    # --- VASTE LASTEN ---
+    # Hypotheek / Woonlasten
+    ('ASR', 'vaste_lasten', 'Hypotheek/Huur', 0.85),  # ASR = meestal hypotheek-gekoppeld
+    ('A.S.R', 'vaste_lasten', 'Hypotheek/Huur', 0.85),
+    ('NATIONALE-NEDERLANDEN', 'vaste_lasten', 'Hypotheek/Huur', 0.80),
+    ('AEGON', 'vaste_lasten', 'Hypotheek/Huur', 0.80),
+    ('DELTA LLOYD', 'vaste_lasten', 'Hypotheek/Huur', 0.80),
+    ('VVE', 'vaste_lasten', 'Hypotheek/Huur', 0.90),
+    # Energie
+    ('FRANK ENERGIE', 'vaste_lasten', 'Energie', 0.99),
+    ('VATTENFALL', 'vaste_lasten', 'Energie', 0.99),
+    ('ENECO', 'vaste_lasten', 'Energie', 0.99),
+    ('ESSENT', 'vaste_lasten', 'Energie', 0.99),
+    ('BUDGET ENERGIE', 'vaste_lasten', 'Energie', 0.99),
+    ('GREENCHOICE', 'vaste_lasten', 'Energie', 0.99),
+    # Water
+    ('VITENS', 'vaste_lasten', 'Water', 0.99),
+    ('BRABANT WATER', 'vaste_lasten', 'Water', 0.99),
+    ('PWN', 'vaste_lasten', 'Water', 0.95),
+    ('DUNEA', 'vaste_lasten', 'Water', 0.99),
+    ('WATERNET', 'vaste_lasten', 'Water', 0.99),
+    # Zorgverzekering
+    ('CZ GROEP', 'vaste_lasten', 'Zorgverzekering', 0.99),
+    ('CZ ZORGVERZEKERING', 'vaste_lasten', 'Zorgverzekering', 0.99),
+    ('ZILVEREN KRUIS', 'vaste_lasten', 'Zorgverzekering', 0.99),
+    ('MENZIS', 'vaste_lasten', 'Zorgverzekering', 0.99),
+    ('OHRA', 'vaste_lasten', 'Zorgverzekering', 0.95),
+    # Gemeentebelasting
+    ('GEMEENTELIJKE BELASTING', 'vaste_lasten', 'Gemeentebelasting/OZB/Waterschapsbelasting', 0.99),
+    ('GBLT', 'vaste_lasten', 'Gemeentebelasting/OZB/Waterschapsbelasting', 0.99),
+    ('WATERSCHAP', 'vaste_lasten', 'Gemeentebelasting/OZB/Waterschapsbelasting', 0.99),
+    # Internet/TV
+    ('ZIGGO', 'vaste_lasten', 'Internet/TV', 0.95),
+    ('KPN', 'vaste_lasten', 'Internet/TV', 0.85),
+    # Mobiele telefonie
+    ('T-MOBILE', 'vaste_lasten', 'Mobiele telefonie', 0.95),
+    ('VODAFONE', 'vaste_lasten', 'Mobiele telefonie', 0.95),
+    # Streaming/Digitaal
+    ('NETFLIX', 'vaste_lasten', 'Streaming/Digitaal', 0.99),
+    ('SPOTIFY', 'vaste_lasten', 'Streaming/Digitaal', 0.99),
+    ('DISNEY', 'vaste_lasten', 'Streaming/Digitaal', 0.95),
+    ('APPLE.COM/BILL', 'vaste_lasten', 'Streaming/Digitaal', 0.90),
+    ('ICLOUD', 'vaste_lasten', 'Streaming/Digitaal', 0.95),
+    ('YOUTUBE PREMIUM', 'vaste_lasten', 'Streaming/Digitaal', 0.99),
+    # Donaties
+    ('GIVT', 'vaste_lasten', 'Donaties/Goede doelen', 0.95),
+    ('KWF', 'vaste_lasten', 'Donaties/Goede doelen', 0.95),
+    ('RODE KRUIS', 'vaste_lasten', 'Donaties/Goede doelen', 0.95),
+    ('OXFAM', 'vaste_lasten', 'Donaties/Goede doelen', 0.95),
+    ('PARTIJ VOOR DE DIEREN', 'vaste_lasten', 'Donaties/Goede doelen', 0.95),
+
+    # --- VARIABELE KOSTEN ---
+    # Supermarkten
+    ('ALBERT HEIJN', 'variabele_kosten', 'Boodschappen/Supermarkt', 0.99),
+    ('JUMBO', 'variabele_kosten', 'Boodschappen/Supermarkt', 0.95),
+    ('LIDL', 'variabele_kosten', 'Boodschappen/Supermarkt', 0.99),
+    ('PLUS SUPERMARKT', 'variabele_kosten', 'Boodschappen/Supermarkt', 0.95),
+    ('DIRK', 'variabele_kosten', 'Boodschappen/Supermarkt', 0.95),
+    # Drogist
+    ('ETOS', 'variabele_kosten', 'Drogist', 0.95),
+    ('KRUIDVAT', 'variabele_kosten', 'Drogist', 0.95),
+    # Tankstations
+    ('SHELL', 'variabele_kosten', 'Benzine/Diesel/Laden', 0.90),
+    ('BP ', 'variabele_kosten', 'Benzine/Diesel/Laden', 0.85),
+    ('TOTALENERGIES', 'variabele_kosten', 'Benzine/Diesel/Laden', 0.95),
+    ('TANGO', 'variabele_kosten', 'Benzine/Diesel/Laden', 0.95),
+    ('TINQ', 'variabele_kosten', 'Benzine/Diesel/Laden', 0.95),
+    # OV
+    ('NS GROEP', 'variabele_kosten', 'OV/Trein', 0.95),
+    ('OV-CHIPKAART', 'variabele_kosten', 'OV/Trein', 0.99),
+    ('CONNEXXION', 'variabele_kosten', 'OV/Trein', 0.95),
+    # Afhaal/Bezorging
+    ('THUISBEZORGD', 'variabele_kosten', 'Afhaal/Bezorging', 0.99),
+    ('UBER EATS', 'variabele_kosten', 'Afhaal/Bezorging', 0.99),
+    ('DELIVEROO', 'variabele_kosten', 'Afhaal/Bezorging', 0.99),
+    # Kleding
+    ('H&M', 'variabele_kosten', 'Kleding', 0.90),
+    ('ZARA', 'variabele_kosten', 'Kleding', 0.90),
+    ('C&A', 'variabele_kosten', 'Kleding', 0.90),
+    ('PRIMARK', 'variabele_kosten', 'Kleding', 0.95),
+    # Elektronica/Online
+    ('BOL.COM', 'variabele_kosten', 'Elektronica/Gadgets', 0.80),
+    ('COOLBLUE', 'variabele_kosten', 'Elektronica/Gadgets', 0.90),
+    ('AMAZON', 'variabele_kosten', 'Elektronica/Gadgets', 0.75),
+    # Vakantie
+    ('BOOKING.COM', 'variabele_kosten', 'Vakantie/Reizen', 0.95),
+    ('AIRBNB', 'variabele_kosten', 'Vakantie/Reizen', 0.95),
+    ('TRANSAVIA', 'variabele_kosten', 'Vakantie/Reizen', 0.99),
+    ('KLM', 'variabele_kosten', 'Vakantie/Reizen', 0.95),
+    ('RYANAIR', 'variabele_kosten', 'Vakantie/Reizen', 0.99),
+    # Huishoudelijk
+    ('ACTION', 'variabele_kosten', 'Huishoudelijke artikelen', 0.85),
+    ('HEMA', 'variabele_kosten', 'Huishoudelijke artikelen', 0.80),
+    # Apotheek
+    ('BENU', 'variabele_kosten', 'Apotheek/Medicijnen', 0.95),
+    ('APOTHEEK', 'variabele_kosten', 'Apotheek/Medicijnen', 0.90),
+
+    # --- SPAREN & BELEGGEN ---
+    ('SAXO BANK', 'sparen_beleggen', 'Effectenrekening', 0.95),
+    ('SAXO', 'sparen_beleggen', 'Effectenrekening', 0.90),
+    ('DEGIRO', 'sparen_beleggen', 'Effectenrekening', 0.95),
+    ('IBKR', 'sparen_beleggen', 'Effectenrekening', 0.95),
+    ('INTERACTIVE BROKERS', 'sparen_beleggen', 'Effectenrekening', 0.95),
+    ('MINTOS', 'sparen_beleggen', 'Crowdlending', 0.99),
+    ('LENDAHAND', 'sparen_beleggen', 'Crowdlending', 0.99),
+    ('PEERBERRY', 'sparen_beleggen', 'Crowdlending', 0.99),
+    ('BRAND NEW DAY', 'sparen_beleggen', 'Pensioenopbouw', 0.99),
+
+    # --- CREDITCARD (geen consumptie, interne verschuiving) ---
+    ('ICS/INT CARD', 'intern', 'Creditcard-aflossing', 0.90),
+    ('ICS ', 'intern', 'Creditcard-aflossing', 0.85),
+    ('INTERNATIONAL CARD SERVICES', 'intern', 'Creditcard-aflossing', 0.95),
+    ('VISA CARD', 'intern', 'Creditcard-aflossing', 0.85),
+
+    # --- TIKKIE (terugbetaling gedeelde kosten, geen inkomen) ---
+    ('TIKKIE', 'intern', 'Tikkie-terugbetaling', 0.90),
+]
+
+
+def _classificeer_rule_based(df: pd.DataFrame) -> pd.DataFrame:
+    """Classificeer transacties op basis van harde regels VOORDAT de AI eraan te pas komt.
+
+    Voegt kolommen toe:
+    - 'regel_sectie': inkomsten/vaste_lasten/variabele_kosten/sparen_beleggen/intern/None
+    - 'regel_categorie': specifieke categorie of None
+    - 'regel_confidence': 0.0-1.0
+    - 'classificatie_bron': 'rule' of 'ai' (wordt later ingevuld)
+
+    Belastingdienst wordt apart afgehandeld: positief = teruggave (inkomsten), negatief = betaling (vaste lasten).
+    """
+    df['regel_sectie'] = None
+    df['regel_categorie'] = None
+    df['regel_confidence'] = 0.0
+    df['classificatie_bron'] = None
+
+    n_geclassificeerd = 0
+
+    for idx, row in df.iterrows():
+        if row.get('is_intern', False):
+            continue  # Al gemarkeerd als intern
+
+        omschr = str(row.get('Omschrijving', '')).upper()
+        bedrag = float(row.get('bedrag', 0))
+
+        # Speciaal geval: Belastingdienst
+        if 'BELASTINGDIENST' in omschr or 'BELASTING DIENST' in omschr:
+            if bedrag > 0:
+                df.at[idx, 'regel_sectie'] = 'inkomsten'
+                df.at[idx, 'regel_categorie'] = 'Belastingteruggave'
+                df.at[idx, 'regel_confidence'] = 0.95
+            else:
+                # Probeer type belasting te herkennen
+                if 'IB' in omschr or 'INKOMSTENBELASTING' in omschr or 'INKOMSTENBEL' in omschr:
+                    df.at[idx, 'regel_categorie'] = 'Inkomstenbelasting/Voorlopige aanslag'
+                elif 'OB' in omschr or 'OMZETBELASTING' in omschr or 'BTW' in omschr:
+                    df.at[idx, 'regel_categorie'] = 'BTW/Omzetbelasting'
+                elif 'ZVW' in omschr or 'ZORGVERZEKERINGSWET' in omschr:
+                    df.at[idx, 'regel_categorie'] = 'Zorgverzekering'
+                elif 'MRB' in omschr or 'MOTORRIJTUIGEN' in omschr:
+                    df.at[idx, 'regel_categorie'] = 'Overige belastingen'
+                else:
+                    df.at[idx, 'regel_categorie'] = 'Inkomstenbelasting/Voorlopige aanslag'
+                df.at[idx, 'regel_sectie'] = 'vaste_lasten'
+                df.at[idx, 'regel_confidence'] = 0.90
+            df.at[idx, 'classificatie_bron'] = 'rule'
+            n_geclassificeerd += 1
+            continue
+
+        # Merchant mapping doorlopen
+        for zoekterm, sectie, categorie, confidence in MERCHANT_MAPPING:
+            if zoekterm in omschr:
+                # Creditcard en Tikkie: markeer als intern
+                if sectie == 'intern':
+                    df.at[idx, 'regel_sectie'] = 'intern'
+                    df.at[idx, 'regel_categorie'] = categorie
+                    df.at[idx, 'regel_confidence'] = confidence
+                    df.at[idx, 'classificatie_bron'] = 'rule'
+                    n_geclassificeerd += 1
+                    break
+                # Effectenrekening: positief = terugstorting (niet als "inkomen")
+                elif sectie == 'sparen_beleggen' and bedrag > 0:
+                    df.at[idx, 'regel_sectie'] = 'inkomsten'
+                    df.at[idx, 'regel_categorie'] = 'Effectenrekening (terugstorting)'
+                    df.at[idx, 'regel_confidence'] = confidence
+                    df.at[idx, 'classificatie_bron'] = 'rule'
+                    n_geclassificeerd += 1
+                    break
+                else:
+                    df.at[idx, 'regel_sectie'] = sectie
+                    df.at[idx, 'regel_categorie'] = categorie
+                    df.at[idx, 'regel_confidence'] = confidence
+                    df.at[idx, 'classificatie_bron'] = 'rule'
+                    n_geclassificeerd += 1
+                    break
+
+    # Statistieken
+    n_totaal = len(df[~df.get('is_intern', False)])
+    n_onzeker = n_totaal - n_geclassificeerd
+    pct = (n_geclassificeerd / n_totaal * 100) if n_totaal > 0 else 0
+    logger.info(f"Rule-based classificatie: {n_geclassificeerd}/{n_totaal} transacties ({pct:.0f}%) "
+                f"geclassificeerd, {n_onzeker} naar AI")
+
+    # Log de verdeling per sectie
+    for sectie in ['inkomsten', 'vaste_lasten', 'variabele_kosten', 'sparen_beleggen', 'intern']:
+        n = len(df[df['regel_sectie'] == sectie])
+        if n > 0:
+            bedrag = abs(df[df['regel_sectie'] == sectie]['bedrag'].sum())
+            logger.info(f"  {sectie}: {n} transacties, EUR {bedrag:,.0f}")
+
+    return df
+
+
+# ---------------------------------------------------------------------------
 # STAP 2: DETERMINISTISCH REKENEN
 # ---------------------------------------------------------------------------
 
@@ -748,11 +998,24 @@ def bouw_prompt(df: pd.DataFrame, feiten: dict, top: dict, eigen_rekeningen: set
         logger.warning(f"Bestand bevat {len(df_extern)} externe transacties — gelimiteerd tot 2000 voor Claude")
         df_extern = df_extern.head(2000)
 
+    # Transacties die rule-based als 'intern' zijn geclassificeerd (Tikkie, creditcard)
+    # worden ook uit de lijst voor AI verwijderd
+    if 'regel_sectie' in df_extern.columns:
+        intern_regel_mask = df_extern['regel_sectie'] == 'intern'
+        n_intern_regel = intern_regel_mask.sum()
+        if n_intern_regel > 0:
+            logger.info(f"Prompt: {n_intern_regel} regel-intern transacties (Tikkie/creditcard) verwijderd uit AI-lijst")
+            df_extern = df_extern[~intern_regel_mask].copy()
+
     regels = []
     for _, row in df_extern.iterrows():
+        # Als rule-based geclassificeerd: voeg classificatie toe als hint voor AI
+        pre_class = ''
+        if row.get('classificatie_bron') == 'rule' and row.get('regel_categorie'):
+            pre_class = f'|[REGEL:{row["regel_categorie"]}]'
         regels.append(
             f"{row['datum'].strftime('%Y-%m-%d')}|{row['Rekeningnummer']}|"
-            f"{row['bedrag']:>10.2f}|{str(row['Omschrijving'])[:80]}"
+            f"{row['bedrag']:>10.2f}|{str(row['Omschrijving'])[:80]}{pre_class}"
         )
 
     # Eigen rekeningen info voor in de prompt
@@ -776,9 +1039,18 @@ Totaal afschrijvingen (verzending eigen rekening): EUR {bedrag_intern_uit:,.2f}
 Deze tellen NIET mee als inkomen of uitgave. Ze worden apart in het rapport vermeld.
 """
 
+    # Tel pre-geclassificeerde transacties
+    n_preclassified = len(df_extern[df_extern.get('classificatie_bron', pd.Series()) == 'rule']) if 'classificatie_bron' in df_extern.columns else 0
+
     return f"""Je bent een financieel analist voor vermogende particulieren en DGA's in Nederland.
-Hieronder staan {len(df_extern)} banktransacties (interne overboekingen zijn al verwijderd).
+Hieronder staan {len(df_extern)} banktransacties (interne overboekingen, Tikkies en creditcard-aflossingen zijn al verwijderd).
 {eigen_rek_tekst}{intern_tekst}
+
+## PRE-CLASSIFICATIE
+Van de {len(df_extern)} transacties zijn er {n_preclassified} al rule-based geclassificeerd.
+Deze transacties hebben een [REGEL:Categorie] tag achter de omschrijving.
+BELANGRIJK: Je MOET deze classificaties OVERNEMEN. Je mag ze NIET wijzigen of overschrijven.
+Categoriseer alleen de transacties ZONDER [REGEL:...] tag.
 
 ## REGELS
 1. Categoriseer ELKE transactie in precies één categorie uit onderstaande lijst.
@@ -787,7 +1059,7 @@ Hieronder staan {len(df_extern)} banktransacties (interne overboekingen zijn al 
    BELANGRIJK: "Overig" categorieën mogen MAXIMAAL 5% van het totaalbedrag per sectie bevatten.
    Als er veel in "Overig" dreigt te belanden, kies dan de best passende bestaande categorie.
 
-2. INKOMSTEN (10 categorieën):
+2. INKOMSTEN (12 categorieën):
    - Netto salaris (loon van werkgever of eigen BV)
    - UWV/Uitkeringen (WW, WIA, Ziektewet, bijstand)
    - DGA-loon/Managementfee (vanuit eigen BV)
@@ -795,6 +1067,7 @@ Hieronder staan {len(df_extern)} banktransacties (interne overboekingen zijn al 
    - Toeslagen (zorgtoeslag, huurtoeslag, kindgebonden budget)
    - Belastingteruggave (teruggave IB, BTW, voorlopige aanslag)
    - Kinderbijslag/Kindregelingen
+   - Effectenrekening (terugstorting) (geld terug van Saxo, DeGiro, broker → GEEN inkomen, wel bijschrijving)
    - Freelance/Opdrachten (losse inkomsten, facturen)
    - Beleggingsinkomen (dividend, rente, uitkeringen)
    - Overig inkomen
@@ -1014,16 +1287,23 @@ def _rapport_kwaliteitscheck(data: dict, df: pd.DataFrame, eigen_rekeningen: set
                         )
                         logger.warning(f"KWALITEITSCHECK: {warnings_found[-1]}")
 
-    # Log alle waarschuwingen maar blokkeer (nog) niet — eerst data verzamelen
+    # Blokkeer rapport bij ernstige classificatiefouten
+    # ChatGPT CEO-plan: "liever even geen rapport dan een rapport dat vertrouwen sloopt"
     if warnings_found:
         logger.warning(f"KWALITEITSCHECK: {len(warnings_found)} waarschuwing(en) gevonden")
         for w in warnings_found:
             logger.warning(f"  - {w}")
+
+        # Bij 'Overig inkomen' > 30%: dit is een fundamenteel classificatieprobleem
+        # Rapport wordt WEL gegenereerd maar met disclaimer in de analyse
+        # In toekomstige versie: blokkeren en opnieuw proberen met strengere prompt
+        logger.warning("KWALITEITSCHECK: Rapport wordt gegenereerd MET waarschuwingen in analyse")
     else:
         logger.info("KWALITEITSCHECK: alle checks geslaagd")
 
 
-def vraag_claude(prompt: str) -> dict:
+def _vraag_claude(prompt: str, model: str) -> dict:
+    """Roep Anthropic Claude API aan."""
     from anthropic import Anthropic
 
     api_key = os.environ.get('ANTHROPIC_API_KEY')
@@ -1031,14 +1311,10 @@ def vraag_claude(prompt: str) -> dict:
         raise ValueError("ANTHROPIC_API_KEY niet geconfigureerd")
 
     import httpx
-    # Ruime timeout voor Opus met grote prompts (66K+ tokens kan 5-8 min duren)
     client = Anthropic(
         api_key=api_key,
         timeout=httpx.Timeout(600.0, connect=30.0),
     )
-    # Gebruik het slimste model voor de beste kwaliteit.
-    # Kwaliteit > snelheid.
-    model = os.environ.get('CLAUDE_MODEL', 'claude-opus-4-6')
 
     logger.info(f"Claude aanroepen ({model}), prompt: {len(prompt)} tekens (~{len(prompt)//4} tokens)")
 
@@ -1053,7 +1329,56 @@ def vraag_claude(prompt: str) -> dict:
     tokens_out = response.usage.output_tokens
     logger.info(f"Claude klaar: {tokens_in} in, {tokens_out} out")
 
-    # Parse JSON
+    return tekst, tokens_in, tokens_out
+
+
+def _vraag_openai(prompt: str, model: str) -> dict:
+    """Roep OpenAI GPT API aan."""
+    from openai import OpenAI
+
+    api_key = os.environ.get('OPENAI_API_KEY')
+    if not api_key:
+        raise ValueError("OPENAI_API_KEY niet geconfigureerd — stel in via Railway Variables")
+
+    client = OpenAI(
+        api_key=api_key,
+        timeout=600.0,
+    )
+
+    logger.info(f"OpenAI aanroepen ({model}), prompt: {len(prompt)} tekens (~{len(prompt)//4} tokens)")
+
+    response = client.chat.completions.create(
+        model=model,
+        max_tokens=32000,
+        messages=[{"role": "user", "content": prompt}],
+    )
+
+    tekst = response.choices[0].message.content
+    tokens_in = response.usage.prompt_tokens
+    tokens_out = response.usage.completion_tokens
+    logger.info(f"OpenAI klaar: {tokens_in} in, {tokens_out} out")
+
+    return tekst, tokens_in, tokens_out
+
+
+# Model configuratie:
+# AI_PROVIDER = 'claude' of 'openai'
+# CLAUDE_MODEL = 'claude-opus-4-6' (default)
+# OPENAI_MODEL = 'gpt-5.4' (default)
+# Kwaliteit > snelheid. Altijd het slimste model.
+
+def vraag_ai(prompt: str) -> dict:
+    """Generieke AI-aanroep — kiest automatisch Claude of GPT op basis van AI_PROVIDER env var."""
+    provider = os.environ.get('AI_PROVIDER', 'claude').lower()
+
+    if provider == 'openai':
+        model = os.environ.get('OPENAI_MODEL', 'gpt-5.4')
+        tekst, tokens_in, tokens_out = _vraag_openai(prompt, model)
+    else:
+        model = os.environ.get('CLAUDE_MODEL', 'claude-opus-4-6')
+        tekst, tokens_in, tokens_out = _vraag_claude(prompt, model)
+
+    # Parse JSON uit response
     if '```json' in tekst:
         tekst = tekst.split('```json')[1].split('```')[0]
     elif '```' in tekst:
@@ -1064,6 +1389,7 @@ def vraag_claude(prompt: str) -> dict:
             'data': json.loads(tekst),
             'tokens': {'input': tokens_in, 'output': tokens_out},
             'model': model,
+            'provider': provider,
         }
     except json.JSONDecodeError as e:
         logger.error(f"JSON parse error: {e}")
@@ -1073,7 +1399,13 @@ def vraag_claude(prompt: str) -> dict:
             'error': str(e),
             'tokens': {'input': tokens_in, 'output': tokens_out},
             'model': model,
+            'provider': provider,
         }
+
+
+# Backward compatible alias
+def vraag_claude(prompt: str) -> dict:
+    return vraag_ai(prompt)
 
 
 # ---------------------------------------------------------------------------
@@ -2077,14 +2409,22 @@ def _run_rapport_pipeline(job_id: str, bestanden: list, email: str):
         n_intern = df['is_intern'].sum()
         update(f'{n_intern} interne overboekingen gedetecteerd', 19)
 
+        # 1c. Rule-based classificatie (vóór AI)
+        update('Transacties classificeren...', 22)
+        df = _classificeer_rule_based(df)
+        n_regel = len(df[df['classificatie_bron'] == 'rule'])
+        update(f'{n_regel} transacties rule-based geclassificeerd', 25)
+
         # 2. Deterministisch rekenen
-        update('Bedragen berekenen en controleren...', 20)
+        update('Bedragen berekenen en controleren...', 27)
         feiten = bereken_feiten(df)
         top = bereken_top(df)
         update(f'Feiten berekend voor {len(feiten)} rekening(en)', 30)
 
-        # 3. Claude categoriseren + analyseren (langste stap: 30s-300s)
-        update('AI analyseert uw transacties...', 35)
+        # 3. AI categoriseren + analyseren (langste stap: 30s-300s)
+        provider = os.environ.get('AI_PROVIDER', 'claude').lower()
+        model_naam = os.environ.get('OPENAI_MODEL', 'gpt-5.4') if provider == 'openai' else os.environ.get('CLAUDE_MODEL', 'claude-opus-4-6')
+        update(f'AI analyseert uw transacties ({model_naam})...', 35)
         prompt = bouw_prompt(df, feiten, top, eigen_rekeningen=eigen_rekeningen)
         logger.info(f"[{job_id}] Prompt: {len(prompt)} tekens, {len(df)} transacties")
         claude_result = vraag_claude(prompt)

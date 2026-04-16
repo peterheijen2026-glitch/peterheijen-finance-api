@@ -869,38 +869,72 @@ def verstuur_rapport_email(email: str, pdf_bytes: bytes, report_id: str):
     pdf_base64 = base64.b64encode(pdf_bytes).decode('utf-8')
     logger.info(f"PDF bijlage: {len(pdf_bytes)} bytes, base64: {len(pdf_base64)} chars")
 
+    # Anti-spam: platte tekst versie (HTML-only is een spam signaal)
+    plain_text = (
+        f"Uw financieel rapport is klaar\n\n"
+        f"Beste klant,\n\n"
+        f"Bijgevoegd vindt u uw persoonlijke financiele analyse van PeterHeijen.com.\n"
+        f"Het rapport bevat een overzicht van uw inkomsten en uitgaven, "
+        f"gecategoriseerd per maand, met concrete inzichten en aanbevelingen.\n\n"
+        f"Rapport ID: {report_id}\n\n"
+        f"Heeft u vragen? Neem contact op via info@peterheijen.com\n\n"
+        f"Met vriendelijke groet,\n"
+        f"Peter Heijen\n"
+        f"PeterHeijen.com\n\n"
+        f"Engelcke B.V. | Tienhoven | KvK 30277920\n"
+        f"U ontvangt deze email omdat u een financiele analyse heeft aangevraagd op peterheijen.com."
+    )
+
     payload = {
-        "from": "PeterHeijen.com <rapport@peterheijen.com>",
+        "from": "Peter Heijen <rapport@peterheijen.com>",
+        "reply_to": "info@peterheijen.com",
         "to": [email],
-        "subject": f"Uw Financieel Rapport \u2014 PeterHeijen.com",
-        "html": f"""
-        <div style="font-family:Georgia,serif;max-width:600px;margin:0 auto;color:#1a1a2e">
-            <div style="background:#1a1a2e;padding:30px;text-align:center">
-                <h1 style="color:#fff;font-size:22px;margin:0">Peter<span style="color:#c9a84c">Heijen</span>.com</h1>
-            </div>
-            <div style="padding:30px;background:#f7f6f2">
-                <h2 style="color:#1a1a2e;font-size:20px">Uw financieel rapport is klaar</h2>
-                <p style="color:#3d3d5c;line-height:1.7">
-                    Bijgevoegd vindt u uw persoonlijke financi\u00eble analyse.
-                    Het rapport bevat een overzicht van uw inkomsten en uitgaven,
-                    gecategoriseerd per maand, met concrete inzichten en aanbevelingen.
-                </p>
-                <p style="color:#3d3d5c;line-height:1.7">
-                    Rapport ID: <strong>{report_id}</strong>
-                </p>
-                <hr style="border:none;border-top:1px solid #ddd9d0;margin:20px 0">
-                <p style="color:#3d3d5c;font-size:13px">
-                    Heeft u vragen over uw rapport? Neem contact op via
-                    <a href="mailto:info@peterheijen.com" style="color:#1f5c8b">info@peterheijen.com</a>
-                </p>
-            </div>
-            <div style="background:#1a1a2e;padding:15px;text-align:center">
-                <p style="color:rgba(255,255,255,0.5);font-size:12px;margin:0">
-                    &copy; 2025-2026 PeterHeijen.com | Vertrouwelijk
-                </p>
-            </div>
-        </div>
-        """,
+        "subject": f"Uw persoonlijke financiele analyse is klaar",
+        "text": plain_text,
+        "html": f"""<!DOCTYPE html>
+<html lang="nl">
+<head><meta charset="utf-8"></head>
+<body style="margin:0;padding:0;background:#f7f6f2;font-family:Georgia,serif">
+<table width="100%" cellpadding="0" cellspacing="0" style="background:#f7f6f2">
+<tr><td align="center" style="padding:20px 0">
+<table width="560" cellpadding="0" cellspacing="0" style="background:#ffffff;border-radius:8px;overflow:hidden">
+  <tr><td style="background:#1a1a2e;padding:24px 30px">
+    <p style="color:#ffffff;font-size:18px;margin:0;font-family:Georgia,serif">Peter<span style="color:#c9a84c">Heijen</span>.com</p>
+  </td></tr>
+  <tr><td style="padding:30px">
+    <h1 style="color:#1a1a2e;font-size:20px;margin:0 0 16px;font-family:Georgia,serif">Uw financieel rapport is klaar</h1>
+    <p style="color:#3d3d5c;font-size:15px;line-height:1.7;margin:0 0 16px">
+      Beste klant,
+    </p>
+    <p style="color:#3d3d5c;font-size:15px;line-height:1.7;margin:0 0 16px">
+      Bijgevoegd vindt u uw persoonlijke financiele analyse.
+      Het rapport bevat een overzicht van uw inkomsten en uitgaven,
+      gecategoriseerd per maand, met concrete inzichten en aanbevelingen.
+    </p>
+    <p style="color:#3d3d5c;font-size:14px;line-height:1.7;margin:0 0 16px">
+      Rapport ID: <strong>{report_id}</strong>
+    </p>
+    <hr style="border:none;border-top:1px solid #ddd9d0;margin:20px 0">
+    <p style="color:#3d3d5c;font-size:13px;line-height:1.6;margin:0 0 8px">
+      Heeft u vragen over uw rapport? Neem contact op via
+      <a href="mailto:info@peterheijen.com" style="color:#1f5c8b">info@peterheijen.com</a>
+    </p>
+    <p style="color:#3d3d5c;font-size:13px;line-height:1.6;margin:0">
+      Met vriendelijke groet,<br>Peter Heijen
+    </p>
+  </td></tr>
+  <tr><td style="background:#f7f6f2;padding:16px 30px;border-top:1px solid #ddd9d0">
+    <p style="color:#999;font-size:11px;line-height:1.5;margin:0">
+      Engelcke B.V. | Tienhoven | KvK 30277920<br>
+      U ontvangt deze email omdat u een financiele analyse heeft aangevraagd op
+      <a href="https://peterheijen.com" style="color:#999">peterheijen.com</a>.
+    </p>
+  </td></tr>
+</table>
+</td></tr>
+</table>
+</body>
+</html>""",
         "attachments": [
             {
                 "filename": f"financieel-rapport-{report_id}.pdf",

@@ -372,17 +372,16 @@ def vraag_claude(prompt: str) -> dict:
         raise ValueError("ANTHROPIC_API_KEY niet geconfigureerd")
 
     client = Anthropic(api_key=api_key)
-    # Sonnet is 5x sneller dan Opus en even goed voor categorisatie.
-    # Opus duurde 90-180s voor grote bestanden → timeout.
-    # Sonnet doet hetzelfde in 20-40s.
-    model = 'claude-sonnet-4-6'
+    # Gebruik het slimste model voor de beste kwaliteit.
+    # Kwaliteit > snelheid. Timeouts zijn ruim genoeg (10 min frontend, 5 min Claude).
+    model = os.environ.get('CLAUDE_MODEL', 'claude-opus-4-6')
 
     logger.info(f"Claude aanroepen ({model}), prompt: {len(prompt)} tekens")
 
     response = client.messages.create(
         model=model,
         max_tokens=32000,
-        timeout=120,  # Max 2 minuten voor Claude — voorkomt eindeloos wachten
+        timeout=300,  # 5 minuten — Opus heeft meer tijd nodig voor grote bestanden
         messages=[{"role": "user", "content": prompt}],
     )
 
@@ -954,8 +953,9 @@ def deep_health():
     api_key = os.environ.get('ANTHROPIC_API_KEY')
     checks['claude_api_key'] = bool(api_key and api_key.startswith('sk-'))
 
-    # Claude model (hardcoded Sonnet voor snelheid)
-    checks['claude_model'] = 'claude-sonnet-4-6'
+    # Claude model
+    model = os.environ.get('CLAUDE_MODEL', 'claude-opus-4-6')
+    checks['claude_model'] = model
 
     # Resend API key
     resend_key = os.environ.get('RESEND_API_KEY')

@@ -1584,7 +1584,7 @@ def _vraag_openai(prompt: str, model: str) -> dict:
 
     response = client.chat.completions.create(
         model=model,
-        max_tokens=32000,
+        max_completion_tokens=32000,
         messages=[{"role": "user", "content": prompt}],
     )
 

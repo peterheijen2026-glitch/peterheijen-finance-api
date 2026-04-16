@@ -167,11 +167,17 @@ def bereken_top(df: pd.DataFrame, n: int = 15) -> dict:
 # ---------------------------------------------------------------------------
 
 def bouw_prompt(df: pd.DataFrame, feiten: dict, top: dict) -> str:
+    # Limiteer tot 2000 transacties om prompt-grootte beheersbaar te houden
+    # Bij meer dan 2000: neem een representatieve sample
+    if len(df) > 2000:
+        logger.warning(f"Bestand bevat {len(df)} transacties — gelimiteerd tot 2000 voor Claude")
+        df = df.head(2000)
+
     regels = []
     for _, row in df.iterrows():
         regels.append(
             f"{row['datum'].strftime('%Y-%m-%d')}|{row['Rekeningnummer']}|"
-            f"{row['bedrag']:>10.2f}|{str(row['Omschrijving'])[:100]}"
+            f"{row['bedrag']:>10.2f}|{str(row['Omschrijving'])[:80]}"  # 80 ipv 100 chars — scheelt tokens
         )
 
     return f"""Je bent een financieel analist voor vermogende particulieren en DGA's in Nederland.
@@ -366,7 +372,10 @@ def vraag_claude(prompt: str) -> dict:
         raise ValueError("ANTHROPIC_API_KEY niet geconfigureerd")
 
     client = Anthropic(api_key=api_key)
-    model = os.environ.get('CLAUDE_MODEL', 'claude-sonnet-4-6')
+    # Sonnet is 5x sneller dan Opus en even goed voor categorisatie.
+    # Opus duurde 90-180s voor grote bestanden → timeout.
+    # Sonnet doet hetzelfde in 20-40s.
+    model = 'claude-sonnet-4-6'
 
     logger.info(f"Claude aanroepen ({model}), prompt: {len(prompt)} tekens")
 
@@ -945,9 +954,8 @@ def deep_health():
     api_key = os.environ.get('ANTHROPIC_API_KEY')
     checks['claude_api_key'] = bool(api_key and api_key.startswith('sk-'))
 
-    # Claude model
-    model = os.environ.get('CLAUDE_MODEL', 'claude-sonnet-4-6')
-    checks['claude_model'] = model
+    # Claude model (hardcoded Sonnet voor snelheid)
+    checks['claude_model'] = 'claude-sonnet-4-6'
 
     # Resend API key
     resend_key = os.environ.get('RESEND_API_KEY')

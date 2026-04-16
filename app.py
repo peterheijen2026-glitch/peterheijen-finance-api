@@ -22,6 +22,7 @@ import threading
 from datetime import datetime
 
 import pandas as pd
+from typing import List, Optional
 from fastapi import FastAPI, UploadFile, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fpdf import FPDF
@@ -1399,9 +1400,10 @@ async def analyseer(bestand: UploadFile):
     return rapport
 
 
-def _run_rapport_pipeline(job_id: str, inhoud: bytes, bestandsnaam: str, email: str):
+def _run_rapport_pipeline(job_id: str, bestanden: list, email: str):
     """Achtergrond-thread: volledige pipeline upload → analyse → PDF → email.
 
+    bestanden: list van (inhoud_bytes, bestandsnaam) tuples.
     Schrijft voortgang naar jobs[job_id] zodat de status-endpoint het kan serveren.
     Draait NIET in een HTTP-request — dus geen proxy timeout meer.
     """
@@ -1412,10 +1414,15 @@ def _run_rapport_pipeline(job_id: str, inhoud: bytes, bestandsnaam: str, email: 
         logger.info(f"[{job_id}] {fase}")
 
     try:
-        # 1. Inlezen
+        # 1. Inlezen — meerdere bestanden samenvoegen
         update('Transacties inlezen...', 10)
-        df = lees_transacties(inhoud, bestandsnaam)
-        update(f'{len(df)} transacties ingelezen', 15)
+        dfs = []
+        for inhoud, bestandsnaam in bestanden:
+            df_deel = lees_transacties(inhoud, bestandsnaam)
+            dfs.append(df_deel)
+            logger.info(f"[{job_id}] {bestandsnaam}: {len(df_deel)} transacties")
+        df = pd.concat(dfs, ignore_index=True)
+        update(f'{len(df)} transacties ingelezen uit {len(bestanden)} bestand(en)', 15)
 
         # 2. Deterministisch rekenen
         update('Bedragen berekenen en controleren...', 20)
@@ -1476,52 +1483,69 @@ def _run_rapport_pipeline(job_id: str, inhoud: bytes, bestandsnaam: str, email: 
 
 
 @app.post("/rapport")
-async def rapport(bestand: UploadFile, email: str = Form(...)):
+async def rapport(bestanden: Optional[List[UploadFile]] = None, bestand: Optional[UploadFile] = None, email: str = Form(...)):
     """Start de rapport-pipeline als achtergrond-job.
+
+    Accepteert één of meerdere bestanden:
+      - 'bestanden' (meerdere files) of 'bestand' (enkele file, backward compatible)
 
     Retourneert DIRECT (< 1 sec) met een job_id.
     Client pollt /rapport/{job_id}/status voor voortgang.
-    Geen lange HTTP-requests = geen Railway/proxy timeout.
     """
     job_id = str(uuid.uuid4())[:8]
     logger.info(f"[{job_id}] Rapport aangevraagd voor {email}")
 
-    # Bestand direct inlezen (dit is snel, < 1 sec)
+    # Verzamel alle bestanden (support zowel 'bestanden' als 'bestand' veld)
+    uploads = []
+    if bestanden:
+        uploads.extend(bestanden)
+    if bestand:
+        uploads.append(bestand)
+    if not uploads:
+        raise HTTPException(status_code=400, detail="Geen bestanden geüpload")
+
+    # Bestanden direct inlezen en valideren (snel, < 1 sec per bestand)
+    bestanden_data = []
+    totaal_transacties = 0
     try:
-        inhoud = await bestand.read()
-        if len(inhoud) > 10 * 1024 * 1024:
-            raise HTTPException(status_code=400, detail="Bestand is te groot (max 10 MB)")
-        # Quick validatie: check of het bestand gelezen kan worden
-        df_test = lees_transacties(inhoud, bestand.filename)
-        n_transacties = len(df_test)
-        del df_test  # Geheugen vrijgeven
-        logger.info(f"[{job_id}] {n_transacties} transacties, {len(inhoud)} bytes — bestand OK")
+        for f in uploads:
+            inhoud = await f.read()
+            if len(inhoud) > 10 * 1024 * 1024:
+                raise HTTPException(status_code=400, detail=f"Bestand '{f.filename}' is te groot (max 10 MB)")
+            # Quick validatie
+            df_test = lees_transacties(inhoud, f.filename)
+            totaal_transacties += len(df_test)
+            del df_test
+            bestanden_data.append((inhoud, f.filename))
+            logger.info(f"[{job_id}] {f.filename}: {len(inhoud)} bytes — OK")
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"[{job_id}] Inleesfout: {e}")
         raise HTTPException(status_code=400, detail=f"Kan bestand niet lezen: {e}")
 
+    logger.info(f"[{job_id}] {totaal_transacties} transacties totaal uit {len(bestanden_data)} bestand(en)")
+
     # Job registreren
+    namen = ', '.join(f[1] for f in bestanden_data)
     with jobs_lock:
         jobs[job_id] = {
             'status': 'bezig',
             'fase': 'Gestart...',
             'voortgang': 5,
             'email': email,
-            'bestand': bestand.filename,
+            'bestand': namen,
             'gestart': datetime.now().isoformat(),
         }
 
-    # Start achtergrond-thread — de eigenlijke analyse
+    # Start achtergrond-thread
     thread = threading.Thread(
         target=_run_rapport_pipeline,
-        args=(job_id, inhoud, bestand.filename, email),
+        args=(job_id, bestanden_data, email),
         daemon=True,
     )
     thread.start()
 
-    # Direct terug — client gaat pollen op /rapport/{job_id}/status
     return {
         'job_id': job_id,
         'status': 'gestart',

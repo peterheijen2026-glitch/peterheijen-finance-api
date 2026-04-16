@@ -986,11 +986,16 @@ def _classificeer_rule_based(df: pd.DataFrame) -> pd.DataFrame:
 def _detecteer_dga_loon(df: pd.DataFrame) -> pd.DataFrame:
     """Detecteer DGA-loon/Managementfee op basis van patronen — GEEN hardcoded namen.
 
+    Werkt voor ALLE DGA-gezinnen in Nederland.
+
     Heuristiek:
-    1. Zoek tegenpartijen waarvan de naam "B.V." of "BV" bevat
+    1. Zoek tegenpartijen waarvan de naam een rechtsvorm bevat:
+       - "B.V." / "BV" (besloten vennootschap)
+       - "HOLDING" (holdingstructuur)
+       - "MANAGEMENT" + bedrijfscontext (managementfee)
     2. Die minstens 3x voorkomen met POSITIEF bedrag (geld ontvangt)
-    3. Waarvan het meeste bedrag (semi-)vast is (standaarddeviatie < 20% van gemiddelde)
-    4. Dit zijn waarschijnlijk DGA-loon/Managementfee-betalingen
+    3. Waarvan het meeste bedrag (semi-)vast is (standaarddeviatie < 25% van gemiddelde)
+    4. Met gemiddeld ≥€500 per betaling
 
     Classificeert als: inkomsten / DGA-loon/Managementfee
     """
@@ -1010,14 +1015,26 @@ def _detecteer_dga_loon(df: pd.DataFrame) -> pd.DataFrame:
     groepeer_col = 'Tegenrekening' if 'Tegenrekening' in df.columns else 'Omschrijving'
 
     for key, groep in df_kandidaat.groupby(groepeer_col):
-        key_str = str(key).upper()
+        key_str = str(key).upper().strip()
 
-        # Check: bevat de tegenpartij of omschrijving "B.V." of "BV"?
-        omschr_sample = ' '.join(groep['Omschrijving'].astype(str).str.upper().head(5))
-        heeft_bv = any(marker in key_str or marker in omschr_sample
-                       for marker in ['B.V.', ' BV ', ' BV,', 'B.V ', ' B.V'])
+        # Check: bevat de tegenpartij of omschrijving een rechtsvorm-indicator?
+        omschr_alle = ' '.join(groep['Omschrijving'].astype(str).str.upper())
+        tekst_check = key_str + ' ' + omschr_alle
 
-        if not heeft_bv:
+        # Patronen die wijzen op een vennootschap / DGA-structuur
+        bv_markers = ['B.V.', ' BV ', ' BV,', 'B.V ', ' B.V', ' BV.']
+        holding_markers = ['HOLDING', 'HLDG']
+        # "MANAGEMENT" alleen als er ook een bedrijfsindicator bij staat
+        mgmt_met_bedrijf = ('MANAGEMENT' in tekst_check and
+                            any(m in tekst_check for m in bv_markers + holding_markers + ['CONSULTANCY', 'ADVIES', 'DIENSTEN']))
+
+        heeft_rechtsvorm = (
+            any(marker in tekst_check for marker in bv_markers) or
+            any(marker in tekst_check for marker in holding_markers) or
+            mgmt_met_bedrijf
+        )
+
+        if not heeft_rechtsvorm:
             continue
 
         # Filter: alleen positieve transacties (inkomend geld)
@@ -1026,15 +1043,16 @@ def _detecteer_dga_loon(df: pd.DataFrame) -> pd.DataFrame:
             continue
 
         # Check: zijn de bedragen (semi-)vast?
+        # 25% tolerantie (ruimer dan 20%) om kleine variaties/vakantiegeld op te vangen
         bedragen = groep_pos['bedrag'].astype(float)
         gemiddeld = bedragen.mean()
         if gemiddeld < 500:
             continue  # Minder dan €500 gemiddeld is waarschijnlijk geen loon
 
         std = bedragen.std()
-        if gemiddeld > 0 and (std / gemiddeld) < 0.20:
+        variatie = (std / gemiddeld) if gemiddeld > 0 else 1.0
+        if variatie < 0.25:
             # Vast bedrag gedetecteerd: dit is waarschijnlijk DGA-loon
-            # Classificeer alle positieve transacties van deze tegenpartij
             mask_dga = df.index.isin(groep_pos.index)
             df.loc[mask_dga, 'regel_sectie'] = 'inkomsten'
             df.loc[mask_dga, 'regel_categorie'] = 'DGA-loon/Managementfee'
@@ -1047,7 +1065,7 @@ def _detecteer_dga_loon(df: pd.DataFrame) -> pd.DataFrame:
                 f"DGA-LOON GEDETECTEERD: {key_str[:50]} — "
                 f"{len(groep_pos)} betalingen, gemiddeld EUR {gemiddeld:,.0f}, "
                 f"totaal EUR {totaal:,.0f}, std EUR {std:,.0f} "
-                f"({std/gemiddeld*100:.0f}% variatie)"
+                f"({variatie*100:.0f}% variatie)"
             )
 
     if n_gedetecteerd > 0:
@@ -1061,18 +1079,21 @@ def _detecteer_dga_loon(df: pd.DataFrame) -> pd.DataFrame:
 def _detecteer_huurinkomsten(df: pd.DataFrame) -> pd.DataFrame:
     """Detecteer huurinkomsten op basis van patronen — GEEN hardcoded namen.
 
+    Werkt voor ALLE verhuurders in Nederland.
+
     Heuristiek:
     1. Zoek tegenpartijen met regelmatige POSITIEVE betalingen (minstens 4x)
-    2. Die GEEN bedrijf zijn (niet in merchant mapping, geen B.V.)
-    3. Met een (semi-)vast bedrag (std < 20% van gemiddelde)
-    4. Waar het geld alleen ÉÉN kant op gaat (niet bidirectioneel = geen huishoudlid)
+    2. Die GEEN bedrijf zijn (niet in merchant mapping, geen B.V./Holding)
+    3. Met een (semi-)vast bedrag (std < 25% van gemiddelde)
+    4. Waar het geld OVERWEGEND één kant op gaat (max 15% negatief)
+       → relaxer dan 0%, want soms geeft een verhuurder eenmalig borg terug
     5. Met een gemiddeld bedrag van minstens €300 (realistisch voor huur)
+
+    Fallback: als Tegenrekening leeg is, groepeer op genormaliseerde naam
+    uit de omschrijving (eerste woorden, hoofdletters).
 
     Classificeert als: inkomsten / Huurinkomsten
     """
-    if 'Tegenrekening' not in df.columns:
-        return df
-
     # Alleen niet-interne, niet-reeds-geclassificeerde, POSITIEVE transacties
     mask = (~df['is_intern']) & (df['classificatie_bron'].isna()) & (df['bedrag'] > 0)
     df_kandidaat = df[mask].copy()
@@ -1085,50 +1106,94 @@ def _detecteer_huurinkomsten(df: pd.DataFrame) -> pd.DataFrame:
     for zoekterm, _, _, _ in MERCHANT_MAPPING:
         bekende_merchants.add(zoekterm)
 
+    # Rechtsvorm-markers (al afgevangen door DGA-loon detectie)
+    rechtsvorm_markers = ['B.V.', ' BV ', ' BV,', 'B.V ', ' B.V', ' BV.',
+                          'HOLDING', 'HLDG', 'STICHTING', 'VERENIGING', 'N.V.', ' NV ']
+
     n_gedetecteerd = 0
 
-    df_kandidaat['_tegen_norm'] = df_kandidaat['Tegenrekening'].apply(_normaliseer_iban)
-    df_kandidaat = df_kandidaat[df_kandidaat['_tegen_norm'] != '']
+    # Bepaal groepeersleutel: Tegenrekening (IBAN) als beschikbaar, anders naam
+    heeft_tegenrek = 'Tegenrekening' in df.columns
 
-    for tegen_rek, groep in df_kandidaat.groupby('_tegen_norm'):
+    if heeft_tegenrek:
+        df_kandidaat['_groep_key'] = df_kandidaat['Tegenrekening'].apply(_normaliseer_iban)
+        # Fallback voor lege tegenrekening: gebruik eerste 3 woorden van omschrijving
+        lege_mask = df_kandidaat['_groep_key'] == ''
+        if lege_mask.any():
+            df_kandidaat.loc[lege_mask, '_groep_key'] = (
+                df_kandidaat.loc[lege_mask, 'Omschrijving']
+                .astype(str).str.upper().str.split().str[:3].str.join(' ')
+            )
+    else:
+        # Geen Tegenrekening kolom: groepeer op eerste 3 woorden van omschrijving
+        df_kandidaat['_groep_key'] = (
+            df_kandidaat['Omschrijving']
+            .astype(str).str.upper().str.split().str[:3].str.join(' ')
+        )
+
+    df_kandidaat = df_kandidaat[df_kandidaat['_groep_key'] != '']
+
+    for groep_key, groep in df_kandidaat.groupby('_groep_key'):
         if len(groep) < 4:
             continue
 
-        # Check: geen B.V. (die zijn al DGA-loon)
-        omschr_sample = ' '.join(groep['Omschrijving'].astype(str).str.upper().head(5))
-        is_bv = any(m in omschr_sample for m in ['B.V.', ' BV ', ' BV,', 'B.V '])
-        if is_bv:
+        # Check: geen rechtsvorm (die zijn al DGA-loon of bedrijf)
+        omschr_alle = ' '.join(groep['Omschrijving'].astype(str).str.upper())
+        is_rechtsvorm = any(m in omschr_alle for m in rechtsvorm_markers)
+        if is_rechtsvorm:
             continue
 
         # Check: geen bekende merchant
         is_merchant = False
         for merchant_zoek in bekende_merchants:
-            if merchant_zoek in omschr_sample:
+            if merchant_zoek in omschr_alle:
                 is_merchant = True
                 break
         if is_merchant:
             continue
 
-        # Check: alleen positieve transacties (geld komt alleen binnen)
-        # Als er ook negatieve transacties van dezelfde tegenpartij zijn,
-        # is het waarschijnlijk een huishoudlid (al afgevangen) of iets anders
-        alle_transacties_tegenpartij = df[
-            (df['Tegenrekening'].apply(_normaliseer_iban) == tegen_rek) &
-            (~df['is_intern'])
-        ]
-        heeft_negatief = (alle_transacties_tegenpartij['bedrag'] < 0).any()
-        if heeft_negatief:
-            continue  # Bidirectioneel = waarschijnlijk geen huur
+        # Check: OVERWEGEND unidirectioneel (max 15% negatieve transacties)
+        # Dit is relaxer dan "absoluut geen negatief", want soms geeft een
+        # verhuurder borg terug of corrigeert een bedrag.
+        if heeft_tegenrek:
+            # Zoek ALLE transacties (ook negatieve) van deze tegenpartij
+            df['_temp_groep'] = df['Tegenrekening'].apply(_normaliseer_iban)
+            lege_temp = df['_temp_groep'] == ''
+            if lege_temp.any():
+                df.loc[lege_temp, '_temp_groep'] = (
+                    df.loc[lege_temp, 'Omschrijving']
+                    .astype(str).str.upper().str.split().str[:3].str.join(' ')
+                )
+            alle_van_tegenpartij = df[
+                (df['_temp_groep'] == groep_key) & (~df['is_intern'])
+            ]
+            df.drop(columns=['_temp_groep'], inplace=True)
+        else:
+            df['_temp_groep'] = (
+                df['Omschrijving'].astype(str).str.upper().str.split().str[:3].str.join(' ')
+            )
+            alle_van_tegenpartij = df[
+                (df['_temp_groep'] == groep_key) & (~df['is_intern'])
+            ]
+            df.drop(columns=['_temp_groep'], inplace=True)
 
-        # Check: (semi-)vast bedrag
+        n_negatief = (alle_van_tegenpartij['bedrag'] < 0).sum()
+        n_totaal_tp = len(alle_van_tegenpartij)
+        pct_negatief = n_negatief / n_totaal_tp if n_totaal_tp > 0 else 0
+
+        if pct_negatief > 0.15:
+            continue  # Te veel geld terug = waarschijnlijk geen huur
+
+        # Check: (semi-)vast bedrag (25% tolerantie)
         bedragen = groep['bedrag'].astype(float)
         gemiddeld = bedragen.mean()
         if gemiddeld < 300:
             continue  # Minder dan €300 gemiddeld is waarschijnlijk geen huur
 
         std = bedragen.std()
-        if gemiddeld > 0 and (std / gemiddeld) < 0.20:
-            # Vast bedrag, regelmatig, één richting = huurinkomsten
+        variatie = (std / gemiddeld) if gemiddeld > 0 else 1.0
+        if variatie < 0.25:
+            # Vast bedrag, regelmatig, overwegend één richting = huurinkomsten
             mask_huur = df.index.isin(groep.index)
             df.loc[mask_huur, 'regel_sectie'] = 'inkomsten'
             df.loc[mask_huur, 'regel_categorie'] = 'Huurinkomsten'
@@ -1139,9 +1204,10 @@ def _detecteer_huurinkomsten(df: pd.DataFrame) -> pd.DataFrame:
             n_gedetecteerd += len(groep)
             naam = groep.iloc[0]['Omschrijving']
             logger.info(
-                f"HUURINKOMSTEN GEDETECTEERD: {tegen_rek} ({str(naam)[:30]}) — "
+                f"HUURINKOMSTEN GEDETECTEERD: {groep_key[:40]} ({str(naam)[:30]}) — "
                 f"{len(groep)} betalingen, gemiddeld EUR {gemiddeld:,.0f}, "
-                f"totaal EUR {totaal:,.0f}"
+                f"totaal EUR {totaal:,.0f}, {variatie*100:.0f}% variatie, "
+                f"{pct_negatief*100:.0f}% negatief"
             )
 
     if n_gedetecteerd > 0:

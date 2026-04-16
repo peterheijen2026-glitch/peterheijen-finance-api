@@ -583,6 +583,50 @@ def _normaliseer_iban(val) -> str:
     return str(val).strip().replace(' ', '').replace('-', '').upper()
 
 
+import re
+# NL IBAN: 2 letters + 2 cijfers + 4 letters bankcode + 10 cijfers account
+# Buitenlands IBAN (bv EE/DE): ook 4 letters bankcode maar account kan langer zijn
+_IBAN_RE = re.compile(r'[A-Z]{2}\d{2}[A-Z]{4}\d{10,14}')
+
+def _extract_iban_uit_omschrijving(omschrijving: str) -> str:
+    """Haal IBAN uit ABN-omschrijving.
+
+    ABN XLSX-transacties hebben GEEN aparte Tegenrekening kolom.
+    Het IBAN zit verborgen in de omschrijving in twee formaten:
+      1. /IBAN/NL50BUNQ2208185153/BIC/...
+      2. IBAN: NL50BUNQ2208185153        BIC: ...
+    """
+    if pd.isna(omschrijving):
+        return ''
+    tekst = str(omschrijving).upper().replace(' ', '')
+    match = _IBAN_RE.search(tekst)
+    return match.group(0) if match else ''
+
+
+def _vul_lege_tegenrekening(df: pd.DataFrame) -> pd.DataFrame:
+    """Vul lege Tegenrekening-velden door IBAN uit omschrijving te extraheren.
+
+    Dit is essentieel voor ABN AMRO XLSX, waar geen Tegenrekening-kolom is.
+    Zonder deze stap kunnen _detecteer_vast_inkomen en _detecteer_huurinkomsten
+    niet groeperen op tegenpartij → inkomen wordt niet herkend.
+    """
+    if 'Tegenrekening' not in df.columns:
+        df['Tegenrekening'] = ''
+
+    lege_mask = df['Tegenrekening'].apply(lambda x: _normaliseer_iban(x) == '')
+    n_leeg = lege_mask.sum()
+
+    if n_leeg > 0:
+        df.loc[lege_mask, 'Tegenrekening'] = (
+            df.loc[lege_mask, 'Omschrijving'].apply(_extract_iban_uit_omschrijving)
+        )
+        n_gevuld = (df.loc[lege_mask, 'Tegenrekening'] != '').sum()
+        if n_gevuld > 0:
+            logger.info(f"IBAN-EXTRACTIE: {n_gevuld} van {n_leeg} lege tegenrekeningen gevuld uit omschrijving")
+
+    return df
+
+
 def _markeer_interne_transfers(df: pd.DataFrame, eigen_rekeningen: set) -> pd.DataFrame:
     """Markeer transacties tussen eigen rekeningen als interne transfer.
 
@@ -3057,6 +3101,9 @@ def _run_rapport_pipeline(job_id: str, bestanden: list, email: str):
             logger.info(f"[{job_id}] {bestandsnaam}: {len(df_deel)} transacties")
         df = pd.concat(dfs, ignore_index=True)
         update(f'{len(df)} transacties ingelezen uit {len(bestanden)} bestand(en)', 15)
+
+        # 1a2. IBAN extractie uit omschrijvingen (essentieel voor ABN XLSX)
+        df = _vul_lege_tegenrekening(df)
 
         # 1b. Huishoudregister & interne-overboekingen detectie
         update('Eigen rekeningen herkennen...', 17)

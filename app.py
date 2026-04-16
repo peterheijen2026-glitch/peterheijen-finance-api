@@ -450,21 +450,51 @@ def eur(n: float) -> str:
 
 
 class RapportPDF(FPDF):
-    """Premium financieel rapport PDF met V2-styling."""
+    """Premium financieel rapport PDF met website-huisstijl.
+
+    Fonts (zelfde als peterheijen.com):
+      - Playfair Display: koppen en titels (serif, premium uitstraling)
+      - Source Serif 4: lopende tekst en analyse (leesbaar, warm)
+      - Inter: tabellen, data, kleine labels (helder, professioneel)
+
+    Alle fonts worden meegeleverd als TTF — geen afhankelijkheid van systeemfonts.
+    """
+
+    # Font aliassen voor makkelijk gebruik door de class heen
+    HEADING = 'Playfair'
+    BODY = 'SourceSerif'
+    DATA = 'Inter'
 
     def __init__(self):
         super().__init__('P', 'mm', 'A4')
         self.set_auto_page_break(auto=True, margin=20)
 
+        # Premium fonts laden — meegeleverd in fonts/ naast app.py
+        fonts_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'fonts')
+
+        # Playfair Display (headings)
+        self.add_font('Playfair', '', os.path.join(fonts_dir, 'PlayfairDisplay-Regular.ttf'))
+        self.add_font('Playfair', 'B', os.path.join(fonts_dir, 'PlayfairDisplay-Bold.ttf'))
+        self.add_font('Playfair', 'I', os.path.join(fonts_dir, 'PlayfairDisplay-Italic.ttf'))
+
+        # Source Serif 4 (body text)
+        self.add_font('SourceSerif', '', os.path.join(fonts_dir, 'SourceSerif4-Regular.ttf'))
+        self.add_font('SourceSerif', 'B', os.path.join(fonts_dir, 'SourceSerif4-SemiBold.ttf'))
+        self.add_font('SourceSerif', 'I', os.path.join(fonts_dir, 'SourceSerif4-Italic.ttf'))
+
+        # Inter (data / tabellen / labels)
+        self.add_font('Inter', '', os.path.join(fonts_dir, 'Inter-Regular.ttf'))
+        self.add_font('Inter', 'B', os.path.join(fonts_dir, 'Inter-Bold.ttf'))
+
     def header(self):
         if self.page_no() > 1:
             self.set_fill_color(*INK)
             self.rect(0, 0, 210, 14, 'F')
-            self.set_font('Helvetica', 'B', 8)
+            self.set_font(self.DATA, 'B', 8)
             self.set_text_color(*WHITE)
             self.set_xy(10, 4)
             self.cell(0, 6, 'PeterHeijen.com  |  Financieel Rapport', 0, 0, 'L')
-            self.set_font('Helvetica', '', 7)
+            self.set_font(self.DATA, '', 7)
             self.set_xy(10, 4)
             self.cell(190, 6, f'Pagina {self.page_no()}', 0, 0, 'R')
             self.set_y(18)
@@ -473,12 +503,12 @@ class RapportPDF(FPDF):
 
     def footer(self):
         self.set_y(-15)
-        self.set_font('Helvetica', '', 7)
+        self.set_font(self.DATA, '', 7)
         self.set_text_color(*INK_SOFT)
         self.cell(0, 10, 'Dit rapport is gegenereerd door PeterHeijen.com  |  Vertrouwelijk', 0, 0, 'C')
 
     def cover_page(self, feiten: dict, rapport_datum: str):
-        """Pagina 1: Cover met samenvatting."""
+        """Pagina 1: Cover met samenvatting — premium uitstraling."""
         # Donkere header
         self.set_fill_color(*INK)
         self.rect(0, 0, 210, 80, 'F')
@@ -488,20 +518,20 @@ class RapportPDF(FPDF):
         self.set_line_width(0.8)
         self.line(15, 72, 55, 72)
 
-        # Titel
-        self.set_font('Helvetica', 'B', 28)
+        # Titel — Playfair Display voor premium serif look
+        self.set_font(self.HEADING, '', 28)
         self.set_text_color(*WHITE)
         self.set_xy(15, 22)
         self.cell(0, 12, 'Financieel Rapport', 0, 1, 'L')
 
-        # Subtitel
-        self.set_font('Helvetica', '', 12)
+        # Subtitel — Source Serif voor warme leesbaarheid
+        self.set_font(self.BODY, '', 12)
         self.set_text_color(200, 200, 210)
         self.set_xy(15, 38)
         self.cell(0, 7, 'Persoonlijk overzicht van uw inkomsten, uitgaven en vermogen', 0, 1, 'L')
 
         # Datum
-        self.set_font('Helvetica', '', 9)
+        self.set_font(self.DATA, '', 9)
         self.set_text_color(150, 150, 170)
         self.set_xy(15, 52)
         self.cell(0, 6, f'Gegenereerd op {rapport_datum}', 0, 1, 'L')
@@ -513,7 +543,6 @@ class RapportPDF(FPDF):
 
         # Quick stats onder de header
         self.set_y(88)
-        self.set_font('Helvetica', 'B', 9)
         self.set_text_color(*INK)
 
         for rek, info in feiten.items():
@@ -523,17 +552,16 @@ class RapportPDF(FPDF):
             self.rect(15, self.get_y(), 180, 26, 'D')
 
             y = self.get_y() + 3
-            self.set_font('Helvetica', 'B', 9)
+            self.set_font(self.DATA, 'B', 9)
             self.set_text_color(*INK)
             self.set_xy(20, y)
             self.cell(50, 5, f'Rekening {rek}', 0, 0, 'L')
 
-            self.set_font('Helvetica', '', 8)
+            self.set_font(self.DATA, '', 8)
             self.set_text_color(*INK_SOFT)
             self.set_xy(20, y + 7)
             self.cell(40, 5, f'{info["periode"]["van"]} t/m {info["periode"]["tot"]}', 0, 0, 'L')
 
-            self.set_font('Helvetica', 'B', 9)
             col_x = [85, 115, 150]
             labels = ['Inkomsten', 'Uitgaven', 'Netto']
             values = [info['totalen']['inkomsten'], info['totalen']['uitgaven'], info['totalen']['netto']]
@@ -541,11 +569,11 @@ class RapportPDF(FPDF):
 
             for i in range(3):
                 self.set_text_color(*INK_SOFT)
-                self.set_font('Helvetica', '', 7)
+                self.set_font(self.DATA, '', 7)
                 self.set_xy(col_x[i], y)
                 self.cell(30, 5, labels[i], 0, 0, 'C')
                 self.set_text_color(*colors[i])
-                self.set_font('Helvetica', 'B', 9)
+                self.set_font(self.DATA, 'B', 9)
                 self.set_xy(col_x[i], y + 7)
                 self.cell(30, 5, eur(values[i]), 0, 0, 'C')
 
@@ -555,17 +583,17 @@ class RapportPDF(FPDF):
         """Pagina met AI-analyse: samenvatting, sterke punten, etc."""
         self.add_page()
 
-        # Sectie header
+        # Sectie header — Playfair voor premium titels
         self._section_title('Analyse & Inzichten')
 
         # Samenvatting
         if analyse.get('samenvatting'):
-            self.set_font('Helvetica', 'B', 10)
+            self.set_font(self.HEADING, '', 12)
             self.set_text_color(*ACCENT)
             self.cell(0, 7, 'Samenvatting', 0, 1, 'L')
-            self.set_font('Helvetica', '', 9)
+            self.set_font(self.BODY, '', 10)
             self.set_text_color(*INK)
-            self.multi_cell(180, 5, analyse['samenvatting'])
+            self.multi_cell(180, 5.5, analyse['samenvatting'])
             self.ln(6)
 
         # Sterke punten
@@ -581,7 +609,7 @@ class RapportPDF(FPDF):
             self._bullet_section('Aanbevelingen', analyse['aanbevelingen'], ACCENT)
 
     def _section_title(self, title: str):
-        self.set_font('Helvetica', 'B', 14)
+        self.set_font(self.HEADING, '', 16)
         self.set_text_color(*INK)
         self.cell(0, 10, title, 0, 1, 'L')
         self.set_draw_color(*GOLD)
@@ -590,10 +618,10 @@ class RapportPDF(FPDF):
         self.ln(5)
 
     def _bullet_section(self, title: str, items: list, color: tuple):
-        self.set_font('Helvetica', 'B', 10)
+        self.set_font(self.HEADING, '', 11)
         self.set_text_color(*color)
         self.cell(0, 7, title, 0, 1, 'L')
-        self.set_font('Helvetica', '', 9)
+        self.set_font(self.BODY, '', 9.5)
         self.set_text_color(*INK)
         for item in items:
             self.set_x(20)
@@ -642,7 +670,7 @@ class RapportPDF(FPDF):
                 color = SEC_COLORS.get(sec_key, INK)
                 self.set_fill_color(*color)
                 self.set_text_color(*WHITE)
-                self.set_font('Helvetica', 'B', 7)
+                self.set_font(self.DATA, 'B', 7)
 
                 # Kolom breedte berekenen
                 cat_w = 55
@@ -655,7 +683,7 @@ class RapportPDF(FPDF):
                 # Maand headers
                 self.set_fill_color(*SURFACE)
                 self.set_text_color(*INK_SOFT)
-                self.set_font('Helvetica', 'B', 6)
+                self.set_font(self.DATA, 'B', 6)
                 self.cell(cat_w, 5, '  Categorie', 1, 0, 'L', True)
                 for m in months:
                     parts = m.split('-')
@@ -665,7 +693,7 @@ class RapportPDF(FPDF):
 
                 # Data rijen
                 section_totals = [0.0] * len(months)
-                self.set_font('Helvetica', '', 7)
+                self.set_font(self.DATA, '', 7)
 
                 for cat in cats:
                     self.set_text_color(*INK)
@@ -688,7 +716,7 @@ class RapportPDF(FPDF):
 
                 # Subtotaal rij
                 self.set_fill_color(*SURFACE)
-                self.set_font('Helvetica', 'B', 7)
+                self.set_font(self.DATA, 'B', 7)
                 self.set_text_color(*INK)
                 self.cell(cat_w, 5, f'  Totaal', 'T', 0, 'L', True)
                 for mi in range(len(months)):
@@ -729,19 +757,19 @@ class RapportPDF(FPDF):
                 color = SEC_COLORS.get(sec_key, INK)
                 self.set_fill_color(*color)
                 self.set_text_color(*WHITE)
-                self.set_font('Helvetica', 'B', 8)
+                self.set_font(self.DATA, 'B', 8)
                 self.cell(180, 6, f'  {sec_label}', 0, 1, 'L', True)
 
                 # Kolom headers
                 self.set_fill_color(*SURFACE)
                 self.set_text_color(*INK_SOFT)
-                self.set_font('Helvetica', 'B', 7)
+                self.set_font(self.DATA, 'B', 7)
                 self.cell(90, 5, '  Categorie', 'B', 0, 'L', True)
                 self.cell(45, 5, 'Jaarbedrag', 'B', 0, 'R', True)
                 self.cell(45, 5, 'Per maand', 'B', 1, 'R', True)
 
                 # Data
-                self.set_font('Helvetica', '', 8)
+                self.set_font(self.DATA, '', 8)
                 section_total = 0
                 for cat, bedrag in entries:
                     section_total += bedrag
@@ -754,7 +782,7 @@ class RapportPDF(FPDF):
                     self.cell(45, 5, eur(pm), 0, 1, 'R')
 
                 # Totaal
-                self.set_font('Helvetica', 'B', 8)
+                self.set_font(self.DATA, 'B', 8)
                 self.set_fill_color(*SURFACE)
                 self.set_text_color(*INK)
                 self.cell(90, 5.5, '  Totaal', 'T', 0, 'L', True)

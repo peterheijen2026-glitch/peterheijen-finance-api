@@ -55,26 +55,153 @@ jobs_lock = threading.Lock()
 # STAP 1: DATA INLEZEN
 # ---------------------------------------------------------------------------
 
+def _normaliseer_abnamro_csv(df: pd.DataFrame) -> pd.DataFrame:
+    """Normaliseer ABN AMRO CSV-formaat naar standaard kolomnamen.
+
+    ABN AMRO CSV: Datum;Naam / Omschrijving;Rekening;Tegenrekening;Code;Af Bij;Bedrag (EUR);Mededelingen
+    Standaard:    Rekeningnummer, Transactiedatum, Transactiebedrag, Omschrijving, Beginsaldo, Eindsaldo
+    """
+    # Bedrag: ABN AMRO CSV gebruikt komma als decimaalteken en "Af Bij" kolom
+    bedrag_col = 'Bedrag (EUR)'
+    if bedrag_col in df.columns:
+        df[bedrag_col] = df[bedrag_col].astype(str).str.replace('.', '', regex=False).str.replace(',', '.', regex=False).astype(float)
+        # "Af" = negatief, "Bij" = positief
+        if 'Af Bij' in df.columns:
+            df[bedrag_col] = df.apply(
+                lambda r: -abs(r[bedrag_col]) if str(r['Af Bij']).strip().lower() == 'af' else abs(r[bedrag_col]),
+                axis=1
+            )
+
+    # Mapping naar standaard kolommen
+    mapping = {
+        'Rekening': 'Rekeningnummer',
+        'Datum': 'Transactiedatum',
+        bedrag_col: 'Transactiebedrag',
+    }
+    df = df.rename(columns=mapping)
+
+    # Omschrijving samenvoegen: "Naam / Omschrijving" + "Mededelingen"
+    naam_col = 'Naam / Omschrijving'
+    meded_col = 'Mededelingen'
+    if naam_col in df.columns:
+        if meded_col in df.columns:
+            df['Omschrijving'] = df[naam_col].fillna('') + ' ' + df[meded_col].fillna('')
+        else:
+            df['Omschrijving'] = df[naam_col]
+
+    # Saldo's berekenen (CSV heeft geen begin/eindsaldo)
+    # Sorteer op datum en bereken cumulatief
+    df['Transactiedatum'] = df['Transactiedatum'].astype(str)
+    df = df.sort_values('Transactiedatum')
+    for rek in df['Rekeningnummer'].unique():
+        mask = df['Rekeningnummer'] == rek
+        cumsum = df.loc[mask, 'Transactiebedrag'].cumsum()
+        df.loc[mask, 'Eindsaldo'] = cumsum
+        df.loc[mask, 'Beginsaldo'] = cumsum - df.loc[mask, 'Transactiebedrag']
+
+    return df
+
+
+def _normaliseer_ing_csv(df: pd.DataFrame) -> pd.DataFrame:
+    """Normaliseer ING CSV-formaat naar standaard kolomnamen.
+
+    ING CSV: Datum;Naam / Omschrijving;Rekening;Tegenrekening;Code;Af Bij;Bedrag (EUR);Mededelingen
+    (Zelfde formaat als ABN AMRO CSV)
+    """
+    return _normaliseer_abnamro_csv(df)
+
+
+def _detecteer_csv_formaat(df: pd.DataFrame) -> str:
+    """Detecteer welk bank CSV-formaat dit is op basis van kolomnamen."""
+    cols = set(df.columns)
+
+    # ABN AMRO / ING formaat
+    if 'Datum' in cols and 'Af Bij' in cols and 'Bedrag (EUR)' in cols:
+        return 'abnamro_csv'
+
+    # Rabobank formaat
+    if 'Datum' in cols and 'Bedrag' in cols and 'IBAN/BBAN' in cols:
+        return 'rabobank_csv'
+
+    # Al in standaardformaat (bijv. geëxporteerd uit onze eigen tool)
+    if 'Rekeningnummer' in cols and 'Transactiebedrag' in cols:
+        return 'standaard'
+
+    return 'onbekend'
+
+
 def lees_transacties(inhoud: bytes, bestandsnaam: str) -> pd.DataFrame:
     if bestandsnaam.endswith(('.xlsx', '.xls')):
         df = pd.read_excel(io.BytesIO(inhoud))
     elif bestandsnaam.endswith('.csv'):
-        for sep in ['\t', ';', ',']:
-            try:
-                df = pd.read_csv(io.BytesIO(inhoud), sep=sep, encoding='utf-8')
-                if len(df.columns) > 3:
-                    break
-            except Exception:
-                continue
-        else:
-            raise ValueError("Kan CSV niet parsen")
+        # Probeer verschillende encodings en separators
+        parsed = False
+        for enc in ['utf-8', 'latin-1', 'cp1252']:
+            for sep in [';', '\t', ',']:
+                try:
+                    df = pd.read_csv(io.BytesIO(inhoud), sep=sep, encoding=enc)
+                    if len(df.columns) > 3:
+                        parsed = True
+                        break
+                except Exception:
+                    continue
+            if parsed:
+                break
+        if not parsed:
+            raise ValueError("Kan CSV niet parsen — controleer of het een geldig bankafschrift is")
     else:
         raise ValueError(f"Onbekend bestandstype: {bestandsnaam}")
 
+    # Detecteer en normaliseer bankformaat
+    formaat = _detecteer_csv_formaat(df)
+    if formaat == 'abnamro_csv':
+        logger.info(f"CSV formaat gedetecteerd: ABN AMRO/ING — wordt genormaliseerd")
+        df = _normaliseer_abnamro_csv(df)
+    elif formaat == 'rabobank_csv':
+        logger.info(f"CSV formaat gedetecteerd: Rabobank — wordt genormaliseerd")
+        # Rabobank mapping
+        rename_map = {}
+        if 'IBAN/BBAN' in df.columns:
+            rename_map['IBAN/BBAN'] = 'Rekeningnummer'
+        if 'Datum' in df.columns:
+            rename_map['Datum'] = 'Transactiedatum'
+        if 'Bedrag' in df.columns:
+            rename_map['Bedrag'] = 'Transactiebedrag'
+        if 'Naam tegenpartij' in df.columns:
+            rename_map['Naam tegenpartij'] = 'Omschrijving'
+        df = df.rename(columns=rename_map)
+        # Bedrag normaliseren (Rabobank gebruikt komma)
+        if df['Transactiebedrag'].dtype == object:
+            df['Transactiebedrag'] = df['Transactiebedrag'].astype(str).str.replace('.', '', regex=False).str.replace(',', '.', regex=False).astype(float)
+        # Saldo's berekenen als die ontbreken
+        if 'Beginsaldo' not in df.columns:
+            df['Transactiedatum'] = df['Transactiedatum'].astype(str)
+            df = df.sort_values('Transactiedatum')
+            for rek in df['Rekeningnummer'].unique():
+                mask = df['Rekeningnummer'] == rek
+                cumsum = df.loc[mask, 'Transactiebedrag'].cumsum()
+                df.loc[mask, 'Eindsaldo'] = cumsum
+                df.loc[mask, 'Beginsaldo'] = cumsum - df.loc[mask, 'Transactiebedrag']
+
+    # Valideer dat we de juiste kolommen hebben
     verwacht = ['Rekeningnummer', 'Transactiedatum', 'Transactiebedrag', 'Omschrijving']
     ontbreekt = [k for k in verwacht if k not in df.columns]
     if ontbreekt:
-        raise ValueError(f"Kolommen ontbreken: {ontbreekt}. Gevonden: {list(df.columns)}")
+        raise ValueError(
+            f"Kolommen ontbreken na normalisatie: {ontbreekt}. "
+            f"Gevonden: {list(df.columns)}. "
+            f"Ondersteunde formaten: ABN AMRO (XLSX/CSV), ING (CSV), Rabobank (CSV)."
+        )
+
+    # Saldo's toevoegen als die nog ontbreken
+    if 'Beginsaldo' not in df.columns or 'Eindsaldo' not in df.columns:
+        df['Transactiedatum'] = df['Transactiedatum'].astype(str)
+        df = df.sort_values('Transactiedatum')
+        for rek in df['Rekeningnummer'].unique():
+            mask = df['Rekeningnummer'] == rek
+            cumsum = df.loc[mask, 'Transactiebedrag'].astype(float).cumsum()
+            df.loc[mask, 'Eindsaldo'] = cumsum
+            df.loc[mask, 'Beginsaldo'] = cumsum - df.loc[mask, 'Transactiebedrag'].astype(float)
 
     df['datum'] = pd.to_datetime(df['Transactiedatum'], format='%Y%m%d')
     df['maand'] = df['datum'].dt.to_period('M')

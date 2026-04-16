@@ -983,6 +983,175 @@ def _classificeer_rule_based(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _detecteer_dga_loon(df: pd.DataFrame) -> pd.DataFrame:
+    """Detecteer DGA-loon/Managementfee op basis van patronen — GEEN hardcoded namen.
+
+    Heuristiek:
+    1. Zoek tegenpartijen waarvan de naam "B.V." of "BV" bevat
+    2. Die minstens 3x voorkomen met POSITIEF bedrag (geld ontvangt)
+    3. Waarvan het meeste bedrag (semi-)vast is (standaarddeviatie < 20% van gemiddelde)
+    4. Dit zijn waarschijnlijk DGA-loon/Managementfee-betalingen
+
+    Classificeert als: inkomsten / DGA-loon/Managementfee
+    """
+    if 'Omschrijving' not in df.columns:
+        return df
+
+    # Alleen niet-interne, niet-reeds-geclassificeerde, POSITIEVE transacties
+    mask = (~df['is_intern']) & (df['classificatie_bron'].isna()) & (df['bedrag'] > 0)
+    df_kandidaat = df[mask].copy()
+
+    if len(df_kandidaat) == 0:
+        return df
+
+    n_gedetecteerd = 0
+
+    # Groepeer per tegenpartij (Tegenrekening als die er is, anders op naam in omschrijving)
+    groepeer_col = 'Tegenrekening' if 'Tegenrekening' in df.columns else 'Omschrijving'
+
+    for key, groep in df_kandidaat.groupby(groepeer_col):
+        key_str = str(key).upper()
+
+        # Check: bevat de tegenpartij of omschrijving "B.V." of "BV"?
+        omschr_sample = ' '.join(groep['Omschrijving'].astype(str).str.upper().head(5))
+        heeft_bv = any(marker in key_str or marker in omschr_sample
+                       for marker in ['B.V.', ' BV ', ' BV,', 'B.V ', ' B.V'])
+
+        if not heeft_bv:
+            continue
+
+        # Filter: alleen positieve transacties (inkomend geld)
+        groep_pos = groep[groep['bedrag'] > 0]
+        if len(groep_pos) < 3:
+            continue
+
+        # Check: zijn de bedragen (semi-)vast?
+        bedragen = groep_pos['bedrag'].astype(float)
+        gemiddeld = bedragen.mean()
+        if gemiddeld < 500:
+            continue  # Minder dan €500 gemiddeld is waarschijnlijk geen loon
+
+        std = bedragen.std()
+        if gemiddeld > 0 and (std / gemiddeld) < 0.20:
+            # Vast bedrag gedetecteerd: dit is waarschijnlijk DGA-loon
+            # Classificeer alle positieve transacties van deze tegenpartij
+            mask_dga = df.index.isin(groep_pos.index)
+            df.loc[mask_dga, 'regel_sectie'] = 'inkomsten'
+            df.loc[mask_dga, 'regel_categorie'] = 'DGA-loon/Managementfee'
+            df.loc[mask_dga, 'regel_confidence'] = 0.90
+            df.loc[mask_dga, 'classificatie_bron'] = 'rule'
+
+            totaal = bedragen.sum()
+            n_gedetecteerd += len(groep_pos)
+            logger.info(
+                f"DGA-LOON GEDETECTEERD: {key_str[:50]} — "
+                f"{len(groep_pos)} betalingen, gemiddeld EUR {gemiddeld:,.0f}, "
+                f"totaal EUR {totaal:,.0f}, std EUR {std:,.0f} "
+                f"({std/gemiddeld*100:.0f}% variatie)"
+            )
+
+    if n_gedetecteerd > 0:
+        logger.info(f"DGA-LOON: {n_gedetecteerd} transacties als DGA-loon geclassificeerd")
+    else:
+        logger.info("DGA-LOON: geen DGA-loon patroon gedetecteerd")
+
+    return df
+
+
+def _detecteer_huurinkomsten(df: pd.DataFrame) -> pd.DataFrame:
+    """Detecteer huurinkomsten op basis van patronen — GEEN hardcoded namen.
+
+    Heuristiek:
+    1. Zoek tegenpartijen met regelmatige POSITIEVE betalingen (minstens 4x)
+    2. Die GEEN bedrijf zijn (niet in merchant mapping, geen B.V.)
+    3. Met een (semi-)vast bedrag (std < 20% van gemiddelde)
+    4. Waar het geld alleen ÉÉN kant op gaat (niet bidirectioneel = geen huishoudlid)
+    5. Met een gemiddeld bedrag van minstens €300 (realistisch voor huur)
+
+    Classificeert als: inkomsten / Huurinkomsten
+    """
+    if 'Tegenrekening' not in df.columns:
+        return df
+
+    # Alleen niet-interne, niet-reeds-geclassificeerde, POSITIEVE transacties
+    mask = (~df['is_intern']) & (df['classificatie_bron'].isna()) & (df['bedrag'] > 0)
+    df_kandidaat = df[mask].copy()
+
+    if len(df_kandidaat) == 0:
+        return df
+
+    # Bekende merchants uitsluiten
+    bekende_merchants = set()
+    for zoekterm, _, _, _ in MERCHANT_MAPPING:
+        bekende_merchants.add(zoekterm)
+
+    n_gedetecteerd = 0
+
+    df_kandidaat['_tegen_norm'] = df_kandidaat['Tegenrekening'].apply(_normaliseer_iban)
+    df_kandidaat = df_kandidaat[df_kandidaat['_tegen_norm'] != '']
+
+    for tegen_rek, groep in df_kandidaat.groupby('_tegen_norm'):
+        if len(groep) < 4:
+            continue
+
+        # Check: geen B.V. (die zijn al DGA-loon)
+        omschr_sample = ' '.join(groep['Omschrijving'].astype(str).str.upper().head(5))
+        is_bv = any(m in omschr_sample for m in ['B.V.', ' BV ', ' BV,', 'B.V '])
+        if is_bv:
+            continue
+
+        # Check: geen bekende merchant
+        is_merchant = False
+        for merchant_zoek in bekende_merchants:
+            if merchant_zoek in omschr_sample:
+                is_merchant = True
+                break
+        if is_merchant:
+            continue
+
+        # Check: alleen positieve transacties (geld komt alleen binnen)
+        # Als er ook negatieve transacties van dezelfde tegenpartij zijn,
+        # is het waarschijnlijk een huishoudlid (al afgevangen) of iets anders
+        alle_transacties_tegenpartij = df[
+            (df['Tegenrekening'].apply(_normaliseer_iban) == tegen_rek) &
+            (~df['is_intern'])
+        ]
+        heeft_negatief = (alle_transacties_tegenpartij['bedrag'] < 0).any()
+        if heeft_negatief:
+            continue  # Bidirectioneel = waarschijnlijk geen huur
+
+        # Check: (semi-)vast bedrag
+        bedragen = groep['bedrag'].astype(float)
+        gemiddeld = bedragen.mean()
+        if gemiddeld < 300:
+            continue  # Minder dan €300 gemiddeld is waarschijnlijk geen huur
+
+        std = bedragen.std()
+        if gemiddeld > 0 and (std / gemiddeld) < 0.20:
+            # Vast bedrag, regelmatig, één richting = huurinkomsten
+            mask_huur = df.index.isin(groep.index)
+            df.loc[mask_huur, 'regel_sectie'] = 'inkomsten'
+            df.loc[mask_huur, 'regel_categorie'] = 'Huurinkomsten'
+            df.loc[mask_huur, 'regel_confidence'] = 0.85
+            df.loc[mask_huur, 'classificatie_bron'] = 'rule'
+
+            totaal = bedragen.sum()
+            n_gedetecteerd += len(groep)
+            naam = groep.iloc[0]['Omschrijving']
+            logger.info(
+                f"HUURINKOMSTEN GEDETECTEERD: {tegen_rek} ({str(naam)[:30]}) — "
+                f"{len(groep)} betalingen, gemiddeld EUR {gemiddeld:,.0f}, "
+                f"totaal EUR {totaal:,.0f}"
+            )
+
+    if n_gedetecteerd > 0:
+        logger.info(f"HUURINKOMSTEN: {n_gedetecteerd} transacties als huurinkomsten geclassificeerd")
+    else:
+        logger.info("HUURINKOMSTEN: geen huurinkomsten patroon gedetecteerd")
+
+    return df
+
+
 # ---------------------------------------------------------------------------
 # STAP 2: DETERMINISTISCH REKENEN
 # ---------------------------------------------------------------------------
@@ -2656,7 +2825,18 @@ def _run_rapport_pipeline(job_id: str, bestanden: list, email: str):
         update('Transacties classificeren...', 22)
         df = _classificeer_rule_based(df)
         n_regel = len(df[df['classificatie_bron'] == 'rule'])
-        update(f'{n_regel} transacties rule-based geclassificeerd', 25)
+        update(f'{n_regel} transacties rule-based geclassificeerd', 24)
+
+        # 1d. Patroon-detectie: DGA-loon en huurinkomsten (vóór AI)
+        update('DGA-loon en huurinkomsten detecteren...', 24)
+        df = _detecteer_dga_loon(df)
+        df = _detecteer_huurinkomsten(df)
+        n_regel_na = len(df[df['classificatie_bron'] == 'rule'])
+        n_patroon = n_regel_na - n_regel
+        if n_patroon > 0:
+            update(f'{n_patroon} extra transacties via patroondetectie', 25)
+        else:
+            update('Patroondetectie afgerond', 25)
 
         # 2. Deterministisch rekenen
         update('Bedragen berekenen en controleren...', 27)

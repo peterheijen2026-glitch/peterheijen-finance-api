@@ -869,6 +869,399 @@ def _detecteer_huishoudleden(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# STAP 1b3: RELATED PARTY RESOLUTION (RPR v1.3)
+# ---------------------------------------------------------------------------
+# Twee gescheiden lagen:
+#   Laag 1: Party Resolution — bepaalt WIE de tegenpartij is
+#   Laag 2: Economic Inflow Classification — bepaalt WAT de transactie is
+#
+# Party types: own_account, household_related_party, business_related_party,
+#   known_external_counterparty, unresolved_private_counterparty
+#
+# Signaalklassen:
+#   STERK: S2 (multi-IBAN linking), S4 (bidirectioneel), S8 (eigen FI), S10 (merchant)
+#   MIDDEL: S6 (cross-account), S9 (rechtsvorm)
+#   ZWAK: S1 (achternaam), S3 (adres-hint), S5 (transfer-achtig), S7 (geen eco relatie)
+#
+# Kernregel: household vereist minimaal één STERK signaal (S2 of S4).
+# ---------------------------------------------------------------------------
+
+# Tussenvoegels en titels voor achternaam-extractie
+_TUSSENVOEGELS = {
+    'van', 'de', 'den', 'der', 'het', 'ter', 'ten', 'te', 'in', "'t",
+    'van de', 'van den', 'van der', 'van het', 'in de', "in 't",
+}
+_TITELS = {
+    'mr', 'mrs', 'ms', 'dr', 'prof', 'ir', 'ing', 'drs', 'mr.',
+    'mrs.', 'ms.', 'dr.', 'prof.', 'ir.', 'ing.', 'drs.', 'bc',
+    'mw', 'mevr', 'dhr',
+}
+
+
+def extract_achternaam(naam: str) -> str:
+    """Extraheer de achternaam uit een naam-string.
+
+    Werkt generiek voor alle Nederlandse naamconventies:
+    - Verwijdert tussenvoegels (van, de, den, het, ter, etc.)
+    - Verwijdert titels (mr, dr, ir, ing, drs, etc.)
+    - Splitst op streepje voor dubbele achternamen
+    - Neemt het langste woord ≥3 letters
+    - Case-insensitive
+
+    Voorbeelden:
+      "E. Heijen-Kop" → "heijen"
+      "P.H.M. van der Berg" → "berg"
+      "Mr. J. de Groot-Jansen" → "groot"  (of "jansen")
+      "M. Jansen-Bakker" → "jansen"
+    """
+    if not naam or str(naam).strip() == '' or str(naam).upper() == 'NAN':
+        return ''
+
+    naam = str(naam).strip().lower()
+
+    # Verwijder IBAN-referenties (bv "iban: nl37bick..." uit ABN AMRO omschrijvingen)
+    naam = re.sub(r'\biban[:\s]+[a-z0-9]+', '', naam, flags=re.IGNORECASE)
+    # Verwijder losse IBAN-patronen (NL + 2 cijfers + 4 letters + cijfers)
+    naam = re.sub(r'\b[a-z]{2}\d{2}[a-z]{4}\d{6,14}\b', '', naam, flags=re.IGNORECASE)
+
+    # Verwijder initialen (letters gevolgd door punt)
+    naam = re.sub(r'\b[a-z]\.\s*', '', naam)
+    # Verwijder initialen zonder punt (enkele letter gevolgd door spatie)
+    naam = re.sub(r'\b[a-z]\s+', '', naam)
+
+    # Splits in woorden
+    woorden = naam.split()
+
+    # Verwijder titels
+    woorden = [w for w in woorden if w.rstrip('.') not in _TITELS]
+
+    # Verwijder tussenvoegels (ook meerdelig: "van de", "van der")
+    schoon = []
+    i = 0
+    while i < len(woorden):
+        # Check meerdelige tussenvoegels eerst
+        if i + 1 < len(woorden) and f"{woorden[i]} {woorden[i+1]}" in _TUSSENVOEGELS:
+            i += 2
+            continue
+        if woorden[i] in _TUSSENVOEGELS:
+            i += 1
+            continue
+        schoon.append(woorden[i])
+        i += 1
+
+    if not schoon:
+        return ''
+
+    # Neem het laatste woord (achternaam), splits op streepje voor dubbele achternamen
+    achternaam_deel = schoon[-1]
+    delen = achternaam_deel.split('-')
+
+    # Neem het langste deel ≥3 letters
+    kandidaten = [d for d in delen if len(d) >= 3]
+    if not kandidaten:
+        # Fallback: neem het langste deel ongeacht lengte
+        kandidaten = delen
+
+    return max(kandidaten, key=len) if kandidaten else ''
+
+
+def _resolve_related_parties(df: pd.DataFrame, eigen_rekeningen: set,
+                             eigen_fi_ibans: set = None) -> pd.DataFrame:
+    """Related Party Resolution — bepaalt party_type per tegenpartij.
+
+    Implementeert de RPR v1.3 beslislogica:
+      Fase 1: Definitieve labels (own_account, eigen FI, merchant)
+      Fase 2: Household (vereist STERK signaal S2 of S4)
+      Fase 3: Business-related (S9 + S1 + extra bewijs)
+      Fase 4: Default (known_external of unresolved_private)
+
+    Voegt kolom 'party_type' toe aan df.
+    """
+    if eigen_fi_ibans is None:
+        eigen_fi_ibans = set()
+
+    # Normaliseer eigen rekeningen
+    eigen_rek_norm = set(_normaliseer_iban(str(r)) for r in eigen_rekeningen if r and str(r) != 'nan')
+
+    # Initialiseer party_type kolom
+    if 'party_type' not in df.columns:
+        df['party_type'] = None
+
+    # Bekende merchants set
+    bekende_merchants_set = set()
+    for zoekterm, _, _, _ in MERCHANT_MAPPING:
+        bekende_merchants_set.add(zoekterm)
+
+    # =========================================================
+    # STAP 1: Bouw tegenpartij-register (per unieke IBAN)
+    # =========================================================
+    heeft_tegenrek = 'Tegenrekening' in df.columns
+
+    # Extraheer achternaam van de rekeninghouder(s)
+    # We gebruiken de naam die op de eigen rekening staat — die zit in tegenpartij_naam
+    # bij INKOMENDE transacties van eigen rekeningen, of we leiden het af uit
+    # bidirectionele matches.
+    eigen_achternamen = set()
+
+    # Methode: gebruik achternamen van bidirectionele tegenpartijen (is_intern)
+    # en achternamen die verschijnen bij transacties NAAR eigen rekeningen
+    if 'tegenpartij_naam' in df.columns:
+        # Van interne (household) transacties: de naam is die van het huishoudlid
+        intern_namen = df[df['is_intern'] & (df['tegenpartij_naam'].notna()) &
+                          (df['tegenpartij_naam'] != '')]['tegenpartij_naam'].unique()
+        for n in intern_namen:
+            ach = extract_achternaam(str(n))
+            # Filter: achternaam moet minstens 3 letters zijn en niet een banknaam/keyword
+            if ach and len(ach) >= 3 and ach not in {
+                'priverekening', 'ondernemersrekening', 'jongerengroeirekening',
+                'spaarrekening', 'betaalrekening', 'rekening', 'tanken',
+            }:
+                eigen_achternamen.add(ach)
+
+        # Methode 2: achternaam uit INKOMENDE transacties naar eigen IBANs
+        if heeft_tegenrek:
+            for rek in eigen_rekeningen:
+                rek_norm = _normaliseer_iban(str(rek))
+                if not rek_norm:
+                    continue
+                incoming = df[df['Tegenrekening'].apply(lambda x: _normaliseer_iban(str(x))) == rek_norm]
+                for _, row in incoming.head(5).iterrows():
+                    naam = str(row.get('tegenpartij_naam', ''))
+                    ach = extract_achternaam(naam)
+                    if ach and len(ach) >= 3 and ach not in {
+                        'priverekening', 'ondernemersrekening', 'jongerengroeirekening',
+                        'spaarrekening', 'betaalrekening', 'rekening', 'tanken',
+                    }:
+                        eigen_achternamen.add(ach)
+
+    logger.info(f"RPR: eigen achternamen gedetecteerd: {eigen_achternamen}")
+
+    if not heeft_tegenrek:
+        logger.info("RPR: geen Tegenrekening kolom — skip party resolution")
+        df.loc[df['party_type'].isna(), 'party_type'] = 'unresolved_private_counterparty'
+        return df
+
+    # =========================================================
+    # STAP 2: Analyseer elke tegenpartij (per uniek IBAN)
+    # =========================================================
+
+    # Bouw lookup: IBAN → naam, transactie-info
+    iban_data = {}  # iban → {'namen': set, 'n_pos': int, 'n_neg': int, 'bedrag_pos': float, ...}
+    df['_tegen_norm'] = df['Tegenrekening'].apply(_normaliseer_iban)
+
+    for iban, groep in df[df['_tegen_norm'] != ''].groupby('_tegen_norm'):
+        namen = set()
+        for n in groep['tegenpartij_naam'].dropna().unique():
+            n_str = str(n).strip()
+            if n_str and n_str.upper() != 'NAN':
+                namen.add(n_str)
+
+        omschr_sample = ' '.join(groep['Omschrijving'].astype(str).str.upper().head(5))
+
+        iban_data[iban] = {
+            'namen': namen,
+            'n_pos': (groep['bedrag'] > 0).sum(),
+            'n_neg': (groep['bedrag'] < 0).sum(),
+            'n_total': len(groep),
+            'bedrag_pos': groep[groep['bedrag'] > 0]['bedrag'].sum(),
+            'bedrag_neg': abs(groep[groep['bedrag'] < 0]['bedrag'].sum()),
+            'omschr_sample': omschr_sample,
+            'is_intern_count': groep['is_intern'].sum(),
+        }
+
+    # Household IBANs (reeds gedetecteerd door _detecteer_huishoudleden via S4)
+    household_ibans = set()
+    for iban, data in iban_data.items():
+        if data['is_intern_count'] > 0 and iban not in eigen_rek_norm:
+            household_ibans.add(iban)
+
+    logger.info(f"RPR: {len(household_ibans)} IBANs al als household gedetecteerd via bidirectioneel (S4)")
+
+    # =========================================================
+    # STAP 3: Resolve party_type per IBAN
+    # =========================================================
+    iban_party_type = {}  # iban → party_type
+    iban_signals = {}     # iban → list of signal codes
+
+    for iban, data in iban_data.items():
+        signals = []
+
+        # --- FASE 1: Definitieve labels ---
+
+        # own_account: IBAN ∈ eigen_rekeningen
+        if iban in eigen_rek_norm:
+            iban_party_type[iban] = 'own_account'
+            signals.append('OWN_ACCOUNT')
+            iban_signals[iban] = signals
+            continue
+
+        # S8: eigen financieel domein
+        if iban in eigen_fi_ibans:
+            iban_party_type[iban] = 'own_account'
+            signals.append('S8_eigen_fi')
+            iban_signals[iban] = signals
+            continue
+
+        # S10: merchant mapping match
+        is_merchant = False
+        for zoekterm in bekende_merchants_set:
+            if zoekterm in data['omschr_sample']:
+                is_merchant = True
+                break
+        if is_merchant:
+            iban_party_type[iban] = 'known_external_counterparty'
+            signals.append('S10_merchant')
+            iban_signals[iban] = signals
+            iban_party_type[iban] = 'known_external_counterparty'
+            continue
+
+        # --- Signalen detecteren ---
+
+        # S1: Achternaam overlap
+        s1 = False
+        tegenpartij_achternamen = set()
+        for naam in data['namen']:
+            ach = extract_achternaam(naam)
+            if ach:
+                tegenpartij_achternamen.add(ach)
+                if ach in eigen_achternamen:
+                    s1 = True
+        if s1:
+            signals.append('S1_achternaam')
+
+        # S4: Bidirectioneel patroon (al gedetecteerd door _detecteer_huishoudleden)
+        s4 = iban in household_ibans
+        if s4:
+            signals.append('S4_bidirectioneel')
+
+        # S2: Multi-IBAN linking
+        # Als een naam op dit IBAN matcht met een naam op een bewezen household IBAN
+        s2 = False
+        if not s4:  # S2 is alleen nodig als S4 niet al geldt
+            for hh_iban in household_ibans:
+                if hh_iban == iban:
+                    continue
+                hh_data = iban_data.get(hh_iban, {})
+                hh_namen = hh_data.get('namen', set())
+                # Check of achternaam matcht
+                for hh_naam in hh_namen:
+                    hh_ach = extract_achternaam(hh_naam)
+                    if hh_ach and hh_ach in tegenpartij_achternamen:
+                        s2 = True
+                        signals.append('S2_multi_iban')
+                        break
+                if s2:
+                    break
+
+        # S5: Transfer-achtig patroon (ronde bedragen, onregelmatig)
+        s5 = False
+        if data['n_pos'] >= 2 and data['n_neg'] == 0:
+            # Unidirectioneel inkomend, check of bedragen rond zijn
+            pos_tx = df[(df['_tegen_norm'] == iban) & (df['bedrag'] > 0)]
+            bedragen = pos_tx['bedrag'].astype(float)
+            ronde = sum(1 for b in bedragen if b % 100 == 0 or b % 50 == 0)
+            if ronde / len(bedragen) > 0.7:
+                s5 = True
+                signals.append('S5_transfer_achtig')
+
+        # S6: Cross-account verschijning
+        s6 = False
+        if heeft_tegenrek:
+            rekeningen_met_iban = df[df['_tegen_norm'] == iban]['Rekeningnummer'].nunique()
+            if rekeningen_met_iban >= 2:
+                s6 = True
+                signals.append('S6_cross_account')
+
+        # S7: Geen economische relatie (geen salaris-keyword, geen huur-keyword, geen merchant)
+        s7_keywords = ['SALARIS', 'LOON', 'MANAGEMENTFEE', 'HUUR', 'RENT', 'KAMER',
+                       'WONING', 'PREMIE', 'FACTUUR', 'DECLARATIE']
+        s7 = not any(kw in data['omschr_sample'] for kw in s7_keywords)
+        if s7:
+            signals.append('S7_geen_eco_relatie')
+
+        # S9: Rechtsvorm (B.V., N.V., Stichting, etc.)
+        s9 = any(m in data['omschr_sample'] for m in _RECHTSVORM_MARKERS)
+        if s9:
+            signals.append('S9_rechtsvorm')
+
+        # --- FASE 2: Household (vereist STERK signaal) ---
+        if s4:
+            iban_party_type[iban] = 'household_related_party'
+            iban_signals[iban] = signals
+            continue
+
+        if s2:
+            iban_party_type[iban] = 'household_related_party'
+            iban_signals[iban] = signals
+            continue
+
+        # --- FASE 3: Business-related ---
+        if s9 and s1:
+            # Candidate: S9 + S1 — check voor extra bewijs
+            salaris_keywords = ['SALARIS', 'LOON', 'MANAGEMENTFEE', 'MANAGEMENT FEE',
+                                'VERGOEDING', 'HONORARIUM']
+            has_keyword = any(kw in data['omschr_sample'] for kw in salaris_keywords)
+            has_extra = has_keyword or s4 or s6
+
+            if has_extra:
+                iban_party_type[iban] = 'business_related_party'
+                signals.append('EXTRA_BEWIJS')
+            else:
+                # S9 + S1 zonder extra bewijs → known_external (behandel als werkgever)
+                iban_party_type[iban] = 'known_external_counterparty'
+            iban_signals[iban] = signals
+            continue
+
+        # --- FASE 4: Default ---
+        if s9:
+            # Rechtsvorm zonder naamoverlap → known_external
+            iban_party_type[iban] = 'known_external_counterparty'
+        else:
+            # Geen signalen of alleen zwak/middel → unresolved_private
+            iban_party_type[iban] = 'unresolved_private_counterparty'
+
+        iban_signals[iban] = signals
+
+    # =========================================================
+    # STAP 4: Schrijf party_type naar DataFrame
+    # =========================================================
+    for iban, pt in iban_party_type.items():
+        mask = df['_tegen_norm'] == iban
+        df.loc[mask, 'party_type'] = pt
+
+    # Transacties zonder IBAN → unresolved_private
+    df.loc[df['party_type'].isna(), 'party_type'] = 'unresolved_private_counterparty'
+
+    # Mark household_related_party als is_intern (hard exclusion)
+    mask_hh = (df['party_type'] == 'household_related_party') & (~df['is_intern'])
+    n_hh_extra = mask_hh.sum()
+    if n_hh_extra > 0:
+        df.loc[mask_hh, 'is_intern'] = True
+        logger.info(f"RPR: {n_hh_extra} extra transacties als is_intern gemarkeerd via household (S2)")
+
+    # Cleanup
+    if '_tegen_norm' in df.columns:
+        df.drop(columns=['_tegen_norm'], inplace=True)
+
+    # === LOGGING ===
+    pt_counts = df['party_type'].value_counts()
+    logger.info(
+        f"RPR: Party types resolved:\n"
+        + '\n'.join(f"  {pt}: {count}" for pt, count in pt_counts.items())
+    )
+
+    # Log gedetailleerd per IBAN met signalen
+    for iban, pt in sorted(iban_party_type.items(), key=lambda x: x[1]):
+        sigs = iban_signals.get(iban, [])
+        namen = iban_data.get(iban, {}).get('namen', set())
+        naam_str = ', '.join(list(namen)[:2]) if namen else '?'
+        if pt in ('household_related_party', 'business_related_party'):
+            logger.info(f"RPR DETAIL: {iban[:20]} ({naam_str[:30]}) → {pt} [{', '.join(sigs)}]")
+
+    return df
+
+
+# ---------------------------------------------------------------------------
 # STAP 1c: RULE-BASED CLASSIFICATIE (vóór AI)
 # ---------------------------------------------------------------------------
 # ChatGPT CEO-plan: "AI mag pas aan zet nadat het systeem al heeft vastgesteld
@@ -2143,6 +2536,9 @@ def _classify_positive_inflows(df: pd.DataFrame, eigen_fi_ibans: set = None,
     # FASE 2: LAAG B — Evidence-Based Classifiers (per groep)
     # ===================================================================
     # Resterende ongeclass positieve transacties na Laag A
+    refund_handled = set()
+    rent_handled = set()
+    salary_handled = set()
     rest_mask = mask & (~df.index.isin(fase1_handled))
     rest = df[rest_mask].copy()
 
@@ -2178,9 +2574,86 @@ def _classify_positive_inflows(df: pd.DataFrame, eigen_fi_ibans: set = None,
                 herclassificaties.append((idx, 'Laag B', 'refund', cat, 'Refund matcher'))
                 refund_handled.add(idx)
 
-        # B2: Rent classifier (per groep)
+        # B2: Rent + Salary classifiers (per groep, gated by party_type)
+        # RPR v1.3 classifier-toegang matrix:
+        #   own_account / household → al uitgesloten (is_intern)
+        #   business_related → salary only
+        #   known_external → rent + salary + benefits
+        #   unresolved_private → rent ONLY
         rent_handled = set()
+        salary_handled = set()
+        has_party_type = 'party_type' in df.columns
+
         for groep_key, groep in rest[~rest.index.isin(refund_handled)].groupby('_groep_key'):
+            # Determine party_type for this group
+            if has_party_type:
+                pt_values = df.loc[groep.index, 'party_type'].dropna().unique()
+                party_type = pt_values[0] if len(pt_values) > 0 else 'unresolved_private_counterparty'
+            else:
+                party_type = 'unresolved_private_counterparty'
+
+            # --- Salary classifier (for business_related and known_external) ---
+            # business_related → salary only (no rent, no benefits)
+            # known_external → salary + rent + benefits
+            allow_salary = party_type in ('business_related_party', 'known_external_counterparty')
+            allow_rent = party_type in ('known_external_counterparty', 'unresolved_private_counterparty')
+
+            if allow_salary:
+                # Simple salary detection: check for salary keywords in the group
+                tekst_alle = ' '.join(groep['Omschrijving'].astype(str).str.upper())
+                salaris_kw = ['SALARIS', 'LOON', 'MANAGEMENTFEE', 'MANAGEMENT FEE',
+                              'HONORARIUM', 'VERGOEDING', 'NETTOLOON', 'NETTO LOON']
+                has_salary_kw = any(kw in tekst_alle for kw in salaris_kw)
+                has_rechtsvorm = any(m in tekst_alle for m in _RECHTSVORM_MARKERS)
+
+                # Evidence: recurring + stable + from org = likely salary
+                n_tx = len(groep)
+                bedragen = groep['bedrag'].astype(float)
+                mediaan = bedragen.median()
+
+                if n_tx >= 3 and mediaan >= 500:
+                    # IQR stability check
+                    if n_tx >= 4:
+                        q1 = bedragen.quantile(0.25)
+                        q3 = bedragen.quantile(0.75)
+                        iqr = q3 - q1
+                        variatie = (iqr / mediaan) if mediaan > 0 else 1.0
+                        is_stable = variatie < 0.30
+                    else:
+                        is_stable = bedragen.std() / mediaan < 0.20 if mediaan > 0 else False
+
+                    if is_stable and (has_salary_kw or has_rechtsvorm):
+                        # Determine subcategorie
+                        if has_salary_kw and any(kw in tekst_alle for kw in ['MANAGEMENTFEE', 'MANAGEMENT FEE']):
+                            cat = 'DGA-loon/Managementfee'
+                        elif party_type == 'business_related_party':
+                            cat = 'DGA-loon/Managementfee'
+                        else:
+                            cat = 'Netto salaris'
+
+                        for gidx in groep.index:
+                            _apply(gidx, 'salary_income', 'inkomsten', cat, 0.85)
+                            salary_handled.add(gidx)
+                        stats.setdefault('salary_likely', 0)
+                        stats['salary_likely'] = stats.get('salary_likely', 0) + len(groep)
+                        naam_sample = str(groep.iloc[0].get('tegenpartij_naam', groep.iloc[0]['Omschrijving']))[:30]
+                        logger.info(
+                            f"SALARY CLASSIFIER: LIKELY — {groep_key[:30]} ({naam_sample}) → {cat} — "
+                            f"{n_tx} tx, mediaan EUR {mediaan:,.0f}, party_type={party_type}"
+                        )
+                        herclassificaties.append((groep.index.tolist(), 'Laag B', 'salary_likely',
+                                                 cat, f'Salary classifier LIKELY (party_type={party_type})'))
+                        continue  # Skip rent classifier for this group
+
+            # --- Rent classifier (for known_external and unresolved_private) ---
+            if not allow_rent:
+                # business_related without salary match → uncertainty gate
+                logger.info(
+                    f"CLASSIFIER GATE: {groep_key[:30]} — party_type={party_type} — "
+                    f"rent classifier BLOCKED (alleen salary toegestaan)"
+                )
+                continue
+
             uitkomst, cat, evidence = _rent_classifier(
                 groep, df, groep_key, eigen_rek_norm, eigen_fi_ibans,
                 bekende_merchants_set, heeft_tegenrek
@@ -2197,11 +2670,11 @@ def _classify_positive_inflows(df: pd.DataFrame, eigen_fi_ibans: set = None,
                 logger.info(
                     f"RENT CLASSIFIER: LIKELY — {groep_key[:30]} ({naam_sample}) — "
                     f"{len(groep)} tx, mediaan EUR {groep['bedrag'].median():,.0f}, "
-                    f"totaal EUR {groep['bedrag'].sum():,.0f}\n"
+                    f"totaal EUR {groep['bedrag'].sum():,.0f}, party_type={party_type}\n"
                     f"  Evidence: {evidence_str}"
                 )
                 herclassificaties.append((groep.index.tolist(), 'Laag B', 'rent_likely',
-                                         'Huurinkomsten', f'Rent classifier LIKELY: {evidence_str}'))
+                                         'Huurinkomsten', f'Rent classifier LIKELY (party_type={party_type}): {evidence_str}'))
 
             elif uitkomst == 'uncertain':
                 # Niet als huur herkend → gaat naar uncertainty gate (fase 3)
@@ -2209,7 +2682,7 @@ def _classify_positive_inflows(df: pd.DataFrame, eigen_fi_ibans: set = None,
                 logger.info(
                     f"RENT CLASSIFIER: UNCERTAIN — {groep_key[:30]} — "
                     f"{len(groep)} tx, mediaan EUR {groep['bedrag'].median():,.0f} — "
-                    f"gefaalde checks: {', '.join(failed)}"
+                    f"gefaalde checks: {', '.join(failed)}, party_type={party_type}"
                 )
 
             # 'reject' = exclusion check gefaald, doorschuiven naar uncertainty gate
@@ -2217,7 +2690,7 @@ def _classify_positive_inflows(df: pd.DataFrame, eigen_fi_ibans: set = None,
     # ===================================================================
     # FASE 3: UNCERTAINTY GATE — alles wat overblijft
     # ===================================================================
-    alle_handled = fase1_handled | refund_handled | rent_handled
+    alle_handled = fase1_handled | refund_handled | rent_handled | salary_handled
     final_rest = mask & (~df.index.isin(alle_handled))
 
     for idx in df[final_rest].index:
@@ -2242,6 +2715,7 @@ def _classify_positive_inflows(df: pd.DataFrame, eigen_fi_ibans: set = None,
         f"  Laag A — insurance:          {stats['insurance']}\n"
         f"  Laag A — loan_inflow:        {stats['loan_inflow']}\n"
         f"  Laag B — refund (matcher):   {len(refund_handled) if 'refund_handled' in dir() else 0}\n"
+        f"  Laag B — salary (likely):    {stats.get('salary_likely', 0)}\n"
         f"  Laag B — rent (likely):      {stats['rent_likely']}\n"
         f"  Uncertainty Gate:            {stats['uncertain']} (EUR {uncertain_bedrag:,.0f})\n"
         f"  → Geen positieve tx naar AI!"
@@ -4199,6 +4673,17 @@ def _run_rapport_pipeline(job_id: str, bestanden: list, email: str):
         if n_huishoud > 0:
             update(f'{n_huishoud} huishoudoverboeking(en) gedetecteerd', 21)
 
+        # 1b3. Related Party Resolution (RPR v1.3)
+        update('Tegenpartijen classificeren (RPR)...', 21)
+        eigen_fi_ibans = _bouw_eigen_financieel_domein(df)
+        df = _resolve_related_parties(df, eigen_rekeningen, eigen_fi_ibans=eigen_fi_ibans)
+        n_intern_na_rpr = df['is_intern'].sum()
+        n_rpr_extra = n_intern_na_rpr - n_intern_totaal
+        if n_rpr_extra > 0:
+            update(f'RPR: {n_rpr_extra} extra interne transacties via multi-IBAN linking', 22)
+        else:
+            update('RPR: tegenpartijen geclassificeerd', 22)
+
         # 1c. Rule-based classificatie (vóór AI)
         update('Transacties classificeren...', 22)
         df = _classificeer_rule_based(df)
@@ -4215,9 +4700,8 @@ def _run_rapport_pipeline(job_id: str, bestanden: list, email: str):
         else:
             update('Patroondetectie afgerond', 25)
 
-        # 1d2. Decision Engine: eigen financieel domein + inflow classificatie
+        # 1d2. Decision Engine: inflow classificatie (eigen_fi_ibans al gebouwd in 1b3)
         update('Decision engine: positieve inflows classificeren...', 25)
-        eigen_fi_ibans = _bouw_eigen_financieel_domein(df)
         n_voor_inflow = len(df[df['classificatie_bron'] == 'rule'])
         df = _classify_positive_inflows(df, eigen_fi_ibans=eigen_fi_ibans, eigen_rekeningen=eigen_rekeningen)
         n_na_inflow = len(df[df['classificatie_bron'] == 'rule'])

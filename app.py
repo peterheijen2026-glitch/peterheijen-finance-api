@@ -2031,6 +2031,7 @@ def _classificeer_rule_based(df: pd.DataFrame) -> pd.DataFrame:
             'Spaarrekening': 'wealth_allocation',
             'Creditcard-aflossing': 'creditcard_settlement',
             'Tikkie-terugbetaling': 'internal_transfer',
+            'Freelance/Opdrachten': 'freelance_business',
         }
         for zoekterm, sectie, categorie, confidence in MERCHANT_MAPPING:
             if zoekterm in omschr:
@@ -2198,12 +2199,49 @@ def _detecteer_vast_inkomen(df: pd.DataFrame) -> pd.DataFrame:
     # LAAG 2: RECHTSVORM — B.V., Stichting, N.V., Gemeente, etc.
     # =========================================================================
     # Bidirectionele IBANs: IBANs waar we OOK geld naartoe sturen
-    # Als je geld ontvangt van een BV EN er ook geld naartoe stuurt → eigen BV → DGA-loon
-    # Een werknemer betaalt nooit geld terug aan zijn werkgever.
     _bidi_ibans_salary = set()
     if 'Tegenrekening' in df.columns:
         for iban_val in df[(df['bedrag'] < 0) & (~df['is_intern']) & df['Tegenrekening'].notna()]['Tegenrekening'].unique():
             _bidi_ibans_salary.add(_normaliseer_iban(str(iban_val)))
+
+    # =========================================================================
+    # ZAKELIJKE REKENING DETECTIE
+    # =========================================================================
+    # Een rekening is "zakelijk" als die zowel ontvangt VAN als betaalt AAN
+    # bedrijfsentiteiten (BV, Stichting, etc.) — exclusief interne transfers.
+    # Generiek signaal: een privépersoon heeft 1 werkgever; een BV-rekening
+    # heeft meerdere zakelijke tegenpartijen aan beide kanten.
+    # Inkomen op een zakelijke rekening = bedrijfsinkomen, niet salaris.
+    _BEDRIJF_MARKERS = ['B.V.', ' BV ', ' BV,', 'B.V ', ' B.V', ' BV.',
+                        'HOLDING', 'HLDG', 'STICHTING', 'VERENIGING',
+                        'N.V.', ' NV ', 'GEMEENTE', 'MINISTERIE']
+    _zakelijke_rekeningen = set()
+    if 'Rekeningnummer' in df.columns and 'Tegenrekening' in df.columns:
+        for rek in df['Rekeningnummer'].unique():
+            rek_str = str(rek).strip()
+            if not rek_str or rek_str == 'Onbekend':
+                continue
+            df_rek = df[(df['Rekeningnummer'] == rek) & (~df['is_intern'])]
+            # Check uitgaand: betaalt aan bedrijven?
+            uit_tekst = ' '.join(df_rek[df_rek['bedrag'] < 0]['Omschrijving'].astype(str).str.upper())
+            betaalt_bedrijven = any(m in uit_tekst for m in _BEDRIJF_MARKERS)
+            # Check inkomend: ontvangt van meerdere bedrijven?
+            ink = df_rek[df_rek['bedrag'] > 0]
+            if 'Tegenrekening' in ink.columns:
+                bedrijf_ibans_in = set()
+                for _, row in ink.iterrows():
+                    omschr = str(row.get('Omschrijving', '')).upper()
+                    if any(m in omschr for m in _BEDRIJF_MARKERS):
+                        tegen = _normaliseer_iban(str(row.get('Tegenrekening', '')))
+                        if tegen:
+                            bedrijf_ibans_in.add(tegen)
+                ontvangt_van_meerdere = len(bedrijf_ibans_in) >= 2
+            else:
+                ontvangt_van_meerdere = False
+            if betaalt_bedrijven and ontvangt_van_meerdere:
+                _zakelijke_rekeningen.add(rek_str)
+                logger.info(f"ZAKELIJKE REKENING: {rek_str} — betaalt + ontvangt van bedrijven")
+    logger.info(f"Zakelijke rekeningen gedetecteerd: {len(_zakelijke_rekeningen)} van {len(df['Rekeningnummer'].unique())}")
 
     groepeer_col = 'Tegenrekening' if 'Tegenrekening' in df.columns else 'Omschrijving'
 
@@ -2263,34 +2301,77 @@ def _detecteer_vast_inkomen(df: pd.DataFrame) -> pd.DataFrame:
         if variatie >= 0.25:
             continue
 
-        is_dga = (heeft_holding or mgmt_met_bedrijf) and not heeft_werkgever
-        heeft_salaris_kw = any(kw in tekst_check for kw in ['SALARIS', 'LOON', 'SALARY'])
+        # Classificatielogica geïnspireerd op Shortcut.ai:
+        # - Expliciet salaris-keyword → Netto salaris (zekerste signaal)
+        # - Holding/Management in naam → DGA-loon/Managementfee
+        # - Eigen BV (bidirectioneel) zonder keyword → Inkomen uit eigen BV (eerlijk)
+        # - Op zakelijke rekening → Freelance/Opdrachten (bedrijfsinkomen)
+        # - Werkgever op privérekening → Netto salaris
+        # - Overige BV → Netto salaris (default)
+
+        heeft_salaris_kw = any(kw in tekst_check for kw in ['SALARIS', 'LOON', 'SALARY',
+                                                             'NETTOLOON', 'PAYROLL', 'LOONRUN'])
+        is_holding_mgmt = (heeft_holding or mgmt_met_bedrijf) and not heeft_werkgever
 
         # Bidirectioneel signaal: als we OOK geld sturen naar deze BV → eigen bedrijf
-        # Een werknemer betaalt nooit terug aan werkgever; een DGA doet dat constant.
-        is_bidi_bv = False
+        is_eigen_bv = False
         if heeft_bv and 'Tegenrekening' in df.columns:
             groep_iban = _normaliseer_iban(key_str) if key_str.startswith('NL') or key_str.startswith('DE') or key_str.startswith('BE') else ''
             if groep_iban and groep_iban in _bidi_ibans_salary:
-                is_bidi_bv = True
+                is_eigen_bv = True
 
-        if (is_dga or is_bidi_bv) and not heeft_salaris_kw:
+        # Zakelijke rekening signaal: als dit inkomen binnenkomt op een
+        # gedetecteerde zakelijke rekening → bedrijfsinkomen, niet salaris
+        op_zakelijke_rek = False
+        if 'Rekeningnummer' in groep.columns:
+            groep_rekeningen = set(groep['Rekeningnummer'].astype(str).str.strip().unique())
+            op_zakelijke_rek = bool(groep_rekeningen & _zakelijke_rekeningen)
+
+        if heeft_salaris_kw and not op_zakelijke_rek:
+            # Sterkste signaal: expliciet salaris/loon in tekst op privérekening
+            categorie = 'Netto salaris'
+            source_fam = 'salary_employment'
+            confidence = 0.95
+        elif heeft_salaris_kw and op_zakelijke_rek:
+            # Salaris-keyword maar op zakelijke rekening → toch salaris
+            # (kan payroll via eigen BV zijn)
+            categorie = 'Netto salaris'
+            source_fam = 'salary_employment'
+            confidence = 0.90
+        elif is_holding_mgmt:
+            # Holding/Management in naam → DGA-loon
             categorie = 'DGA-loon/Managementfee'
             source_fam = 'management_fee'
-            confidence = 0.90 if is_dga else 0.85  # bidi-signaal iets lager
-            if is_bidi_bv and not is_dga:
-                logger.info(
-                    f"DGA-DETECTIE via bidirectioneel: {key_str[:50]} — "
-                    f"ontvangt + stuurt geld → eigen BV → DGA-loon"
-                )
+            confidence = 0.90
+        elif is_eigen_bv:
+            # Eigen BV (bidirectioneel bewezen) zonder expliciet salaris-keyword
+            categorie = 'Inkomen uit eigen BV'
+            source_fam = 'management_fee'
+            confidence = 0.85
+            logger.info(
+                f"EIGEN-BV DETECTIE: {key_str[:50]} — bidirectioneel → "
+                f"Inkomen uit eigen BV (geen salaris-keyword gevonden)"
+            )
+        elif op_zakelijke_rek:
+            # Inkomen op zakelijke rekening van derde partij → freelance/opdrachten
+            # Niet: salaris. Een BV-rekening ontvangt omzet, geen loon.
+            categorie = 'Freelance/Opdrachten'
+            source_fam = 'freelance_business'
+            confidence = 0.85
+            logger.info(
+                f"ZAKELIJK INKOMEN: {key_str[:50]} op zakelijke rekening → "
+                f"Freelance/Opdrachten (geen salaris-keyword)"
+            )
         elif heeft_werkgever:
+            # Stichting/Gemeente/etc. op privérekening → regulier salaris
             categorie = 'Netto salaris'
             source_fam = 'salary_employment'
             confidence = 0.88
         else:
+            # Overige BV/NV zonder verdere aanwijzingen → salaris (veilige default)
             categorie = 'Netto salaris'
             source_fam = 'salary_employment'
-            confidence = 0.88
+            confidence = 0.85
 
         mask_match = df.index.isin(groep_pos.index)
         df.loc[mask_match, 'regel_sectie'] = 'inkomsten'
@@ -2389,6 +2470,7 @@ def _detecteer_vast_inkomen(df: pd.DataFrame) -> pd.DataFrame:
 _STRUCTURAL_INCOME_WHITELIST = {
     'Netto salaris',
     'DGA-loon/Managementfee',
+    'Inkomen uit eigen BV',
     'Huurinkomsten',
     'UWV/Uitkeringen',
     'Kinderbijslag/Kindregelingen',

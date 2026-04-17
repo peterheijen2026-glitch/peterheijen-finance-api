@@ -718,7 +718,7 @@ def _verrijk_transactie_velden(df: pd.DataFrame) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 # NTROPY ENRICHMENT — externe transactie-verrijking
 # ---------------------------------------------------------------------------
-NTROPY_API_KEY = os.getenv('NTROPY_API_KEY', '')
+NTROPY_API_KEY = ''  # Uitgeschakeld — eigen merchant registry (1451 merchants) is actief
 NTROPY_BASE = 'https://api.ntropy.com/v3'
 
 # Mapping van Ntropy consumer categorieën naar onze sectie + categorie

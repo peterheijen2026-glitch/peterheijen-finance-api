@@ -588,41 +588,129 @@ import re
 # Buitenlands IBAN (bv EE/DE): ook 4 letters bankcode maar account kan langer zijn
 _IBAN_RE = re.compile(r'[A-Z]{2}\d{2}[A-Z]{4}\d{10,14}')
 
-def _extract_iban_uit_omschrijving(omschrijving: str) -> str:
-    """Haal IBAN uit ABN-omschrijving.
 
-    ABN XLSX-transacties hebben GEEN aparte Tegenrekening kolom.
-    Het IBAN zit verborgen in de omschrijving in twee formaten:
-      1. /IBAN/NL50BUNQ2208185153/BIC/...
-      2. IBAN: NL50BUNQ2208185153        BIC: ...
+def _parse_transactie_omschrijving(omschrijving: str) -> dict:
+    """Extraheer gestructureerde velden uit banktransactie-omschrijvingen.
+
+    Ondersteunt alle NL bankformaten:
+    - ABN AMRO XLSX: /TRTP/ formaat en SEPA platte-tekst formaat
+    - ING CSV: "Naam | Details" formaat
+    - Overig: Rabobank, Triodos, Knab, Bunq hebben al gestructureerde kolommen
+              maar als hun omschrijving toch geparst moet worden, werkt deze fallback.
+
+    Returns dict: tegenpartij_naam, tegenpartij_iban, transactie_type, kenmerk
     """
-    if pd.isna(omschrijving):
-        return ''
-    tekst = str(omschrijving).upper().replace(' ', '')
-    match = _IBAN_RE.search(tekst)
-    return match.group(0) if match else ''
+    if not omschrijving or pd.isna(omschrijving) or str(omschrijving).strip() == '':
+        return {'tegenpartij_naam': '', 'tegenpartij_iban': '', 'transactie_type': '', 'kenmerk': ''}
+
+    tekst = str(omschrijving).strip()
+    naam = ''
+    iban = ''
+    tx_type = ''
+    kenmerk = ''
+
+    # === FORMAT 1: ABN /TRTP/ formaat ===
+    if '/TRTP/' in tekst or tekst.startswith('/TRTP/'):
+        trtp_match = re.search(r'/TRTP/([^/]+)', tekst)
+        if trtp_match:
+            tx_type = trtp_match.group(1).strip()
+        iban_match = re.search(r'/IBAN/([A-Z]{2}\d{2}[A-Z0-9]{4}[\dA-Z]+?)/', tekst)
+        if iban_match:
+            iban = iban_match.group(1).replace(' ', '')
+        name_match = re.search(r'/NAME/([^/]+)', tekst)
+        if name_match:
+            naam = name_match.group(1).strip()
+        remi_match = re.search(r'/REMI/([^/]+)', tekst)
+        if remi_match:
+            kenmerk = remi_match.group(1).strip()
+
+    # === FORMAT 2: ABN SEPA platte-tekst ===
+    elif tekst.startswith('SEPA ') or ('Naam:' in tekst and 'IBAN:' in tekst):
+        type_match = re.match(r'^(SEPA [A-Za-z. ]+?)(?:\s{2,}|IBAN|Incassant)', tekst)
+        if type_match:
+            tx_type = type_match.group(1).strip().rstrip('.')
+        iban_match = re.search(r'IBAN:\s*([A-Z]{2}\d{2}[A-Z0-9]{4}[\dA-Z]+)', tekst)
+        if iban_match:
+            iban = iban_match.group(1).replace(' ', '')
+        naam_match = re.search(r'Naam:\s*(.+?)(?:\s{2,}|Omschrijving:|Betalingskenm|Kenmerk:|Machtiging:|$)', tekst)
+        if naam_match:
+            naam = naam_match.group(1).strip()
+        omschr_match = re.search(r'Omschrijving:\s*(.+?)(?:\s{2,}|Kenmerk:|IBAN:|$)', tekst)
+        if omschr_match:
+            kenmerk = omschr_match.group(1).strip()
+        if not kenmerk:
+            betk_match = re.search(r'Betalingskenm\.?:\s*(\d+)', tekst)
+            if betk_match:
+                kenmerk = f"BK:{betk_match.group(1)}"
+
+    # === FORMAT 3: ING "Naam | Details" formaat ===
+    elif '|' in tekst:
+        delen = tekst.split('|', 1)
+        korte_naam = delen[0].strip()
+        details = delen[1].strip() if len(delen) > 1 else ''
+        naam_match = re.search(r'Naam:\s*(.+?)(?:\s+Omschrijving:|\s+IBAN:|\s+Kenmerk:|$)', details)
+        if naam_match:
+            naam = naam_match.group(1).strip()
+        else:
+            naam = korte_naam
+        iban_match = re.search(r'IBAN:\s*([A-Z]{2}\d{2}[A-Z0-9]+)', details)
+        if iban_match:
+            iban = iban_match.group(1).replace(' ', '')
+        omschr_match = re.search(r'Omschrijving:\s*(.+?)(?:\s+IBAN:|\s+Kenmerk:|$)', details)
+        if omschr_match:
+            kenmerk = omschr_match.group(1).strip()
+        tx_type = 'ING'
+
+    # === FALLBACK ===
+    else:
+        naam = tekst[:80]
+
+    naam = re.sub(r'\s+', ' ', naam).strip()
+    kenmerk = re.sub(r'\s+', ' ', kenmerk).strip()
+    iban = iban.replace(' ', '').upper() if iban else ''
+
+    return {'tegenpartij_naam': naam, 'tegenpartij_iban': iban, 'transactie_type': tx_type, 'kenmerk': kenmerk}
 
 
-def _vul_lege_tegenrekening(df: pd.DataFrame) -> pd.DataFrame:
-    """Vul lege Tegenrekening-velden door IBAN uit omschrijving te extraheren.
+def _verrijk_transactie_velden(df: pd.DataFrame) -> pd.DataFrame:
+    """Voeg gestructureerde velden toe aan elke transactie.
 
-    Dit is essentieel voor ABN AMRO XLSX, waar geen Tegenrekening-kolom is.
-    Zonder deze stap kunnen _detecteer_vast_inkomen en _detecteer_huurinkomsten
-    niet groeperen op tegenpartij → inkomen wordt niet herkend.
+    Stap 1 in de enrichment-pipeline (vóór alle detectie):
+    - Vult lege Tegenrekening met IBAN uit omschrijving
+    - Extraheert tegenpartij_naam uit omschrijving
+    - Maakt omschrijving_schoon voor de AI-prompt
+
+    Voor banken met al gestructureerde data (Rabobank 'Naam tegenpartij',
+    Triodos 'Naam', Knab 'Tegenrekeninghouder', Bunq 'Naam') wordt de
+    bestaande naam gebruikt en niet overschreven.
     """
     if 'Tegenrekening' not in df.columns:
         df['Tegenrekening'] = ''
 
-    lege_mask = df['Tegenrekening'].apply(lambda x: _normaliseer_iban(x) == '')
-    n_leeg = lege_mask.sum()
+    # Parse omschrijvingen
+    parsed = df['Omschrijving'].apply(_parse_transactie_omschrijving)
+    df['tegenpartij_naam'] = parsed.apply(lambda x: x['tegenpartij_naam'])
+    df['kenmerk'] = parsed.apply(lambda x: x['kenmerk'])
 
+    # Vul lege Tegenrekening met geparsed IBAN
+    lege_mask = df['Tegenrekening'].apply(lambda x: _normaliseer_iban(x) == '')
+    parsed_ibans = parsed.apply(lambda x: x['tegenpartij_iban'])
+    n_leeg = lege_mask.sum()
     if n_leeg > 0:
-        df.loc[lege_mask, 'Tegenrekening'] = (
-            df.loc[lege_mask, 'Omschrijving'].apply(_extract_iban_uit_omschrijving)
-        )
+        df.loc[lege_mask, 'Tegenrekening'] = parsed_ibans[lege_mask]
         n_gevuld = (df.loc[lege_mask, 'Tegenrekening'] != '').sum()
         if n_gevuld > 0:
-            logger.info(f"IBAN-EXTRACTIE: {n_gevuld} van {n_leeg} lege tegenrekeningen gevuld uit omschrijving")
+            logger.info(f"IBAN-EXTRACTIE: {n_gevuld}/{n_leeg} lege tegenrekeningen gevuld uit omschrijving")
+
+    # Maak schone omschrijving: "Naam — Kenmerk" (voor AI-prompt)
+    df['omschrijving_schoon'] = df.apply(
+        lambda r: (r['tegenpartij_naam'] + (' — ' + r['kenmerk'] if r['kenmerk'] else ''))
+        if r['tegenpartij_naam'] else str(r['Omschrijving'])[:200],
+        axis=1
+    )
+
+    n_naam = (df['tegenpartij_naam'] != '').sum()
+    logger.info(f"NAAM-EXTRACTIE: {n_naam}/{len(df)} transacties met herkende tegenpartij-naam")
 
     return df
 
@@ -813,12 +901,28 @@ MERCHANT_MAPPING = [
 
     # --- VASTE LASTEN ---
     # Hypotheek / Woonlasten
-    ('ASR', 'vaste_lasten', 'Hypotheek/Huur', 0.85),  # ASR = meestal hypotheek-gekoppeld
+    ('ASR HYPOTHEEK', 'vaste_lasten', 'Hypotheek/Huur', 0.99),
+    ('ASR LEVENSVERZEKERING', 'vaste_lasten', 'Hypotheek/Huur', 0.90),
+    ('ASR', 'vaste_lasten', 'Hypotheek/Huur', 0.85),
     ('A.S.R', 'vaste_lasten', 'Hypotheek/Huur', 0.85),
     ('NATIONALE-NEDERLANDEN', 'vaste_lasten', 'Hypotheek/Huur', 0.80),
+    ('NN GROUP', 'vaste_lasten', 'Hypotheek/Huur', 0.80),
     ('AEGON', 'vaste_lasten', 'Hypotheek/Huur', 0.80),
     ('DELTA LLOYD', 'vaste_lasten', 'Hypotheek/Huur', 0.80),
     ('VVE', 'vaste_lasten', 'Hypotheek/Huur', 0.90),
+    ('OBVION', 'vaste_lasten', 'Hypotheek/Huur', 0.99),
+    ('FLORIUS', 'vaste_lasten', 'Hypotheek/Huur', 0.99),
+    ('WOONFONDS', 'vaste_lasten', 'Hypotheek/Huur', 0.99),
+    ('HYPOTHEEK', 'vaste_lasten', 'Hypotheek/Huur', 0.95),
+    ('MUNT HYPOTHEKEN', 'vaste_lasten', 'Hypotheek/Huur', 0.99),
+    ('VISTA HYPOTHEKEN', 'vaste_lasten', 'Hypotheek/Huur', 0.99),
+    ('WONINGCORPORATIE', 'vaste_lasten', 'Hypotheek/Huur', 0.95),
+    ('VESTIA', 'vaste_lasten', 'Hypotheek/Huur', 0.95),
+    ('YMERE', 'vaste_lasten', 'Hypotheek/Huur', 0.95),
+    ('EIGEN HAARD', 'vaste_lasten', 'Hypotheek/Huur', 0.95),
+    ('DE ALLIANTIE', 'vaste_lasten', 'Hypotheek/Huur', 0.95),
+    ('PORTAAL', 'vaste_lasten', 'Hypotheek/Huur', 0.90),
+    ('WOONSTAD', 'vaste_lasten', 'Hypotheek/Huur', 0.95),
     # Energie
     ('FRANK ENERGIE', 'vaste_lasten', 'Energie', 0.99),
     ('VATTENFALL', 'vaste_lasten', 'Energie', 0.99),
@@ -826,28 +930,89 @@ MERCHANT_MAPPING = [
     ('ESSENT', 'vaste_lasten', 'Energie', 0.99),
     ('BUDGET ENERGIE', 'vaste_lasten', 'Energie', 0.99),
     ('GREENCHOICE', 'vaste_lasten', 'Energie', 0.99),
+    ('VANDEBRON', 'vaste_lasten', 'Energie', 0.99),
+    ('ENERGIEDIRECT', 'vaste_lasten', 'Energie', 0.99),
+    ('INNOVA ENERGIE', 'vaste_lasten', 'Energie', 0.99),
+    ('NUON', 'vaste_lasten', 'Energie', 0.99),
+    ('OXXIO', 'vaste_lasten', 'Energie', 0.99),
+    ('PURE ENERGIE', 'vaste_lasten', 'Energie', 0.99),
+    ('UNITED CONSUMERS', 'vaste_lasten', 'Energie', 0.90),
+    ('TIBBER', 'vaste_lasten', 'Energie', 0.99),
+    ('NEXT ENERGY', 'vaste_lasten', 'Energie', 0.99),
+    ('DUTCH ENERGY', 'vaste_lasten', 'Energie', 0.99),
+    ('STROOM', 'vaste_lasten', 'Energie', 0.85),
     # Water
     ('VITENS', 'vaste_lasten', 'Water', 0.99),
     ('BRABANT WATER', 'vaste_lasten', 'Water', 0.99),
     ('PWN', 'vaste_lasten', 'Water', 0.95),
     ('DUNEA', 'vaste_lasten', 'Water', 0.99),
     ('WATERNET', 'vaste_lasten', 'Water', 0.99),
+    ('EVIDES', 'vaste_lasten', 'Water', 0.99),
+    ('OASEN', 'vaste_lasten', 'Water', 0.99),
+    ('WATERBEDRIJF GRONINGEN', 'vaste_lasten', 'Water', 0.99),
+    ('WMD', 'vaste_lasten', 'Water', 0.90),
     # Zorgverzekering
     ('CZ GROEP', 'vaste_lasten', 'Zorgverzekering', 0.99),
     ('CZ ZORGVERZEKERING', 'vaste_lasten', 'Zorgverzekering', 0.99),
     ('ZILVEREN KRUIS', 'vaste_lasten', 'Zorgverzekering', 0.99),
+    ('ACHMEA', 'vaste_lasten', 'Zorgverzekering', 0.90),
     ('MENZIS', 'vaste_lasten', 'Zorgverzekering', 0.99),
     ('OHRA', 'vaste_lasten', 'Zorgverzekering', 0.95),
-    # Gemeentebelasting
+    ('VGZ', 'vaste_lasten', 'Zorgverzekering', 0.99),
+    ('COOPERATIE VGZ', 'vaste_lasten', 'Zorgverzekering', 0.99),
+    ('UNIVE', 'vaste_lasten', 'Zorgverzekering', 0.95),
+    ('INTERPOLIS', 'vaste_lasten', 'Zorgverzekering', 0.90),
+    ('DITZO', 'vaste_lasten', 'Zorgverzekering', 0.95),
+    ('JUST', 'vaste_lasten', 'Zorgverzekering', 0.80),
+    ('DSW', 'vaste_lasten', 'Zorgverzekering', 0.99),
+    ('ZORG EN ZEKERHEID', 'vaste_lasten', 'Zorgverzekering', 0.99),
+    ('ENO ZORGVERZEKERAAR', 'vaste_lasten', 'Zorgverzekering', 0.99),
+    ('SALLAND VERZEKERINGEN', 'vaste_lasten', 'Zorgverzekering', 0.99),
+    # Gemeentebelasting / OZB / Waterschap
     ('GEMEENTELIJKE BELASTING', 'vaste_lasten', 'Gemeentebelasting/OZB/Waterschapsbelasting', 0.99),
+    ('GEMEENTE ', 'vaste_lasten', 'Gemeentebelasting/OZB/Waterschapsbelasting', 0.85),
     ('GBLT', 'vaste_lasten', 'Gemeentebelasting/OZB/Waterschapsbelasting', 0.99),
     ('WATERSCHAP', 'vaste_lasten', 'Gemeentebelasting/OZB/Waterschapsbelasting', 0.99),
+    ('BELASTINGSAMENWERKING', 'vaste_lasten', 'Gemeentebelasting/OZB/Waterschapsbelasting', 0.99),
+    ('COCENSUS', 'vaste_lasten', 'Gemeentebelasting/OZB/Waterschapsbelasting', 0.99),
+    ('SVHW', 'vaste_lasten', 'Gemeentebelasting/OZB/Waterschapsbelasting', 0.99),
+    ('BSGR', 'vaste_lasten', 'Gemeentebelasting/OZB/Waterschapsbelasting', 0.99),
+    ('SABEWA', 'vaste_lasten', 'Gemeentebelasting/OZB/Waterschapsbelasting', 0.99),
+    ('HEFPUNT', 'vaste_lasten', 'Gemeentebelasting/OZB/Waterschapsbelasting', 0.99),
+    ('RBG', 'vaste_lasten', 'Gemeentebelasting/OZB/Waterschapsbelasting', 0.90),
+    # Autoverzekering
+    ('CENTRAAL BEHEER', 'vaste_lasten', 'Autoverzekering', 0.85),
+    ('ALLSECUR', 'vaste_lasten', 'Autoverzekering', 0.90),
+    ('UNIVÉ', 'vaste_lasten', 'Autoverzekering', 0.85),
+    ('ALLIANZ', 'vaste_lasten', 'Autoverzekering', 0.80),
+    ('INSHARED', 'vaste_lasten', 'Autoverzekering', 0.90),
+    # Overige verzekeringen
+    ('FBTO', 'vaste_lasten', 'Overige verzekeringen', 0.90),
+    ('REAAL', 'vaste_lasten', 'Overige verzekeringen', 0.85),
+    ('DELA', 'vaste_lasten', 'Overige verzekeringen', 0.95),
+    ('MONUTA', 'vaste_lasten', 'Overige verzekeringen', 0.95),
+    ('YARDEN', 'vaste_lasten', 'Overige verzekeringen', 0.95),
+    ('UITVAART', 'vaste_lasten', 'Overige verzekeringen', 0.95),
+    ('NOPPES VERZEKERINGEN', 'vaste_lasten', 'Overige verzekeringen', 0.90),
     # Internet/TV
     ('ZIGGO', 'vaste_lasten', 'Internet/TV', 0.95),
+    ('VODAFONEZIGGO', 'vaste_lasten', 'Internet/TV', 0.95),
     ('KPN', 'vaste_lasten', 'Internet/TV', 0.85),
+    ('GLASPOORT', 'vaste_lasten', 'Internet/TV', 0.95),
+    ('DELTA', 'vaste_lasten', 'Internet/TV', 0.80),
+    ('CAIWAY', 'vaste_lasten', 'Internet/TV', 0.95),
+    ('SOLCON', 'vaste_lasten', 'Internet/TV', 0.95),
+    ('FREEDOM INTERNET', 'vaste_lasten', 'Internet/TV', 0.99),
+    ('YOUFONE', 'vaste_lasten', 'Internet/TV', 0.85),
+    ('ODIDO', 'vaste_lasten', 'Internet/TV', 0.85),
     # Mobiele telefonie
     ('T-MOBILE', 'vaste_lasten', 'Mobiele telefonie', 0.95),
     ('VODAFONE', 'vaste_lasten', 'Mobiele telefonie', 0.95),
+    ('SIMPEL', 'vaste_lasten', 'Mobiele telefonie', 0.95),
+    ('LEBARA', 'vaste_lasten', 'Mobiele telefonie', 0.95),
+    ('LYCAMOBILE', 'vaste_lasten', 'Mobiele telefonie', 0.95),
+    ('BEN MOBIEL', 'vaste_lasten', 'Mobiele telefonie', 0.95),
+    ('HOLLANDSNIEUWE', 'vaste_lasten', 'Mobiele telefonie', 0.95),
     # Streaming/Digitaal
     ('NETFLIX', 'vaste_lasten', 'Streaming/Digitaal', 0.99),
     ('SPOTIFY', 'vaste_lasten', 'Streaming/Digitaal', 0.99),
@@ -855,58 +1020,225 @@ MERCHANT_MAPPING = [
     ('APPLE.COM/BILL', 'vaste_lasten', 'Streaming/Digitaal', 0.90),
     ('ICLOUD', 'vaste_lasten', 'Streaming/Digitaal', 0.95),
     ('YOUTUBE PREMIUM', 'vaste_lasten', 'Streaming/Digitaal', 0.99),
+    ('VIDEOLAND', 'vaste_lasten', 'Streaming/Digitaal', 0.99),
+    ('HBO MAX', 'vaste_lasten', 'Streaming/Digitaal', 0.99),
+    ('PRIME VIDEO', 'vaste_lasten', 'Streaming/Digitaal', 0.95),
+    ('AMAZON PRIME', 'vaste_lasten', 'Streaming/Digitaal', 0.90),
+    ('GOOGLE STORAGE', 'vaste_lasten', 'Streaming/Digitaal', 0.95),
+    ('GOOGLE ONE', 'vaste_lasten', 'Streaming/Digitaal', 0.95),
+    ('MICROSOFT 365', 'vaste_lasten', 'Overige abonnementen', 0.95),
+    ('ADOBE', 'vaste_lasten', 'Overige abonnementen', 0.95),
+    ('CHATGPT', 'vaste_lasten', 'Overige abonnementen', 0.95),
+    ('OPENAI', 'vaste_lasten', 'Overige abonnementen', 0.90),
+    ('ANTHROPIC', 'vaste_lasten', 'Overige abonnementen', 0.90),
+    # Overige abonnementen
+    ('NRC', 'vaste_lasten', 'Overige abonnementen', 0.95),
+    ('VOLKSKRANT', 'vaste_lasten', 'Overige abonnementen', 0.95),
+    ('TELEGRAAF', 'vaste_lasten', 'Overige abonnementen', 0.95),
+    ('AD.NL', 'vaste_lasten', 'Overige abonnementen', 0.95),
+    ('TROUW', 'vaste_lasten', 'Overige abonnementen', 0.95),
+    ('FD.NL', 'vaste_lasten', 'Overige abonnementen', 0.95),
+    ('FINANCIEELE DAGBLAD', 'vaste_lasten', 'Overige abonnementen', 0.95),
+    # Kinderopvang
+    ('KINDEROPVANG', 'vaste_lasten', 'Kinderopvang/BSO/School', 0.95),
+    ('BSO', 'vaste_lasten', 'Kinderopvang/BSO/School', 0.90),
+    ('PARTOU', 'vaste_lasten', 'Kinderopvang/BSO/School', 0.99),
+    ('KIDS FIRST', 'vaste_lasten', 'Kinderopvang/BSO/School', 0.99),
+    ('SMALLSTEPS', 'vaste_lasten', 'Kinderopvang/BSO/School', 0.99),
+    ('HUMANKIND', 'vaste_lasten', 'Kinderopvang/BSO/School', 0.95),
+    ('KINDERGARDEN', 'vaste_lasten', 'Kinderopvang/BSO/School', 0.99),
+    ('SCHOOLGELD', 'vaste_lasten', 'Kinderopvang/BSO/School', 0.95),
+    # Contributie/Lidmaatschap
+    ('ANWB', 'vaste_lasten', 'Contributie/Lidmaatschap', 0.90),
+    ('KNVB', 'vaste_lasten', 'Contributie/Lidmaatschap', 0.95),
+    ('SPORTSCHOOL', 'vaste_lasten', 'Contributie/Lidmaatschap', 0.90),
+    ('FITNESS', 'vaste_lasten', 'Contributie/Lidmaatschap', 0.85),
+    ('BASIC-FIT', 'vaste_lasten', 'Contributie/Lidmaatschap', 0.99),
+    ('SPORTCITY', 'vaste_lasten', 'Contributie/Lidmaatschap', 0.99),
+    ('TRAINMORE', 'vaste_lasten', 'Contributie/Lidmaatschap', 0.99),
     # Donaties
     ('GIVT', 'vaste_lasten', 'Donaties/Goede doelen', 0.95),
     ('KWF', 'vaste_lasten', 'Donaties/Goede doelen', 0.95),
     ('RODE KRUIS', 'vaste_lasten', 'Donaties/Goede doelen', 0.95),
     ('OXFAM', 'vaste_lasten', 'Donaties/Goede doelen', 0.95),
     ('PARTIJ VOOR DE DIEREN', 'vaste_lasten', 'Donaties/Goede doelen', 0.95),
+    ('AMNESTY', 'vaste_lasten', 'Donaties/Goede doelen', 0.95),
+    ('GREENPEACE', 'vaste_lasten', 'Donaties/Goede doelen', 0.95),
+    ('WWF', 'vaste_lasten', 'Donaties/Goede doelen', 0.95),
+    ('UNICEF', 'vaste_lasten', 'Donaties/Goede doelen', 0.95),
+    ('NATUURMONUMENTEN', 'vaste_lasten', 'Donaties/Goede doelen', 0.95),
+    ('LEGER DES HEILS', 'vaste_lasten', 'Donaties/Goede doelen', 0.95),
+    ('HARTSTICHTING', 'vaste_lasten', 'Donaties/Goede doelen', 0.95),
+    # Bankkosten
+    ('KOSTEN PAKKET', 'vaste_lasten', 'Bankkosten', 0.95),
+    ('BANKKOSTEN', 'vaste_lasten', 'Bankkosten', 0.99),
+    ('REKENINGKOSTEN', 'vaste_lasten', 'Bankkosten', 0.99),
 
     # --- VARIABELE KOSTEN ---
     # Supermarkten
     ('ALBERT HEIJN', 'variabele_kosten', 'Boodschappen/Supermarkt', 0.99),
+    ('AH TO GO', 'variabele_kosten', 'Boodschappen/Supermarkt', 0.99),
     ('JUMBO', 'variabele_kosten', 'Boodschappen/Supermarkt', 0.95),
     ('LIDL', 'variabele_kosten', 'Boodschappen/Supermarkt', 0.99),
+    ('ALDI', 'variabele_kosten', 'Boodschappen/Supermarkt', 0.99),
     ('PLUS SUPERMARKT', 'variabele_kosten', 'Boodschappen/Supermarkt', 0.95),
+    ('PLUS ', 'variabele_kosten', 'Boodschappen/Supermarkt', 0.80),
     ('DIRK', 'variabele_kosten', 'Boodschappen/Supermarkt', 0.95),
+    ('DIRK VAN DEN BROEK', 'variabele_kosten', 'Boodschappen/Supermarkt', 0.99),
+    ('DEKAMARKT', 'variabele_kosten', 'Boodschappen/Supermarkt', 0.99),
+    ('COOP ', 'variabele_kosten', 'Boodschappen/Supermarkt', 0.90),
+    ('PICNIC', 'variabele_kosten', 'Boodschappen/Supermarkt', 0.95),
+    ('SPAR', 'variabele_kosten', 'Boodschappen/Supermarkt', 0.90),
+    ('VOMAR', 'variabele_kosten', 'Boodschappen/Supermarkt', 0.99),
+    ('HOOGVLIET', 'variabele_kosten', 'Boodschappen/Supermarkt', 0.99),
+    ('NETTORAMA', 'variabele_kosten', 'Boodschappen/Supermarkt', 0.99),
+    ('JAN LINDERS', 'variabele_kosten', 'Boodschappen/Supermarkt', 0.99),
+    ('BONI ', 'variabele_kosten', 'Boodschappen/Supermarkt', 0.90),
+    ('POIESZ', 'variabele_kosten', 'Boodschappen/Supermarkt', 0.99),
+    ('SLIGRO', 'variabele_kosten', 'Boodschappen/Supermarkt', 0.90),
+    ('MARQT', 'variabele_kosten', 'Boodschappen/Supermarkt', 0.99),
+    ('EKOPLAZA', 'variabele_kosten', 'Boodschappen/Supermarkt', 0.99),
     # Drogist
     ('ETOS', 'variabele_kosten', 'Drogist', 0.95),
     ('KRUIDVAT', 'variabele_kosten', 'Drogist', 0.95),
-    # Tankstations
+    ('TREKPLEISTER', 'variabele_kosten', 'Drogist', 0.95),
+    ('HOLLAND & BARRETT', 'variabele_kosten', 'Drogist', 0.90),
+    ('DA DROGIST', 'variabele_kosten', 'Drogist', 0.95),
+    # Tankstations / Laden
     ('SHELL', 'variabele_kosten', 'Benzine/Diesel/Laden', 0.90),
     ('BP ', 'variabele_kosten', 'Benzine/Diesel/Laden', 0.85),
     ('TOTALENERGIES', 'variabele_kosten', 'Benzine/Diesel/Laden', 0.95),
     ('TANGO', 'variabele_kosten', 'Benzine/Diesel/Laden', 0.95),
     ('TINQ', 'variabele_kosten', 'Benzine/Diesel/Laden', 0.95),
+    ('ESSO', 'variabele_kosten', 'Benzine/Diesel/Laden', 0.95),
+    ('GULF', 'variabele_kosten', 'Benzine/Diesel/Laden', 0.90),
+    ('TEXACO', 'variabele_kosten', 'Benzine/Diesel/Laden', 0.95),
+    ('FASTNED', 'variabele_kosten', 'Benzine/Diesel/Laden', 0.99),
+    ('ALLEGO', 'variabele_kosten', 'Benzine/Diesel/Laden', 0.99),
+    ('IONITY', 'variabele_kosten', 'Benzine/Diesel/Laden', 0.99),
+    ('TESLA SUPERCHARGER', 'variabele_kosten', 'Benzine/Diesel/Laden', 0.99),
+    ('NEWMOTION', 'variabele_kosten', 'Benzine/Diesel/Laden', 0.99),
+    ('VATTENFALL LAADPAAL', 'variabele_kosten', 'Benzine/Diesel/Laden', 0.99),
     # OV
     ('NS GROEP', 'variabele_kosten', 'OV/Trein', 0.95),
+    ('NS-', 'variabele_kosten', 'OV/Trein', 0.85),
     ('OV-CHIPKAART', 'variabele_kosten', 'OV/Trein', 0.99),
     ('CONNEXXION', 'variabele_kosten', 'OV/Trein', 0.95),
+    ('GVB', 'variabele_kosten', 'OV/Trein', 0.95),
+    ('RET', 'variabele_kosten', 'OV/Trein', 0.90),
+    ('HTM', 'variabele_kosten', 'OV/Trein', 0.90),
+    ('ARRIVA', 'variabele_kosten', 'OV/Trein', 0.95),
+    ('QBUZZ', 'variabele_kosten', 'OV/Trein', 0.95),
+    ('TRANSLINK', 'variabele_kosten', 'OV/Trein', 0.95),
+    ('KEOLIS', 'variabele_kosten', 'OV/Trein', 0.95),
+    ('EBS ', 'variabele_kosten', 'OV/Trein', 0.85),
+    # Parkeren
+    ('PARKMOBILE', 'variabele_kosten', 'Parkeren', 0.99),
+    ('YELLOWBRICK', 'variabele_kosten', 'Parkeren', 0.99),
+    ('Q-PARK', 'variabele_kosten', 'Parkeren', 0.99),
+    ('PARKBEE', 'variabele_kosten', 'Parkeren', 0.99),
+    ('P1 PARKING', 'variabele_kosten', 'Parkeren', 0.95),
+    ('APCOA', 'variabele_kosten', 'Parkeren', 0.95),
+    # Taxi/Ride
+    ('UBER ', 'variabele_kosten', 'Taxi/Uber', 0.90),
+    ('UBER BV', 'variabele_kosten', 'Taxi/Uber', 0.95),
+    ('BOLT.EU', 'variabele_kosten', 'Taxi/Uber', 0.95),
     # Afhaal/Bezorging
     ('THUISBEZORGD', 'variabele_kosten', 'Afhaal/Bezorging', 0.99),
     ('UBER EATS', 'variabele_kosten', 'Afhaal/Bezorging', 0.99),
     ('DELIVEROO', 'variabele_kosten', 'Afhaal/Bezorging', 0.99),
+    ('JUST EAT', 'variabele_kosten', 'Afhaal/Bezorging', 0.99),
+    ('GORILLAS', 'variabele_kosten', 'Afhaal/Bezorging', 0.99),
+    ('GETIR', 'variabele_kosten', 'Afhaal/Bezorging', 0.99),
+    ('FLINK', 'variabele_kosten', 'Afhaal/Bezorging', 0.99),
     # Kleding
     ('H&M', 'variabele_kosten', 'Kleding', 0.90),
     ('ZARA', 'variabele_kosten', 'Kleding', 0.90),
     ('C&A', 'variabele_kosten', 'Kleding', 0.90),
     ('PRIMARK', 'variabele_kosten', 'Kleding', 0.95),
+    ('UNIQLO', 'variabele_kosten', 'Kleding', 0.95),
+    ('NIKE', 'variabele_kosten', 'Kleding', 0.85),
+    ('ADIDAS', 'variabele_kosten', 'Kleding', 0.85),
+    ('WE FASHION', 'variabele_kosten', 'Kleding', 0.95),
+    ('ZEEMAN', 'variabele_kosten', 'Kleding', 0.90),
+    ('ZALANDO', 'variabele_kosten', 'Kleding', 0.90),
+    ('ABOUT YOU', 'variabele_kosten', 'Kleding', 0.90),
     # Elektronica/Online
     ('BOL.COM', 'variabele_kosten', 'Elektronica/Gadgets', 0.80),
     ('COOLBLUE', 'variabele_kosten', 'Elektronica/Gadgets', 0.90),
     ('AMAZON', 'variabele_kosten', 'Elektronica/Gadgets', 0.75),
-    # Vakantie
+    ('MEDIAMARKT', 'variabele_kosten', 'Elektronica/Gadgets', 0.95),
+    ('MEDIA MARKT', 'variabele_kosten', 'Elektronica/Gadgets', 0.95),
+    ('ALIEXPRESS', 'variabele_kosten', 'Elektronica/Gadgets', 0.85),
+    ('TEMU', 'variabele_kosten', 'Elektronica/Gadgets', 0.80),
+    # Vakantie/Reizen
     ('BOOKING.COM', 'variabele_kosten', 'Vakantie/Reizen', 0.95),
     ('AIRBNB', 'variabele_kosten', 'Vakantie/Reizen', 0.95),
     ('TRANSAVIA', 'variabele_kosten', 'Vakantie/Reizen', 0.99),
     ('KLM', 'variabele_kosten', 'Vakantie/Reizen', 0.95),
     ('RYANAIR', 'variabele_kosten', 'Vakantie/Reizen', 0.99),
-    # Huishoudelijk
+    ('EASYJET', 'variabele_kosten', 'Vakantie/Reizen', 0.99),
+    ('VUELING', 'variabele_kosten', 'Vakantie/Reizen', 0.99),
+    ('TRAVELBIRD', 'variabele_kosten', 'Vakantie/Reizen', 0.99),
+    ('SUNWEB', 'variabele_kosten', 'Vakantie/Reizen', 0.99),
+    ('CORENDON', 'variabele_kosten', 'Vakantie/Reizen', 0.99),
+    ('TUI ', 'variabele_kosten', 'Vakantie/Reizen', 0.95),
+    ('PHAROS', 'variabele_kosten', 'Vakantie/Reizen', 0.90),
+    ('D-REIZEN', 'variabele_kosten', 'Vakantie/Reizen', 0.99),
+    ('ROOMPOT', 'variabele_kosten', 'Vakantie/Reizen', 0.99),
+    ('LANDAL', 'variabele_kosten', 'Vakantie/Reizen', 0.99),
+    ('CENTER PARCS', 'variabele_kosten', 'Vakantie/Reizen', 0.99),
+    ('EUROCAMP', 'variabele_kosten', 'Vakantie/Reizen', 0.99),
+    # Restaurant/Uit eten
+    ('MCDONALDS', 'variabele_kosten', 'Restaurant/Uit eten', 0.95),
+    ('MCDONALD', 'variabele_kosten', 'Restaurant/Uit eten', 0.95),
+    ('BURGER KING', 'variabele_kosten', 'Restaurant/Uit eten', 0.95),
+    ('STARBUCKS', 'variabele_kosten', 'Restaurant/Uit eten', 0.90),
+    ('SUBWAY', 'variabele_kosten', 'Restaurant/Uit eten', 0.90),
+    ('FEBO', 'variabele_kosten', 'Restaurant/Uit eten', 0.95),
+    ('DUNKIN', 'variabele_kosten', 'Restaurant/Uit eten', 0.90),
+    ('NEW YORK PIZZA', 'variabele_kosten', 'Restaurant/Uit eten', 0.95),
+    ('DOMINOS', 'variabele_kosten', 'Restaurant/Uit eten', 0.95),
+    ('VAPIANO', 'variabele_kosten', 'Restaurant/Uit eten', 0.95),
+    ('LA PLACE', 'variabele_kosten', 'Restaurant/Uit eten', 0.90),
+    # Huishoudelijke artikelen
     ('ACTION', 'variabele_kosten', 'Huishoudelijke artikelen', 0.85),
     ('HEMA', 'variabele_kosten', 'Huishoudelijke artikelen', 0.80),
-    # Apotheek
+    ('IKEA', 'variabele_kosten', 'Huishoudelijke artikelen', 0.90),
+    ('BLOKKER', 'variabele_kosten', 'Huishoudelijke artikelen', 0.90),
+    ('XENOS', 'variabele_kosten', 'Huishoudelijke artikelen', 0.90),
+    ('FLYING TIGER', 'variabele_kosten', 'Huishoudelijke artikelen', 0.90),
+    # Bouwmarkt/Tuin
+    ('GAMMA', 'variabele_kosten', 'Doe-het-zelf/Tuin', 0.95),
+    ('KARWEI', 'variabele_kosten', 'Doe-het-zelf/Tuin', 0.95),
+    ('PRAXIS', 'variabele_kosten', 'Doe-het-zelf/Tuin', 0.95),
+    ('HORNBACH', 'variabele_kosten', 'Doe-het-zelf/Tuin', 0.95),
+    ('FORMIDO', 'variabele_kosten', 'Doe-het-zelf/Tuin', 0.95),
+    ('INTRATUIN', 'variabele_kosten', 'Doe-het-zelf/Tuin', 0.95),
+    ('TUINCENTRUM', 'variabele_kosten', 'Doe-het-zelf/Tuin', 0.90),
+    # Apotheek/Medisch
     ('BENU', 'variabele_kosten', 'Apotheek/Medicijnen', 0.95),
     ('APOTHEEK', 'variabele_kosten', 'Apotheek/Medicijnen', 0.90),
+    ('SPECSAVERS', 'variabele_kosten', 'Medisch/Zorgkosten', 0.90),
+    ('PEARLE', 'variabele_kosten', 'Medisch/Zorgkosten', 0.90),
+    ('HANS ANDERS', 'variabele_kosten', 'Medisch/Zorgkosten', 0.90),
+    ('TANDARTS', 'variabele_kosten', 'Medisch/Zorgkosten', 0.95),
+    ('FYSIOTHERAP', 'variabele_kosten', 'Medisch/Zorgkosten', 0.95),
+    ('HUISARTS', 'variabele_kosten', 'Medisch/Zorgkosten', 0.95),
+    # Huisdieren
+    ('PETS PLACE', 'variabele_kosten', 'Huisdieren', 0.99),
+    ('DIERENSPECIAALZAAK', 'variabele_kosten', 'Huisdieren', 0.95),
+    ('DIERENARTS', 'variabele_kosten', 'Huisdieren', 0.95),
+    # Auto-onderhoud
+    ('APK ', 'variabele_kosten', 'Auto-onderhoud/APK', 0.90),
+    ('KWIK FIT', 'variabele_kosten', 'Auto-onderhoud/APK', 0.99),
+    ('EUROMASTER', 'variabele_kosten', 'Auto-onderhoud/APK', 0.95),
+    ('PROFILE TYRECENTER', 'variabele_kosten', 'Auto-onderhoud/APK', 0.95),
+    ('HALFORDS', 'variabele_kosten', 'Auto-onderhoud/APK', 0.90),
+    # Cadeaus/Bloemen
+    ('GREETZ', 'variabele_kosten', 'Cadeaus/Sinterklaas/Kerst', 0.90),
+    ('HALLMARK', 'variabele_kosten', 'Cadeaus/Sinterklaas/Kerst', 0.90),
+    ('BRUNA', 'variabele_kosten', 'Cadeaus/Sinterklaas/Kerst', 0.80),
 
     # --- SPAREN & BELEGGEN ---
     ('SAXO BANK', 'sparen_beleggen', 'Effectenrekening', 0.95),
@@ -914,16 +1246,27 @@ MERCHANT_MAPPING = [
     ('DEGIRO', 'sparen_beleggen', 'Effectenrekening', 0.95),
     ('IBKR', 'sparen_beleggen', 'Effectenrekening', 0.95),
     ('INTERACTIVE BROKERS', 'sparen_beleggen', 'Effectenrekening', 0.95),
+    ('BINCK', 'sparen_beleggen', 'Effectenrekening', 0.95),
+    ('LYNX', 'sparen_beleggen', 'Effectenrekening', 0.95),
+    ('FLATEX', 'sparen_beleggen', 'Effectenrekening', 0.95),
+    ('ETORO', 'sparen_beleggen', 'Effectenrekening', 0.95),
+    ('TRADING 212', 'sparen_beleggen', 'Effectenrekening', 0.95),
+    ('BITVAVO', 'sparen_beleggen', 'Crypto', 0.99),
+    ('COINBASE', 'sparen_beleggen', 'Crypto', 0.99),
+    ('KRAKEN', 'sparen_beleggen', 'Crypto', 0.90),
     ('MINTOS', 'sparen_beleggen', 'Crowdlending', 0.99),
     ('LENDAHAND', 'sparen_beleggen', 'Crowdlending', 0.99),
     ('PEERBERRY', 'sparen_beleggen', 'Crowdlending', 0.99),
     ('BRAND NEW DAY', 'sparen_beleggen', 'Pensioenopbouw', 0.99),
+    ('MEESMAN', 'sparen_beleggen', 'Effectenrekening', 0.99),
+    ('NORTHERN TRUST', 'sparen_beleggen', 'Effectenrekening', 0.90),
 
     # --- CREDITCARD (geen consumptie, interne verschuiving) ---
     ('ICS/INT CARD', 'intern', 'Creditcard-aflossing', 0.90),
     ('ICS ', 'intern', 'Creditcard-aflossing', 0.85),
     ('INTERNATIONAL CARD SERVICES', 'intern', 'Creditcard-aflossing', 0.95),
     ('VISA CARD', 'intern', 'Creditcard-aflossing', 0.85),
+    ('ADYEN', 'intern', 'Creditcard-aflossing', 0.80),
 
     # --- TIKKIE (terugbetaling gedeelde kosten, geen inkomen) ---
     ('TIKKIE', 'intern', 'Tikkie-terugbetaling', 0.90),
@@ -1366,6 +1709,87 @@ def _detecteer_huurinkomsten(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# CONSISTENTIE-AFDWINGING: zelfde IBAN → zelfde categorie
+# ---------------------------------------------------------------------------
+
+def _afdwing_iban_consistentie(df: pd.DataFrame) -> pd.DataFrame:
+    """Zorg dat transacties met dezelfde Tegenrekening (IBAN) consistent geclassificeerd worden.
+
+    Twee stappen:
+    1. PROPAGATIE: Als een IBAN al rule-based geclassificeerd is, geef ALLE transacties
+       met die IBAN dezelfde classificatie (mits zelfde richting: in/uit).
+    2. MAJORITY VOTE: Als een IBAN meerdere keren voorkomt en de AI het inconsistent
+       classificeert, wordt dit later in de prompt-hint afgevangen.
+
+    Dit draait NA _classificeer_rule_based + _detecteer_vast_inkomen + _detecteer_huurinkomsten.
+    """
+    if 'Tegenrekening' not in df.columns or 'classificatie_bron' not in df.columns:
+        return df
+
+    n_gepropageerd = 0
+
+    # Stap 1: Vind alle IBANs die al een rule-based classificatie hebben
+    df_regel = df[(df['classificatie_bron'] == 'rule') & df['Tegenrekening'].notna()].copy()
+    df_regel = df_regel[df_regel['Tegenrekening'].str.len() > 5]
+
+    if len(df_regel) == 0:
+        logger.info("CONSISTENTIE: geen IBANs met rule-based classificatie gevonden")
+        return df
+
+    # Bouw lookup: IBAN + richting → (sectie, categorie, confidence)
+    iban_classificatie = {}
+    for iban, groep in df_regel.groupby('Tegenrekening'):
+        # Splits per richting (positief = inkomend, negatief = uitgaand)
+        for richting in ['in', 'uit']:
+            if richting == 'in':
+                sub = groep[groep['bedrag'] > 0]
+            else:
+                sub = groep[groep['bedrag'] < 0]
+
+            if len(sub) == 0:
+                continue
+
+            # Majority vote: welke sectie+categorie komt het vaakst voor?
+            classificaties = sub.groupby(['regel_sectie', 'regel_categorie']).size()
+            beste = classificaties.idxmax()
+            iban_classificatie[(iban, richting)] = {
+                'sectie': beste[0],
+                'categorie': beste[1],
+                'count': int(classificaties[beste]),
+                'total': len(sub)
+            }
+
+    # Stap 2: Propageer naar niet-geclassificeerde transacties met dezelfde IBAN
+    mask_onbekend = (df['classificatie_bron'].isna()) & (~df.get('is_intern', False)) & df['Tegenrekening'].notna()
+    df_onbekend = df[mask_onbekend]
+
+    for idx, row in df_onbekend.iterrows():
+        iban = row['Tegenrekening']
+        if not iban or len(str(iban)) < 5:
+            continue
+
+        richting = 'in' if row['bedrag'] > 0 else 'uit'
+        key = (iban, richting)
+
+        if key in iban_classificatie:
+            info = iban_classificatie[key]
+            # Alleen propageren als we ≥2 bevestigde transacties hebben (of 1 met hoge confidence)
+            if info['count'] >= 2 or info['total'] >= 2:
+                df.at[idx, 'regel_sectie'] = info['sectie']
+                df.at[idx, 'regel_categorie'] = info['categorie']
+                df.at[idx, 'classificatie_bron'] = 'rule'
+                df.at[idx, 'regel_confidence'] = 0.85
+                n_gepropageerd += 1
+
+    if n_gepropageerd > 0:
+        logger.info(f"CONSISTENTIE: {n_gepropageerd} transacties gepropageerd via IBAN-matching")
+    else:
+        logger.info("CONSISTENTIE: geen extra transacties gepropageerd")
+
+    return df
+
+
+# ---------------------------------------------------------------------------
 # STAP 2: DETERMINISTISCH REKENEN
 # ---------------------------------------------------------------------------
 
@@ -1431,7 +1855,10 @@ def bereken_top(df: pd.DataFrame, n: int = 15) -> dict:
     resultaat = {}
     for rekening in sorted(df['Rekeningnummer'].unique()):
         rdf = df[df['Rekeningnummer'] == rekening].copy()
-        rdf['tegenpartij'] = rdf['Omschrijving'].apply(extract_naam)
+        # Gebruik geëxtraheerde naam als beschikbaar, anders fallback op extract_naam
+        rdf['tegenpartij'] = rdf.apply(
+            lambda r: r['tegenpartij_naam'] if r.get('tegenpartij_naam') else extract_naam(r['Omschrijving']),
+            axis=1)
 
         top_uit = (rdf[rdf['bedrag'] < 0]
                    .groupby('tegenpartij')['bedrag']
@@ -1499,9 +1926,20 @@ def bouw_prompt(df: pd.DataFrame, feiten: dict, top: dict, eigen_rekeningen: set
         pre_class = ''
         if row.get('classificatie_bron') == 'rule' and row.get('regel_categorie'):
             pre_class = f'|[REGEL:{row["regel_sectie"]}:{row["regel_categorie"]}]'
+
+        # Gebruik gestructureerde omschrijving als beschikbaar (tegenpartij — kenmerk)
+        # Dit is veel duidelijker voor de AI dan de ruwe bankomschrijving
+        omschr = str(row.get('omschrijving_schoon') or row['Omschrijving'])[:250]
+
+        # Voeg tegenpartij IBAN toe als beschikbaar (helpt bij consistentie)
+        iban_hint = ''
+        tr = row.get('Tegenrekening', '')
+        if tr and str(tr).startswith('NL'):
+            iban_hint = f'|IBAN:{tr}'
+
         regels.append(
             f"{row['datum'].strftime('%Y-%m-%d')}|{row['Rekeningnummer']}|"
-            f"{row['bedrag']:>10.2f}|{str(row['Omschrijving'])[:200]}{pre_class}"
+            f"{row['bedrag']:>10.2f}|{omschr}{iban_hint}{pre_class}"
         )
 
     # Eigen rekeningen info voor in de prompt
@@ -1557,11 +1995,11 @@ ABSOLUUT VERPLICHT:
 - RICHTING: Positief bedrag van een winkel/tankstation = Retour/Terugbetaling, NIET een inkomstencategorie.
   Positief bedrag van een B.V./Stichting/werkgever = wél inkomen.
 
-## ABN AMRO TRANSACTIEFORMAAT
-ABN-omschrijvingen zijn lang (150-200 tekens). De tegenpartijnaam staat vaak PAS NA "Naam:" of "NAME/".
-Voorbeeld: "/TRTP/SEPA OVERBOEKING/IBAN/NL50BUNQ2208185153/BIC/BUNQNL2A/NAME/Sevi B.V./REMI/2025 12 Sevi"
-→ De naam "Sevi B.V." staat pas op positie ~90. LEES ALTIJD DE HELE OMSCHRIJVING.
-ING-omschrijvingen bevatten de naam juist aan het BEGIN.
+## TRANSACTIEFORMAAT
+Elke transactie heeft het formaat: datum|rekening|bedrag|omschrijving[|IBAN:tegenrekening][|REGEL:sectie:categorie]
+De omschrijving is gestructureerd als "Tegenpartij — Kenmerk" (bv "Sevi B.V. — 2025 12 Sevi").
+Als IBAN beschikbaar is, gebruik deze voor consistentie: dezelfde IBAN = altijd dezelfde categorie.
+Let op: sommige transacties hebben nog ruwe bankomschrijvingen — lees dan de HELE tekst om de naam te vinden.
 
 2. INKOMSTEN (12 categorieën):
    - Netto salaris (loon van werkgever of eigen BV)
@@ -3102,8 +3540,9 @@ def _run_rapport_pipeline(job_id: str, bestanden: list, email: str):
         df = pd.concat(dfs, ignore_index=True)
         update(f'{len(df)} transacties ingelezen uit {len(bestanden)} bestand(en)', 15)
 
-        # 1a2. IBAN extractie uit omschrijvingen (essentieel voor ABN XLSX)
-        df = _vul_lege_tegenrekening(df)
+        # 1a2. Transactie-verrijking: naam-extractie + IBAN-extractie uit omschrijvingen
+        update('Transacties verrijken...', 16)
+        df = _verrijk_transactie_velden(df)
 
         # 1b. Huishoudregister & interne-overboekingen detectie
         update('Eigen rekeningen herkennen...', 17)
@@ -3136,6 +3575,14 @@ def _run_rapport_pipeline(job_id: str, bestanden: list, email: str):
             update(f'{n_patroon} extra transacties via patroondetectie', 25)
         else:
             update('Patroondetectie afgerond', 25)
+
+        # 1e. Consistentie-afdwinging: propageer classificaties via IBAN
+        update('Consistentie afdwingen...', 26)
+        df = _afdwing_iban_consistentie(df)
+        n_regel_final = len(df[df['classificatie_bron'] == 'rule'])
+        n_consistentie = n_regel_final - n_regel_na
+        if n_consistentie > 0:
+            update(f'{n_consistentie} extra transacties via IBAN-consistentie', 26)
 
         # 2. Deterministisch rekenen
         update('Bedragen berekenen en controleren...', 27)

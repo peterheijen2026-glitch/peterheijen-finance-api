@@ -1454,6 +1454,29 @@ def _resolve_related_parties(df: pd.DataFrame, eigen_rekeningen: set,
             iban_signals[iban] = signals
             continue
 
+        # --- FASE 2B: Household via achternaam + gedragspatroon ---
+        # GENERIEK: klanten hebben vaak 5-8 rekeningen maar uploaden er 3-4.
+        # Transfers van eigen rekeningen bij andere banken, of van partner
+        # bij een andere bank, verschijnen als "extern inkomen".
+        #
+        # Regel: zelfde achternaam + privépersoon + geen economische relatie
+        #        → household_related_party
+        #
+        # Dit vangt:
+        # - Self-transfers van niet-geüploade eigen rekeningen (Bunq, N26, Revolut)
+        # - Partner-transfers van niet-geüploade rekeningen
+        # - Familieleden die geld overmaken
+        #
+        # False positive bescherming:
+        # - s9 = False: geen B.V./Stichting (dus geen zakelijke relatie)
+        # - s7 = True: geen salaris/huur/factuur keywords (geen economische relatie)
+        # - Alleen privépersonen met dezelfde achternaam
+        if s1 and not s9 and s7:
+            iban_party_type[iban] = 'household_related_party'
+            signals.append('HOUSEHOLD_VIA_ACHTERNAAM_GEDRAG')
+            iban_signals[iban] = signals
+            continue
+
         # --- FASE 3: Business-related ---
         if s9 and s1:
             # Candidate: S9 + S1 — check voor extra bewijs
@@ -2225,29 +2248,71 @@ def _detecteer_vast_inkomen(df: pd.DataFrame) -> pd.DataFrame:
     # LAAG 2: RECHTSVORM — B.V., Stichting, N.V., Gemeente, etc.
     # =========================================================================
     # =========================================================================
-    # ZAKELIJKE REKENING DETECTIE (simpel & robuust)
+    # ZAKELIJKE REKENING DETECTIE v2 (generiek voor alle Nederlandse banken)
     # =========================================================================
-    # Bij interne transfers (tussen eigen rekeningen) staat de tegenpartij-naam
-    # in de omschrijving. Als die naam BV/Holding bevat → die Tegenrekening
-    # is een zakelijke rekening. Simpel, geen false positives.
-    _BV_DETECT_MARKERS = ['B.V.', ' BV ', ' BV,', 'B.V ', ' B.V', ' BV.',
-                          'HOLDING', 'HLDG']
+    # Detecteert welke van de geüploade rekeningen een zakelijke rekening is.
+    # Twee methoden:
+    #   A) BV/Holding in tegenpartijnaam bij interne transfers (alle formatting-varianten)
+    #   B) Bank-specifieke account type labels ("Ondernemersrekening", "Zakelijke rekening")
+    # Werkt voor: ABN AMRO, ING, Rabo, Triodos, Bunq, Knab, ASN, RegioBank, SNS
+    #
+    # GENERIEK: elke DGA bij elke Nederlandse bank profiteert hiervan.
+
+    # BV/Holding naammarkers — alle formatting-varianten die banken gebruiken
+    # Banken formatteren "B.V." inconsistent: met/zonder punten, met/zonder spaties
+    _BV_DETECT_MARKERS = [
+        'B.V.', ' BV ', ' BV,', 'B.V ', ' B.V', ' BV.',
+        ' B V ', ' B V,', ' B V.', 'B V ',   # spatie-variant (ABN AMRO)
+        ' B V', 'B V',                         # einde-van-string variant
+        ' BV',                                  # einde-van-string "PIETERSEN BV"
+        'HOLDING', 'HLDG',
+    ]
+
+    # Bank-specifieke account type labels die "zakelijk" aanduiden
+    # Nederlandse banken gebruiken deze termen bij interne overboekingen
+    _ZAKELIJK_ACCOUNT_LABELS = [
+        'ONDERNEMERSREKENING', 'ZAKELIJKE REKENING', 'BEDRIJFSREKENING',
+        'BUSINESS ACCOUNT', 'ZAKELIJKREKENING',
+    ]
+
+    # Privé account type labels — als je HIERNAARTOE overmaakt, is de BRON zakelijk
+    _PRIVE_ACCOUNT_LABELS = [
+        'PRIVEREKENING', 'PRIVÉREKENING', 'PRIVE REKENING', 'PRIVÉ REKENING',
+        'PRIVATE ACCOUNT',
+    ]
+
     _zakelijke_rekeningen = set()  # Set van Rekeningnummer-strings
     if 'Rekeningnummer' in df.columns and 'Tegenrekening' in df.columns:
         eigen_genorm = set(_normaliseer_iban(str(r)) for r in df['Rekeningnummer'].unique()
                           if str(r).strip() and str(r).strip() != 'Onbekend')
         df_intern = df[df['is_intern']].copy()
-        # Scan interne transfers: als tegenpartij BV/Holding in naam heeft
-        # → die Tegenrekening is de BV-rekening
+
         _bv_ibans = set()
         for _, row in df_intern.iterrows():
             omschr = str(row.get('Omschrijving', '')).upper()
             tegen_naam = str(row.get('tegenpartij_naam', '')).upper()
             tekst = omschr + ' ' + tegen_naam
+
+            tegen_iban = _normaliseer_iban(str(row.get('Tegenrekening', '')))
+            bron_iban = _normaliseer_iban(str(row.get('Rekeningnummer', '')))
+
+            # Methode A: BV/Holding in tegenpartij naam → Tegenrekening is zakelijk
             if any(m in tekst for m in _BV_DETECT_MARKERS):
-                tegen_iban = _normaliseer_iban(str(row.get('Tegenrekening', '')))
                 if tegen_iban and tegen_iban in eigen_genorm:
                     _bv_ibans.add(tegen_iban)
+
+            # Methode B: Bank account type label = "Ondernemersrekening" →
+            # de Tegenrekening is de zakelijke rekening
+            elif any(label in tegen_naam for label in _ZAKELIJK_ACCOUNT_LABELS):
+                if tegen_iban and tegen_iban in eigen_genorm:
+                    _bv_ibans.add(tegen_iban)
+
+            # Methode C: Tegenpartij = "Priverekening" → de BRON is de zakelijke rekening
+            # (je zit op je BV en maakt over naar je privé)
+            elif any(label in tegen_naam for label in _PRIVE_ACCOUNT_LABELS):
+                if bron_iban and bron_iban in eigen_genorm:
+                    _bv_ibans.add(bron_iban)
+
         # Map BV-IBANs terug naar Rekeningnummer strings
         for rek in df['Rekeningnummer'].unique():
             if _normaliseer_iban(str(rek)) in _bv_ibans:
@@ -3250,21 +3315,71 @@ def _classify_positive_inflows(df: pd.DataFrame, eigen_fi_ibans: set = None,
             # 'reject' = exclusion check gefaald, doorschuiven naar uncertainty gate
 
     # ===================================================================
+    # FASE 2.5: HUISHOUD/SELF-TRANSFERS — household_related_party → neutraal
+    # ===================================================================
+    # GENERIEK: bij elke klant zijn er transfers van partner, familie, of
+    # eigen rekeningen bij andere banken. RPR labelt deze als
+    # household_related_party. Ze zijn al geblokkeerd voor salary (goed),
+    # maar zonder deze stap vallen ze in de uncertainty gate als "Onzeker
+    # positief" (slecht). Dit routeert ze naar onderling_neutraal.
+    #
+    # Werkt voor: DGA die geld verschuift, tweeverdiener met gescheiden
+    # bankrekeningen, gezin met onderlinge betalingen, etc.
+    alle_handled = fase1_handled | refund_handled | rent_handled | salary_handled
+    pre_uncertainty_rest = mask & (~df.index.isin(alle_handled))
+    household_handled = set()
+
+    for idx in df[pre_uncertainty_rest].index:
+        row = df.loc[idx]
+        pt = row.get('party_type', '')
+        if pt in ('household_related_party', 'own_account'):
+            bedrag = float(row.get('bedrag', 0))
+            if pt == 'own_account':
+                _apply(idx, 'internal_transfer', 'onderling_neutraal',
+                       'Eigen overboeking (niet-geüpload)', 0.80)
+            else:
+                _apply(idx, 'household_transfer', 'onderling_neutraal',
+                       'Huishoudtransfer', 0.70)
+            household_handled.add(idx)
+            stats.setdefault('household_transfer', 0)
+            stats['household_transfer'] = stats.get('household_transfer', 0) + 1
+            herclassificaties.append((idx, 'Fase 2.5', 'household_transfer',
+                                      f'{pt} → onderling_neutraal',
+                                      f'party_type={pt}, bedrag={bedrag:.0f}'))
+
+    if household_handled:
+        logger.info(f"HOUSEHOLD ROUTING: {len(household_handled)} transacties → onderling_neutraal")
+
+    # ===================================================================
     # FASE 3: UNCERTAINTY GATE — alles wat overblijft
     # ===================================================================
-    alle_handled = fase1_handled | refund_handled | rent_handled | salary_handled
+    alle_handled = alle_handled | household_handled
     final_rest = mask & (~df.index.isin(alle_handled))
 
     # Mapping van subcategorie → (sectie, inflow_type, confidence)
+    # GENERIEK: elke subcategorie die we herkennen krijgt een specifieke sectie
+    # zodat het niet in de generieke "Onzeker positief" valt.
     _UNCERTAINTY_SECTIE = {
+        # --- Neutraal / onderling ---
         'Terugbetaling/Tikkie': ('onderling_neutraal', 'tikkie_refund', 0.75),
-        'Verkoop (tweedehands)': ('inkomsten', 'marketplace_sale', 0.70),
-        'Cashback/Spaarprogramma': ('variabele_kosten', 'cashback', 0.75),
-        'Notaris/Woningtransactie': ('inkomsten', 'property_transaction', 0.60),
         'Onderlinge betaling (privépersoon)': ('onderling_neutraal', 'private_transfer', 0.50),
         'Onderlinge betaling (klein bedrag)': ('onderling_neutraal', 'private_transfer', 0.60),
         'Overige bijschrijving (klein)': ('onderling_neutraal', 'misc_small', 0.50),
         'Overige bijschrijving': ('onderling_neutraal', 'misc_inflow', 0.40),
+        # --- Verzekeraar/financieel ---
+        'Onzeker positief (verzekeraar)': ('variabele_kosten', 'insurance_payout', 0.65),
+        'Onzeker positief (financiële instelling)': ('onderling_neutraal', 'financial_transfer', 0.55),
+        # --- Bedrijf/organisatie —-- specifiekere routing
+        'Onzeker positief (bedrijf/organisatie)': ('inkomsten', 'business_income_uncertain', 0.45),
+        'Onzeker positief (bedrijf, klein bedrag)': ('onderling_neutraal', 'business_small', 0.50),
+        # --- Bidirectioneel ---
+        'Onzeker positief (bidirectioneel)': ('onderling_neutraal', 'bidirectional_transfer', 0.55),
+        # --- Privépersoon groot bedrag ---
+        'Onzeker positief (privépersoon, groot bedrag)': ('onderling_neutraal', 'private_large', 0.40),
+        # --- Verkoop / cashback ---
+        'Verkoop (tweedehands)': ('inkomsten', 'marketplace_sale', 0.70),
+        'Cashback/Spaarprogramma': ('variabele_kosten', 'cashback', 0.75),
+        'Notaris/Woningtransactie': ('inkomsten', 'property_transaction', 0.60),
     }
     n_reclassified = 0  # teller voor specifiek herkende subcategorieën
 

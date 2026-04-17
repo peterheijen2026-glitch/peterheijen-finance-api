@@ -1920,15 +1920,26 @@ def bouw_prompt(df: pd.DataFrame, feiten: dict, top: dict, eigen_rekeningen: set
             logger.info(f"Prompt: {n_intern_regel} regel-intern transacties (Tikkie/creditcard) verwijderd uit AI-lijst")
             df_extern = df_extern[~intern_regel_mask].copy()
 
-    regels = []
-    for _, row in df_extern.iterrows():
-        # Als rule-based geclassificeerd: voeg classificatie toe als hint voor AI
-        pre_class = ''
-        if row.get('classificatie_bron') == 'rule' and row.get('regel_categorie'):
-            pre_class = f'|[REGEL:{row["regel_sectie"]}:{row["regel_categorie"]}]'
+    # =========================================================================
+    # SPLIT: rule-based transacties gaan NIET naar de AI
+    # De AI classificeert ALLEEN onbekende transacties. Rule-based totalen
+    # worden apart berekend uit het DataFrame en na afloop gemerged.
+    # Dit voorkomt dubbeltelling per definitie.
+    # =========================================================================
+    if 'classificatie_bron' in df_extern.columns:
+        df_ai_only = df_extern[df_extern['classificatie_bron'] != 'rule'].copy()
+        df_rule = df_extern[df_extern['classificatie_bron'] == 'rule'].copy()
+        n_preclassified = len(df_rule)
+    else:
+        df_ai_only = df_extern.copy()
+        df_rule = pd.DataFrame()
+        n_preclassified = 0
 
+    logger.info(f"Prompt: {len(df_ai_only)} transacties naar AI, {n_preclassified} rule-based (apart berekend)")
+
+    regels = []
+    for _, row in df_ai_only.iterrows():
         # Gebruik gestructureerde omschrijving als beschikbaar (tegenpartij — kenmerk)
-        # Dit is veel duidelijker voor de AI dan de ruwe bankomschrijving
         omschr = str(row.get('omschrijving_schoon') or row['Omschrijving'])[:250]
 
         # Voeg tegenpartij IBAN toe als beschikbaar (helpt bij consistentie)
@@ -1939,8 +1950,20 @@ def bouw_prompt(df: pd.DataFrame, feiten: dict, top: dict, eigen_rekeningen: set
 
         regels.append(
             f"{row['datum'].strftime('%Y-%m-%d')}|{row['Rekeningnummer']}|"
-            f"{row['bedrag']:>10.2f}|{omschr}{iban_hint}{pre_class}"
+            f"{row['bedrag']:>10.2f}|{omschr}{iban_hint}"
         )
+
+    # Samenvatting van rule-based classificaties als context voor de AI
+    rule_samenvatting = ""
+    if n_preclassified > 0:
+        rule_cats = df_rule.groupby(['regel_sectie', 'regel_categorie'])['bedrag'].agg(['sum', 'count'])
+        rule_samenvatting = "\n## AL GECLASSIFICEERDE TRANSACTIES (niet in onderstaande lijst)\n"
+        rule_samenvatting += f"Er zijn {n_preclassified} transacties al deterministisch geclassificeerd. "
+        rule_samenvatting += "Deze zitten NIET in de lijst hieronder — jij hoeft ze NIET te classificeren.\n"
+        rule_samenvatting += "Samenvatting ter context:\n"
+        for (sectie, cat), row in rule_cats.iterrows():
+            rule_samenvatting += f"- {sectie}/{cat}: {int(row['count'])}x, EUR {row['sum']:,.2f}\n"
+        rule_samenvatting += "\nDeze bedragen worden automatisch samengevoegd met jouw classificatie.\n"
 
     # Eigen rekeningen info voor in de prompt
     eigen_rek_tekst = ""
@@ -1963,27 +1986,14 @@ Totaal afschrijvingen (verzending eigen rekening): EUR {bedrag_intern_uit:,.2f}
 Deze tellen NIET mee als inkomen of uitgave. Ze worden apart in het rapport vermeld.
 """
 
-    # Tel pre-geclassificeerde transacties
-    n_preclassified = len(df_extern[df_extern.get('classificatie_bron', pd.Series()) == 'rule']) if 'classificatie_bron' in df_extern.columns else 0
-
     return f"""Je bent een financieel analist voor vermogende particulieren en DGA's in Nederland.
-Hieronder staan {len(df_extern)} banktransacties (interne overboekingen, Tikkies en creditcard-aflossingen zijn al verwijderd).
-{eigen_rek_tekst}{intern_tekst}
+Hieronder staan {len(df_ai_only)} banktransacties die JIJ moet classificeren.
+{rule_samenvatting}{eigen_rek_tekst}{intern_tekst}
 
-## PRE-CLASSIFICATIE
-Van de {len(df_extern)} transacties zijn er {n_preclassified} al rule-based geclassificeerd.
-Deze transacties hebben een [REGEL:sectie:Categorie] tag achter de omschrijving, bv [REGEL:variabele_kosten:Benzine/Diesel/Laden].
-ABSOLUUT VERPLICHT:
-- Je MOET deze classificaties EXACT overnemen — zowel de SECTIE als de CATEGORIE.
-- [REGEL:variabele_kosten:Benzine/Diesel/Laden] → zet in variabele_kosten als "Benzine/Diesel/Laden", ZELFS als het bedrag positief is (dat is een terugbetaling/refund).
-- [REGEL:vaste_lasten:Energie] → zet in vaste_lasten als "Energie", ZELFS als het bedrag positief is.
-- [REGEL:inkomsten:Netto salaris] → zet in inkomsten als "Netto salaris".
-- [REGEL:inkomsten:Huurinkomsten] → zet in inkomsten als "Huurinkomsten" (NIET als Netto salaris!).
-- [REGEL:inkomsten:DGA-loon/Managementfee] → zet in inkomsten als "DGA-loon/Managementfee" (NIET als Netto salaris!).
-- Een positief bedrag bij een niet-inkomsten-categorie is een TERUGBETALING, geen inkomen. Zet het in de sectie die de [REGEL:] tag aangeeft.
-- Je mag [REGEL:...] transacties NIET verplaatsen naar een andere sectie of categorie.
-- SUBCATEGORIE IS BELANGRIJK: "Huurinkomsten" ≠ "Netto salaris" ≠ "DGA-loon". Houd ze apart!
-- Categoriseer alleen de transacties ZONDER [REGEL:...] tag.
+## BELANGRIJK
+- Alle transacties hieronder zijn nog NIET geclassificeerd. Classificeer ze allemaal.
+- Er zijn daarnaast {n_preclassified} transacties al apart geclassificeerd (zie samenvatting hierboven).
+  Die worden automatisch samengevoegd — jij hoeft daar NIETS mee te doen.
 
 ## REGELS
 1. Categoriseer ELKE transactie in precies één categorie uit onderstaande lijst.
@@ -2363,153 +2373,125 @@ def _rapport_kwaliteitscheck(data: dict, df: pd.DataFrame, eigen_rekeningen: set
     return warnings_found
 
 
-def _forceer_rule_classificaties(ai_data: dict, df: pd.DataFrame) -> dict:
-    """Overschrijf AI-output met rule-based classificaties.
+def _bereken_rule_based_totalen(df: pd.DataFrame) -> dict:
+    """Bereken totalen voor rule-based geclassificeerde transacties direct uit het DataFrame.
 
-    Dit is de DEFINITIEVE correctie: als de rule-based engine een transactie heeft
-    geclassificeerd, dan is dat definitief — ongeacht wat de AI ervan vindt.
+    Dit is de GROUND TRUTH — deze cijfers komen rechtstreeks uit de bankdata,
+    niet uit de AI. Ze worden later gemerged met de AI-output.
 
-    Werkt op de jaartotalen en maandoverzicht: herberekent de bedragen per categorie
-    op basis van de rule-based tags in het DataFrame.
+    Retourneert dezelfde structuur als de AI: {rekening: {sectie: {categorie: bedrag}}}
+    Plus maandoverzicht: {rekening: {maand: {sectie: {categorie: {bedrag, aantal}}}}}
     """
-    if 'classificatie_bron' not in df.columns:
-        return ai_data
+    result = {'jaartotalen': {}, 'maandoverzicht': {}}
 
-    # Alleen externe transacties die rule-based geclassificeerd zijn
+    if 'classificatie_bron' not in df.columns:
+        return result
+
     df_regel = df[(df['classificatie_bron'] == 'rule') & (~df.get('is_intern', False))].copy()
-    # Filter ook regel_sectie == 'intern' eruit (die zitten niet in de AI output)
     df_regel = df_regel[df_regel['regel_sectie'] != 'intern']
 
     if len(df_regel) == 0:
-        logger.info("POST-PROCESSING: geen rule-based transacties om te corrigeren")
-        return ai_data
+        logger.info("RULE-TOTALEN: geen rule-based transacties")
+        return result
 
-    logger.info(f"POST-PROCESSING: {len(df_regel)} rule-based transacties forceren in AI-output")
+    # Jaartotalen: per rekening, per sectie, per categorie → som bedragen
+    for (rek, sectie, cat), groep in df_regel.groupby(
+        [df_regel['Rekeningnummer'].astype(str), 'regel_sectie', 'regel_categorie']
+    ):
+        bedrag = round(float(groep['bedrag'].sum()), 2)
 
-    # Bouw een correctie-tabel: per rekening, per sectie, per categorie → som bedragen
-    correcties = {}  # {rekening: {sectie: {categorie: bedrag}}}
-    correcties_maand = {}  # {rekening: {maand: {sectie: {categorie: {bedrag, aantal}}}}}
+        if rek not in result['jaartotalen']:
+            result['jaartotalen'][rek] = {}
+        if sectie not in result['jaartotalen'][rek]:
+            result['jaartotalen'][rek][sectie] = {}
+        result['jaartotalen'][rek][sectie][cat] = bedrag
 
-    for _, row in df_regel.iterrows():
-        rek = str(row['Rekeningnummer'])
-        sectie = row['regel_sectie']
-        cat = row['regel_categorie']
-        bedrag = float(row['bedrag'])
-        maand = row['datum'].strftime('%Y-%m') if hasattr(row['datum'], 'strftime') else str(row.get('maand', ''))
+        logger.info(f"RULE-TOTALEN: {rek}/{sectie}/{cat} = EUR {bedrag:,.2f} ({len(groep)} tx)")
 
-        # Jaartotalen
-        if rek not in correcties:
-            correcties[rek] = {}
-        if sectie not in correcties[rek]:
-            correcties[rek][sectie] = {}
-        correcties[rek][sectie][cat] = correcties[rek][sectie].get(cat, 0) + bedrag
+    # Maandoverzicht: per rekening, per maand, per sectie, per categorie
+    df_regel['_maand'] = df_regel['datum'].apply(
+        lambda d: d.strftime('%Y-%m') if hasattr(d, 'strftime') else str(d)
+    )
+    for (rek, maand, sectie, cat), groep in df_regel.groupby(
+        [df_regel['Rekeningnummer'].astype(str), '_maand', 'regel_sectie', 'regel_categorie']
+    ):
+        bedrag = round(float(groep['bedrag'].sum()), 2)
+        aantal = len(groep)
 
-        # Maandoverzicht
-        if rek not in correcties_maand:
-            correcties_maand[rek] = {}
-        if maand not in correcties_maand[rek]:
-            correcties_maand[rek][maand] = {}
-        if sectie not in correcties_maand[rek][maand]:
-            correcties_maand[rek][maand][sectie] = {}
-        if cat not in correcties_maand[rek][maand][sectie]:
-            correcties_maand[rek][maand][sectie][cat] = {'bedrag': 0, 'aantal': 0}
-        correcties_maand[rek][maand][sectie][cat]['bedrag'] += bedrag
-        correcties_maand[rek][maand][sectie][cat]['aantal'] += 1
+        if rek not in result['maandoverzicht']:
+            result['maandoverzicht'][rek] = {}
+        if maand not in result['maandoverzicht'][rek]:
+            result['maandoverzicht'][rek][maand] = {}
+        if sectie not in result['maandoverzicht'][rek][maand]:
+            result['maandoverzicht'][rek][maand][sectie] = {}
+        result['maandoverzicht'][rek][maand][sectie][cat] = {
+            'bedrag': bedrag,
+            'aantal': aantal
+        }
 
-    # STRATEGIE: Voor elke rule-based categorie berekenen we het CORRECTE totaal
-    # uit het DataFrame, en OVERSCHRIJVEN de AI-output. We verwijderen het bedrag
-    # ook uit andere AI-categorieën waar de AI het mogelijk fout heeft gezet.
-    #
-    # Probleem dat dit oplost: als de rule-engine "Huurinkomsten" zegt maar de AI
-    # het als "Netto salaris" classificeert, werd het bedrag dubbel geteld. Nu
-    # trekken we het af van ALLE AI-categorieën in dezelfde sectie (niet alleen
-    # de exacte categorie-naam) en zetten het in de juiste categorie.
+    logger.info(f"RULE-TOTALEN: {len(df_regel)} transacties in {len(result['jaartotalen'])} rekening(en)")
+    return result
 
-    jaartotalen = ai_data.get('jaartotalen', {})
-    maandoverzicht = ai_data.get('maandoverzicht', {})
 
-    # === STAP 1: Bereken totaal rule-based bedrag per rekening ===
-    # Dit is wat we uit de AI-inkomsten/uitgaven moeten verwijderen
-    rule_totaal_per_rek = {}  # {rek: {sectie: totaal_bedrag}}
-    for rek, secties in correcties.items():
-        rule_totaal_per_rek[rek] = {}
+def _merge_rule_en_ai_totalen(rule_data: dict, ai_data: dict) -> dict:
+    """Voeg rule-based totalen en AI-totalen samen.
+
+    GEEN overlap mogelijk: rule-based transacties zijn NIET naar de AI gestuurd.
+    Simpele merge: voor elke rekening/sectie/categorie → tel bedragen op.
+    Als dezelfde categorie in beide voorkomt, is dat correct (rule-based had andere
+    transacties dan de AI).
+    """
+    merged = ai_data.copy()
+
+    # === Jaartotalen mergen ===
+    ai_jaar = merged.get('jaartotalen', {})
+    for rek, secties in rule_data.get('jaartotalen', {}).items():
+        if rek not in ai_jaar:
+            ai_jaar[rek] = {}
         for sectie, cats in secties.items():
-            rule_totaal_per_rek[rek][sectie] = sum(cats.values())
-
-    # === STAP 2: Jaartotalen corrigeren ===
-    for rek, secties in correcties.items():
-        if rek not in jaartotalen:
-            jaartotalen[rek] = {}
-
-        for sectie, cats in secties.items():
-            if sectie not in jaartotalen[rek]:
-                jaartotalen[rek][sectie] = {}
-
-            rule_bedrag_in_sectie = round(sum(cats.values()), 2)
-
-            # Stap 2a: Trek het rule-bedrag af van de AI-categorie waar het
-            # waarschijnlijk fout staat. We zoeken in DEZELFDE sectie naar de
-            # grootste categorie die het bedrag zou kunnen bevatten.
-            if isinstance(jaartotalen[rek].get(sectie), dict):
-                for ai_cat, ai_bedrag in list(jaartotalen[rek][sectie].items()):
-                    if ai_cat in cats:
-                        # AI heeft dezelfde categorie — verwijder, wordt overschreven
-                        del jaartotalen[rek][sectie][ai_cat]
-
-            # Stap 2b: Zoek ook in ANDERE AI-categorieën waar de AI het fout
-            # kan hebben gezet (bv. "Netto salaris" ipv "Huurinkomsten")
-            for andere_sectie in ['inkomsten', 'vaste_lasten', 'variabele_kosten', 'sparen_beleggen']:
-                ai_sect = jaartotalen[rek].get(andere_sectie, {})
-                if not isinstance(ai_sect, dict):
-                    continue
-
-                for ai_cat in list(ai_sect.keys()):
-                    if ai_cat in cats:
-                        # Exacte match — verwijder
-                        del ai_sect[ai_cat]
-                        logger.info(f"POST-PROCESSING: '{ai_cat}' verwijderd uit AI-{andere_sectie} voor {rek}")
-
-            # Stap 2c: Zet de CORRECTE bedragen (alleen overschrijven, nooit optellen)
+            if sectie not in ai_jaar[rek]:
+                ai_jaar[rek][sectie] = {}
+            if not isinstance(ai_jaar[rek][sectie], dict):
+                ai_jaar[rek][sectie] = {}
             for cat, bedrag in cats.items():
-                bedrag_rounded = round(bedrag, 2)
-                if isinstance(jaartotalen[rek].get(sectie), dict):
-                    jaartotalen[rek][sectie][cat] = bedrag_rounded
-                    logger.info(f"POST-PROCESSING: '{cat}' = EUR {bedrag_rounded:,.2f} in {sectie} voor {rek}")
+                # Optellen: AI had andere transacties, rule had andere transacties
+                bestaand = float(ai_jaar[rek][sectie].get(cat, 0))
+                ai_jaar[rek][sectie][cat] = round(bestaand + bedrag, 2)
+                logger.info(
+                    f"MERGE: {rek}/{sectie}/{cat}: rule EUR {bedrag:,.2f} + AI EUR {bestaand:,.2f} "
+                    f"= EUR {round(bestaand + bedrag, 2):,.2f}"
+                )
+    merged['jaartotalen'] = ai_jaar
 
-    # === STAP 3: Maandoverzicht corrigeren (zelfde logica per maand) ===
-    for rek, maanden in correcties_maand.items():
-        if rek not in maandoverzicht:
-            maandoverzicht[rek] = {}
+    # === Maandoverzicht mergen ===
+    ai_maand = merged.get('maandoverzicht', {})
+    for rek, maanden in rule_data.get('maandoverzicht', {}).items():
+        if rek not in ai_maand:
+            ai_maand[rek] = {}
         for maand, secties in maanden.items():
-            if maand not in maandoverzicht[rek]:
-                maandoverzicht[rek][maand] = {}
+            if maand not in ai_maand[rek]:
+                ai_maand[rek][maand] = {}
             for sectie, cats in secties.items():
-                if sectie not in maandoverzicht[rek][maand]:
-                    maandoverzicht[rek][maand][sectie] = {}
-
-                # Verwijder exacte categorie-matches uit alle secties
-                for andere_sectie in ['inkomsten', 'vaste_lasten', 'variabele_kosten', 'sparen_beleggen']:
-                    ai_maand_sect = maandoverzicht[rek][maand].get(andere_sectie, {})
-                    if isinstance(ai_maand_sect, dict):
-                        for ai_cat in list(ai_maand_sect.keys()):
-                            if ai_cat in cats:
-                                del ai_maand_sect[ai_cat]
-
-                # Zet correcte bedragen
+                if sectie not in ai_maand[rek][maand]:
+                    ai_maand[rek][maand][sectie] = {}
+                if not isinstance(ai_maand[rek][maand][sectie], dict):
+                    ai_maand[rek][maand][sectie] = {}
                 for cat, data in cats.items():
-                    bedrag_rounded = round(data['bedrag'], 2)
-                    aantal = data['aantal']
-                    if isinstance(maandoverzicht[rek][maand].get(sectie), dict):
-                        maandoverzicht[rek][maand][sectie][cat] = {
-                            'bedrag': bedrag_rounded,
-                            'aantal': aantal
-                        }
+                    bestaand = ai_maand[rek][maand][sectie].get(cat, {'bedrag': 0, 'aantal': 0})
+                    if isinstance(bestaand, dict):
+                        b = float(bestaand.get('bedrag', 0))
+                        a = int(bestaand.get('aantal', 0))
+                    else:
+                        b = float(bestaand)
+                        a = 0
+                    ai_maand[rek][maand][sectie][cat] = {
+                        'bedrag': round(b + data['bedrag'], 2),
+                        'aantal': a + data['aantal']
+                    }
+    merged['maandoverzicht'] = ai_maand
 
-    ai_data['jaartotalen'] = jaartotalen
-    ai_data['maandoverzicht'] = maandoverzicht
-
-    logger.info("POST-PROCESSING: rule-based correcties toegepast op AI-output")
-    return ai_data
+    logger.info("MERGE: rule-based en AI totalen samengevoegd")
+    return merged
 
 
 def _vraag_claude(prompt: str, model: str) -> dict:
@@ -3677,9 +3659,17 @@ def _run_rapport_pipeline(job_id: str, bestanden: list, email: str):
         if not claude_result.get('data'):
             raise ValueError(f"AI-analyse ongeldig: {claude_result.get('error', 'onbekend')}")
 
-        # 3b. Post-processing: forceer rule-based classificaties in AI-output
-        claude_result['data'] = _forceer_rule_classificaties(claude_result['data'], df)
-        update('Rule-based correcties toegepast', 65)
+        # 3b. Rule-based totalen berekenen uit DataFrame (ground truth)
+        rule_totalen = _bereken_rule_based_totalen(df)
+        n_rule_cats = sum(
+            len(cats) for secties in rule_totalen['jaartotalen'].values()
+            for cats in secties.values()
+        )
+        logger.info(f"[{job_id}] Rule-based: {n_rule_cats} categorieën berekend uit DataFrame")
+
+        # 3c. Merge: rule-based + AI totalen samenvoegen (geen overlap)
+        claude_result['data'] = _merge_rule_en_ai_totalen(rule_totalen, claude_result['data'])
+        update('Rule-based en AI resultaten samengevoegd', 65)
 
         # 3c. Report quality checks (blokkeer bij grove fouten, raises ValueError)
         kwaliteitswaarschuwingen = _rapport_kwaliteitscheck(claude_result['data'], df, eigen_rekeningen)

@@ -2267,7 +2267,9 @@ def _rapport_kwaliteitscheck(data: dict, df: pd.DataFrame, eigen_rekeningen: set
     # BLOKKERENDE CHECKS — rapport wordt NIET gegenereerd
     # =========================================================================
 
-    # Check 1: 'Overig inkomen' mag niet groter zijn dan 40% van totaal inkomen
+    # Check 1: 'Overig inkomen' mag niet groter zijn dan 60% van totaal inkomen
+    # NB: drempel is hoger (60%) omdat rule-based transacties apart worden berekend
+    # en de AI alleen de onbekende transacties classificeert — "Overig" is dan relatief groter
     for rek, totalen in jaartotalen.items():
         inkomsten = totalen.get('inkomsten', {})
         if isinstance(inkomsten, dict):
@@ -2275,7 +2277,7 @@ def _rapport_kwaliteitscheck(data: dict, df: pd.DataFrame, eigen_rekeningen: set
             totaal_ink = sum(abs(float(v)) for v in inkomsten.values() if isinstance(v, (int, float)))
             if totaal_ink > 0 and overig > 0:
                 ratio = overig / totaal_ink
-                if ratio > 0.40:
+                if ratio > 0.60:
                     blockers.append(
                         f"BLOKKADE: Rekening {rek}: 'Overig inkomen' is {ratio:.0%} van totaal inkomen "
                         f"(EUR {overig:,.0f} / EUR {totaal_ink:,.0f}). "

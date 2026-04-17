@@ -1566,157 +1566,240 @@ def _detecteer_vast_inkomen(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def _detecteer_huurinkomsten(df: pd.DataFrame) -> pd.DataFrame:
-    """Detecteer huurinkomsten op basis van patronen — GEEN hardcoded namen.
+# ---------------------------------------------------------------------------
+# DECISION ENGINE — Evidence-Based Classifiers (Laag B)
+# ---------------------------------------------------------------------------
+# Elke classifier verzamelt onafhankelijke bewijsstukken (evidence checks)
+# en komt tot een driedelige uitkomst: likely / uncertain / reject.
+# Elke check is binair (ja/nee) en transparant uitlegbaar.
+# ---------------------------------------------------------------------------
 
-    Werkt voor ALLE verhuurders in Nederland.
+# Page-1 whitelist — ALLEEN deze categorieën tellen als structural income
+_STRUCTURAL_INCOME_WHITELIST = {
+    'Netto salaris',
+    'DGA-loon/Managementfee',
+    'Huurinkomsten',
+    'UWV/Uitkeringen',
+    'Kinderbijslag/Kindregelingen',
+    'Toeslagen',
+    'Freelance/Opdrachten',
+    'Pensioen/AOW',
+    'Studiefinanciering',
+    'Overheid overig',
+}
 
-    Heuristiek:
-    1. Zoek tegenpartijen met regelmatige POSITIEVE betalingen (minstens 4x)
-    2. Die GEEN bedrijf zijn (niet in merchant mapping, geen B.V./Holding)
-    3. Met een (semi-)vast bedrag (std < 25% van gemiddelde)
-    4. Waar het geld OVERWEGEND één kant op gaat (max 15% negatief)
-       → relaxer dan 0%, want soms geeft een verhuurder eenmalig borg terug
-    5. Met een gemiddeld bedrag van minstens €300 (realistisch voor huur)
+# Categorieën die NOOIT structural income zijn (voor quality checks)
+_UNCERTAIN_CATS = {
+    'Onzeker positief (niet-geverifieerd inkomen)',
+    'Onzeker positief',
+    'Onzeker positief (verzekeraar)',
+    'Onzeker positief (bidirectioneel)',
+    'Onzeker positief (financiële instelling)',
+}
 
-    Fallback: als Tegenrekening leeg is, groepeer op genormaliseerde naam
-    uit de omschrijving (eerste woorden, hoofdletters).
+# Rechtsvorm-markers voor employer detection
+_RECHTSVORM_MARKERS = ['B.V.', ' BV ', ' BV,', 'B.V ', ' B.V', ' BV.',
+                       'HOLDING', 'HLDG', 'STICHTING', 'VERENIGING',
+                       'N.V.', ' NV ', 'GEMEENTE', 'MINISTERIE', 'UNIVERSITEIT']
 
-    Classificeert als: inkomsten / Huurinkomsten
+
+def _rent_classifier(groep_df, df_all, groep_key, eigen_rekeningen, eigen_fi_ibans,
+                     bekende_merchants_set, heeft_tegenrek):
+    """Evidence-based rent income classifier.
+
+    9 evidence checks, driedelige uitkomst: likely / uncertain / reject.
+    Elke check is binair en uitlegbaar.
+
+    Returns: (uitkomst, categorie, evidence_dict)
+        uitkomst: 'likely' | 'uncertain' | 'reject'
+        categorie: 'Huurinkomsten' | 'Onzeker positief' | None
+        evidence_dict: {check_name: (bool, str)} voor logging
     """
-    # Alleen niet-interne, niet-reeds-geclassificeerde, POSITIEVE transacties
-    mask = (~df['is_intern']) & (df['classificatie_bron'].isna()) & (df['bedrag'] > 0)
-    df_kandidaat = df[mask].copy()
+    evidence = {}
+    tekst_alle = ' '.join(groep_df['Omschrijving'].astype(str).str.upper())
 
-    if len(df_kandidaat) == 0:
-        return df
+    # === EXCLUSION CHECKS (verplicht, allemaal ja) ===
 
-    # Bekende merchants uitsluiten
-    bekende_merchants = set()
-    for zoekterm, _, _, _ in MERCHANT_MAPPING:
-        bekende_merchants.add(zoekterm)
+    # E2: Externality — is dit een externe partij?
+    iban = groep_key if groep_key.startswith('NL') or groep_key.startswith('DE') or groep_key.startswith('BE') else ''
+    e2 = True
+    if iban:
+        if iban in eigen_rekeningen or iban in eigen_fi_ibans:
+            e2 = False
+    evidence['E2_externality'] = (e2, f'IBAN {"niet " if e2 else ""}in eigen domein')
 
-    # Rechtsvorm-markers (al afgevangen door DGA-loon detectie)
-    rechtsvorm_markers = ['B.V.', ' BV ', ' BV,', 'B.V ', ' B.V', ' BV.',
-                          'HOLDING', 'HLDG', 'STICHTING', 'VERENIGING', 'N.V.', ' NV ']
+    # E6: Not an employer — geen rechtsvorm-markers
+    e6 = not any(m in tekst_alle for m in _RECHTSVORM_MARKERS)
+    evidence['E6_not_employer'] = (e6, f'{"Geen" if e6 else "Wel"} rechtsvorm gevonden')
 
-    n_gedetecteerd = 0
+    # E7: Not a known merchant
+    e7 = not any(m in tekst_alle for m in bekende_merchants_set)
+    evidence['E7_not_merchant'] = (e7, f'{"Geen" if e7 else "Wel"} merchant match')
 
-    # Bepaal groepeersleutel: Tegenrekening (IBAN) als beschikbaar, anders naam
-    heeft_tegenrek = 'Tegenrekening' in df.columns
+    # E8: Not a financial institution
+    e8_fi = not any(kw in tekst_alle for kw in FINANCIELE_INSTELLINGEN_KEYWORDS)
+    e8_verz = not any(v in tekst_alle for v in VERZEKERAAR_NAMEN)
+    e8 = e8_fi and e8_verz
+    evidence['E8_not_fi'] = (e8, f'{"Geen" if e8 else "Wel"} FI/verzekeraar match')
 
-    if heeft_tegenrek:
-        df_kandidaat['_groep_key'] = df_kandidaat['Tegenrekening'].apply(_normaliseer_iban)
-        # Fallback voor lege tegenrekening: gebruik eerste 3 woorden van omschrijving
-        lege_mask = df_kandidaat['_groep_key'] == ''
-        if lege_mask.any():
-            df_kandidaat.loc[lege_mask, '_groep_key'] = (
-                df_kandidaat.loc[lege_mask, 'Omschrijving']
-                .astype(str).str.upper().str.split().str[:3].str.join(' ')
-            )
+    # Als één exclusion check faalt → REJECT
+    if not (e2 and e6 and e7 and e8):
+        failed = [k for k, (v, _) in evidence.items() if not v]
+        return ('reject', None, evidence)
+
+    # === EVIDENCE CHECKS ===
+
+    # E1: Recurring counterparty — minstens 3 positieve transacties
+    e1 = len(groep_df) >= 3
+    evidence['E1_recurring'] = (e1, f'{len(groep_df)} transacties')
+
+    if not e1:
+        return ('reject', None, evidence)  # Te weinig data
+
+    # E3: Amount stability — IQR < 30% van mediaan (robuust tegen outliers)
+    bedragen = groep_df['bedrag'].astype(float)
+    mediaan = bedragen.median()
+
+    # Outlier-filter: verwijder bedragen < 25% van mediaan
+    kern_bedragen = bedragen[bedragen >= mediaan * 0.25]
+    if len(kern_bedragen) < 3:
+        e3 = False
+        variatie = 1.0
     else:
-        # Geen Tegenrekening kolom: groepeer op eerste 3 woorden van omschrijving
-        df_kandidaat['_groep_key'] = (
-            df_kandidaat['Omschrijving']
-            .astype(str).str.upper().str.split().str[:3].str.join(' ')
-        )
-
-    df_kandidaat = df_kandidaat[df_kandidaat['_groep_key'] != '']
-
-    for groep_key, groep in df_kandidaat.groupby('_groep_key'):
-        if len(groep) < 4:
-            continue
-
-        # Check: geen rechtsvorm (die zijn al DGA-loon of bedrijf)
-        omschr_alle = ' '.join(groep['Omschrijving'].astype(str).str.upper())
-        is_rechtsvorm = any(m in omschr_alle for m in rechtsvorm_markers)
-        if is_rechtsvorm:
-            continue
-
-        # Check: geen bekende merchant
-        is_merchant = False
-        for merchant_zoek in bekende_merchants:
-            if merchant_zoek in omschr_alle:
-                is_merchant = True
-                break
-        if is_merchant:
-            continue
-
-        # Check: OVERWEGEND unidirectioneel (max 15% negatieve transacties)
-        # Dit is relaxer dan "absoluut geen negatief", want soms geeft een
-        # verhuurder borg terug of corrigeert een bedrag.
-        if heeft_tegenrek:
-            # Zoek ALLE transacties (ook negatieve) van deze tegenpartij
-            df['_temp_groep'] = df['Tegenrekening'].apply(_normaliseer_iban)
-            lege_temp = df['_temp_groep'] == ''
-            if lege_temp.any():
-                df.loc[lege_temp, '_temp_groep'] = (
-                    df.loc[lege_temp, 'Omschrijving']
-                    .astype(str).str.upper().str.split().str[:3].str.join(' ')
-                )
-            alle_van_tegenpartij = df[
-                (df['_temp_groep'] == groep_key) & (~df['is_intern'])
-            ]
-            df.drop(columns=['_temp_groep'], inplace=True)
-        else:
-            df['_temp_groep'] = (
-                df['Omschrijving'].astype(str).str.upper().str.split().str[:3].str.join(' ')
-            )
-            alle_van_tegenpartij = df[
-                (df['_temp_groep'] == groep_key) & (~df['is_intern'])
-            ]
-            df.drop(columns=['_temp_groep'], inplace=True)
-
-        n_negatief = (alle_van_tegenpartij['bedrag'] < 0).sum()
-        n_totaal_tp = len(alle_van_tegenpartij)
-        pct_negatief = n_negatief / n_totaal_tp if n_totaal_tp > 0 else 0
-
-        if pct_negatief > 0.15:
-            continue  # Te veel geld terug = waarschijnlijk geen huur
-
-        # Check: (semi-)vast bedrag — robuust met median + IQR
-        # Reden: mean/std is gevoelig voor outliers (bijv. eenmalige borg-verhoging
-        # of correctiebetaling die de std disproportioneel opdrijft).
-        # Median + IQR is robuuster en pakt patronen als "9x €2500 + 1x €100 + 3x €2600".
-        bedragen = groep['bedrag'].astype(float)
-        mediaan = bedragen.median()
-        if mediaan < 300:
-            continue  # Minder dan €300 mediaan is waarschijnlijk geen huur
-
-        # Filter outliers: verwijder bedragen < 25% van mediaan (bijv. eenmalige kleine correctie)
-        kern_bedragen = bedragen[bedragen >= mediaan * 0.25]
-        if len(kern_bedragen) < 4:
-            continue  # Na outlier-filter niet genoeg transacties over
-
-        # IQR-gebaseerde variatie (robuust tegen outliers)
         q1 = kern_bedragen.quantile(0.25)
         q3 = kern_bedragen.quantile(0.75)
         iqr = q3 - q1
         variatie = (iqr / mediaan) if mediaan > 0 else 1.0
-        if variatie < 0.30:  # IQR-variatie is natuurlijk lager, dus iets ruimere threshold
-            # Vast bedrag, regelmatig, overwegend één richting = huurinkomsten
-            mask_huur = df.index.isin(groep.index)
-            df.loc[mask_huur, 'regel_sectie'] = 'inkomsten'
-            df.loc[mask_huur, 'regel_categorie'] = 'Huurinkomsten'
-            df.loc[mask_huur, 'regel_confidence'] = 0.85
-            df.loc[mask_huur, 'classificatie_bron'] = 'rule'
+        e3 = variatie < 0.30
+    evidence['E3_amount_stability'] = (e3, f'IQR-variatie {variatie*100:.1f}%, mediaan EUR {mediaan:,.0f}')
 
-            totaal = bedragen.sum()
-            n_gedetecteerd += len(groep)
-            naam = groep.iloc[0]['Omschrijving']
-            logger.info(
-                f"HUURINKOMSTEN GEDETECTEERD: {groep_key[:40]} ({str(naam)[:30]}) — "
-                f"{len(groep)} betalingen, mediaan EUR {mediaan:,.0f}, "
-                f"totaal EUR {totaal:,.0f}, IQR-variatie {variatie*100:.0f}%, "
-                f"{pct_negatief*100:.0f}% negatief"
-            )
+    # E4: Minimum amount — mediaan >= €300
+    e4 = mediaan >= 300
+    evidence['E4_minimum_amount'] = (e4, f'Mediaan EUR {mediaan:,.0f}')
 
-    if n_gedetecteerd > 0:
-        logger.info(f"HUURINKOMSTEN: {n_gedetecteerd} transacties als huurinkomsten geclassificeerd")
+    if not e4:
+        return ('reject', None, evidence)  # Bedrag te laag voor huur
+
+    # E5: Predominantly unidirectional — max 15% negatief
+    # Zoek ALLE transacties (ook negatieve) van deze tegenpartij
+    if heeft_tegenrek and iban:
+        df_all['_temp_iban'] = df_all['Tegenrekening'].apply(
+            lambda x: _normaliseer_iban(str(x)) if pd.notna(x) else '')
+        alle_tp = df_all[(df_all['_temp_iban'] == iban) & (~df_all['is_intern'])]
+        df_all.drop(columns=['_temp_iban'], inplace=True)
     else:
-        logger.info("HUURINKOMSTEN: geen huurinkomsten patroon gedetecteerd")
+        df_all['_temp_key'] = (
+            df_all['Omschrijving'].astype(str).str.upper().str.split().str[:3].str.join(' '))
+        alle_tp = df_all[(df_all['_temp_key'] == groep_key) & (~df_all['is_intern'])]
+        df_all.drop(columns=['_temp_key'], inplace=True)
 
-    return df
+    n_negatief = (alle_tp['bedrag'] < 0).sum()
+    n_totaal = len(alle_tp)
+    pct_negatief = n_negatief / n_totaal if n_totaal > 0 else 0
+    e5 = pct_negatief <= 0.15
+    evidence['E5_unidirectional'] = (e5, f'{pct_negatief*100:.0f}% negatief ({n_negatief}/{n_totaal})')
+
+    # E9: Description hint — huur-gerelateerde termen (optioneel, versterkt bewijs)
+    huur_keywords = ['HUUR', ' RENT ', 'KAMER', 'WONING', 'HUURPENNING', 'KAMERHUUR']
+    e9 = any(kw in tekst_alle for kw in huur_keywords)
+    evidence['E9_description_hint'] = (e9, f'{"Ja" if e9 else "Nee"}: huur-keyword in omschrijving')
+
+    # === BESLISLOGICA ===
+    verplichte_evidence = [e1, e3, e4, e5]
+    n_ja = sum(verplichte_evidence)
+
+    if all(verplichte_evidence):
+        # Alle 4 ja → LIKELY
+        return ('likely', 'Huurinkomsten', evidence)
+    elif n_ja >= 3 and e9:
+        # 3 van 4 ja + huur-keyword → nog steeds UNCERTAIN (keyword alleen is niet genoeg)
+        return ('uncertain', 'Onzeker positief', evidence)
+    elif n_ja >= 3:
+        # 3 van 4 ja, geen keyword → UNCERTAIN
+        return ('uncertain', 'Onzeker positief', evidence)
+    else:
+        # < 3 ja → UNCERTAIN (niet reject, want exclusion checks passeerden)
+        return ('uncertain', 'Onzeker positief', evidence)
+
+
+def _refund_matcher(row, negatieve_bedragen_per_iban, negatieve_bedragen_per_naam,
+                    kosten_merchants_set):
+    """Evidence-based refund matcher.
+
+    5 evidence checks, driedelige uitkomst.
+
+    Returns: (uitkomst, categorie)
+        uitkomst: 'likely' | 'uncertain' | 'reject'
+    """
+    omschr = str(row.get('Omschrijving', '')).upper()
+    bedrag = float(row.get('bedrag', 0))
+    iban = _normaliseer_iban(str(row.get('Tegenrekening', ''))) if 'Tegenrekening' in row.index else ''
+    naam = str(row.get('tegenpartij_naam', '')).upper() if 'tegenpartij_naam' in row.index else ''
+    tekst = omschr + ' ' + naam
+
+    # E4: Refund keyword
+    e4 = any(kw in tekst for kw in REFUND_KEYWORDS)
+    if e4:
+        return ('likely', 'Terugbetaling/Refund')
+
+    # E5: Known expense merchant (positief bedrag van kosten-merchant)
+    e5 = any(m in tekst for m in kosten_merchants_set)
+
+    # E1: Amount match — eerder negatief bedrag binnen ±30%
+    e1 = False
+    if iban and iban in negatieve_bedragen_per_iban:
+        for nb in negatieve_bedragen_per_iban[iban]:
+            if nb > 0 and abs(bedrag - nb) / nb < 0.30:
+                e1 = True
+                break
+    if not e1 and naam:
+        # Fallback: zoek op naam
+        for key, bedragen_lijst in negatieve_bedragen_per_naam.items():
+            if key in naam or naam in key:
+                for nb in bedragen_lijst:
+                    if nb > 0 and abs(bedrag - nb) / nb < 0.30:
+                        e1 = True
+                        break
+                if e1:
+                    break
+
+    # E2: Same counterparty (IBAN of naam match met negatieve tx) — impliciet in E1
+    # E3: Time window — niet geïmplementeerd in eerste versie (vereist datum-matching)
+
+    if e5:
+        # Kosten-merchant + positief bedrag = waarschijnlijk refund
+        return ('likely', f'Terugbetaling ({tekst[:20].strip().title()})')
+
+    if e1:
+        # Bedragmatch met eerder negatief bedrag = waarschijnlijk refund
+        return ('likely', 'Terugbetaling (bedrag-match)')
+
+    return ('reject', None)
+
+
+def _uncertainty_gate(row, bidi_ibans):
+    """Subcategoriseer uncertain positive inflows.
+
+    Returns: subcategorie string
+    """
+    omschr = str(row.get('Omschrijving', '')).upper()
+    naam = str(row.get('tegenpartij_naam', '')).upper() if 'tegenpartij_naam' in row.index else ''
+    tekst = omschr + ' ' + naam
+    iban = _normaliseer_iban(str(row.get('Tegenrekening', ''))) if 'Tegenrekening' in row.index else ''
+
+    # Verzekeraar zonder uitkering-keyword
+    if any(v in tekst for v in VERZEKERAAR_NAMEN):
+        return 'Onzeker positief (verzekeraar)'
+
+    # Financiële instelling niet in eigen domein
+    if any(kw in tekst for kw in FINANCIELE_INSTELLINGEN_KEYWORDS):
+        return 'Onzeker positief (financiële instelling)'
+
+    # Bidirectioneel IBAN
+    if iban and iban in bidi_ibans:
+        return 'Onzeker positief (bidirectioneel)'
+
+    return 'Onzeker positief'
 
 
 # ---------------------------------------------------------------------------
@@ -1863,324 +1946,310 @@ def _bouw_eigen_financieel_domein(df: pd.DataFrame) -> set:
     return eigen_fi_ibans
 
 
-def _classificeer_inflow_type(df: pd.DataFrame, eigen_fi_ibans: set = None) -> pd.DataFrame:
-    """Classificeer ELKE positieve, niet-geclassificeerde transactie naar inflow type.
+def _classify_positive_inflows(df: pd.DataFrame, eigen_fi_ibans: set = None,
+                               eigen_rekeningen: set = None) -> pd.DataFrame:
+    """Decision Engine — Classificeer ALLE ongeclass positieve transacties.
 
-    8 inflow types (conform ChatGPT CEO-advies):
-    1. structural_income     — salaris, huur, freelance → TELT als inkomen
-    2. government_income     — belasting teruggave, toeslagen, UWV → TELT als inkomen
-    3. asset_withdrawal      — geld terug van broker/crypto/crowdlending → sparen_beleggen
-    4. investment_income     — ALLEEN expliciet dividend/rente → inkomsten (aparte categorie)
-    5. refund                — retour, storno, cashback → variabele_kosten
-    6. internal_transfer     — eigen rekening, spaar, Tikkie → intern
-    7. insurance_payout      — verzekeringsuitkering → inkomsten (aparte categorie)
-    8. uncertain_positive    — ONBEKEND → NIET als inkomen, gaat naar aparte bucket
+    Drielaags model:
+      Laag A: Deterministic rules (overheid, FI domein, keywords)
+      Laag B: Evidence-based classifiers (rent, refund)
+      Uncertainty Gate: subcategoriseer rest
 
-    KRITIEK: uncertain_positive_inflow wordt UITGESLOTEN van page-1 inkomenscijfers.
-    De AI mag deze transacties classificeren voor het rapport, maar ze tellen NIET
-    mee in de structurele inkomstenconclusie.
+    Kernprincipe: elke positieve transactie krijgt een classificatie.
+    Uncertain = geldige einduitkomst, telt NOOIT als structural income.
 
-    Draait NA _detecteer_huurinkomsten() en VOOR _afdwing_iban_consistentie().
+    Draait NA _detecteer_vast_inkomen() en VOOR _afdwing_iban_consistentie().
     """
     if 'classificatie_bron' not in df.columns:
         return df
 
     if eigen_fi_ibans is None:
         eigen_fi_ibans = set()
+    if eigen_rekeningen is None:
+        eigen_rekeningen = set()
+
+    # Normaliseer eigen rekeningen
+    eigen_rek_norm = set(_normaliseer_iban(str(r)) for r in eigen_rekeningen if r and str(r) != 'nan')
 
     # Alleen niet-interne, niet-geclassificeerde, POSITIEVE transacties
     mask = (~df['is_intern']) & (df['classificatie_bron'].isna()) & (df['bedrag'] > 0)
     kandidaten = df[mask].copy()
 
     if len(kandidaten) == 0:
-        logger.info("INFLOW-TYPE: geen ongeclassificeerde positieve transacties")
+        logger.info("DECISION ENGINE: geen ongeclassificeerde positieve transacties")
         return df
 
-    # Voeg inflow_type kolom toe als die er nog niet is
     if 'inflow_type' not in df.columns:
         df['inflow_type'] = None
 
-    # Bouw lookup: bekende merchants die normaal kosten zijn (voor refund-detectie)
-    kosten_merchants = set()
-    for zoekterm, sectie, categorie, _ in MERCHANT_MAPPING:
-        if sectie in ('vaste_lasten', 'variabele_kosten'):
-            kosten_merchants.add(zoekterm)
+    # === LOOKUPS BOUWEN ===
 
-    # Bouw lookup: IBANs waar we OOK geld naartoe sturen (bidirectioneel)
+    # Bekende merchants (voor rent classifier exclusion + refund detection)
+    bekende_merchants_set = set()
+    kosten_merchants_set = set()
+    for zoekterm, sectie, _, _ in MERCHANT_MAPPING:
+        bekende_merchants_set.add(zoekterm)
+        if sectie in ('vaste_lasten', 'variabele_kosten'):
+            kosten_merchants_set.add(zoekterm)
+
+    # Bidirectionele IBANs (waar we ook geld naartoe sturen)
     bidi_ibans = set()
     if 'Tegenrekening' in df.columns:
-        df_negatief = df[(df['bedrag'] < 0) & (~df['is_intern']) & df['Tegenrekening'].notna()]
-        for iban in df_negatief['Tegenrekening'].unique():
-            iban_norm = _normaliseer_iban(str(iban))
+        for iban_val in df[(df['bedrag'] < 0) & (~df['is_intern']) & df['Tegenrekening'].notna()]['Tegenrekening'].unique():
+            iban_norm = _normaliseer_iban(str(iban_val))
             if iban_norm:
                 bidi_ibans.add(iban_norm)
 
-    # Bouw lookup: IBANs met negatief bedrag → bedragen (voor bedrag-matching refunds)
+    # Negatieve bedragen per IBAN en per naam (voor refund matching)
     negatieve_bedragen_per_iban = {}
+    negatieve_bedragen_per_naam = {}
     if 'Tegenrekening' in df.columns:
         for _, row in df[(df['bedrag'] < 0) & (~df['is_intern'])].iterrows():
             iban = _normaliseer_iban(str(row.get('Tegenrekening', '')))
             if iban:
-                if iban not in negatieve_bedragen_per_iban:
-                    negatieve_bedragen_per_iban[iban] = []
-                negatieve_bedragen_per_iban[iban].append(abs(float(row['bedrag'])))
+                negatieve_bedragen_per_iban.setdefault(iban, []).append(abs(float(row['bedrag'])))
+            naam = str(row.get('tegenpartij_naam', '')).upper().strip()
+            if naam and naam != 'NAN':
+                negatieve_bedragen_per_naam.setdefault(naam, []).append(abs(float(row['bedrag'])))
 
-    # Statistieken
+    heeft_tegenrek = 'Tegenrekening' in df.columns
+
+    # === STATISTIEKEN ===
     stats = {
-        'asset_withdrawal': 0,
-        'investment_income': 0,
-        'refund': 0,
-        'internal_transfer': 0,
-        'government': 0,
-        'insurance': 0,
-        'loan_inflow': 0,
-        'uncertain': 0,
+        'government': 0, 'asset_withdrawal': 0, 'investment_income': 0,
+        'refund': 0, 'internal_transfer': 0, 'insurance': 0,
+        'loan_inflow': 0, 'rent_likely': 0, 'uncertain': 0,
     }
     uncertain_bedrag = 0.0
+    herclassificaties = []  # Voor before/after logging
+
+    def _apply(idx, inflow_t, sectie, categorie, confidence):
+        """Helper: pas classificatie toe op DataFrame."""
+        df.at[idx, 'inflow_type'] = inflow_t
+        df.at[idx, 'regel_sectie'] = sectie
+        df.at[idx, 'regel_categorie'] = categorie
+        df.at[idx, 'regel_confidence'] = confidence
+        df.at[idx, 'classificatie_bron'] = 'rule'
+        if inflow_t == 'internal_transfer':
+            df.at[idx, 'is_intern'] = True
+
+    # ===================================================================
+    # FASE 1: LAAG A — Deterministic Rules (per transactie)
+    # ===================================================================
+    fase1_handled = set()  # indices die door Laag A zijn afgehandeld
 
     for idx, row in kandidaten.iterrows():
         omschr = str(row.get('Omschrijving', '')).upper()
         bedrag = float(row.get('bedrag', 0))
-        iban = _normaliseer_iban(str(row.get('Tegenrekening', ''))) if 'Tegenrekening' in df.columns else ''
+        iban = _normaliseer_iban(str(row.get('Tegenrekening', ''))) if heeft_tegenrek else ''
         naam = str(row.get('tegenpartij_naam', '')).upper() if 'tegenpartij_naam' in df.columns else ''
-        tekst = omschr + ' ' + naam  # Gecombineerde tekst voor keyword matching
+        tekst = omschr + ' ' + naam
 
-        inflow_type = None
-        inflow_confidence = 0.0
-        inflow_categorie = None
+        classified = False
 
-        # =====================================================================
-        # STAP 1: OVERHEID — belastingteruggave, toeslagen, UWV, SVB
-        # =====================================================================
+        # A1: OVERHEID
         if any(kw in tekst for kw in OVERHEID_KEYWORDS):
-            inflow_type = 'government'
-            inflow_confidence = 0.90
             if 'BELASTINGDIENST' in tekst or 'BELASTING DIENST' in tekst:
-                inflow_categorie = 'Belastingteruggave'
+                cat = 'Belastingteruggave'
             elif 'UWV' in tekst:
-                inflow_categorie = 'UWV/Uitkeringen'
+                cat = 'UWV/Uitkeringen'
             elif 'SVB' in tekst or 'KINDERBIJSLAG' in tekst:
-                inflow_categorie = 'Kinderbijslag/Kindregelingen'
+                cat = 'Kinderbijslag/Kindregelingen'
             elif any(kw in tekst for kw in ['ZORGTOESLAG', 'HUURTOESLAG', 'KINDGEBONDEN']):
-                inflow_categorie = 'Toeslagen'
+                cat = 'Toeslagen'
             elif 'DUO' in tekst or 'DIENST UITVOERING' in tekst:
-                inflow_categorie = 'Studiefinanciering'
+                cat = 'Studiefinanciering'
             else:
-                inflow_categorie = 'Overheid overig'
+                cat = 'Overheid overig'
+            _apply(idx, 'government', 'inkomsten', cat, 0.90)
+            stats['government'] += 1
+            herclassificaties.append((idx, 'Laag A', 'government', cat, f'Overheid-keyword'))
+            classified = True
 
-        # =====================================================================
-        # STAP 2: EIGEN FINANCIEEL DOMEIN — IBAN zit in eigen FI register
-        # Dit is de sterkste check: als we geld STUREN naar dit IBAN (broker),
-        # dan is geld TERUG van dit IBAN altijd een asset withdrawal.
-        # UITZONDERING: expliciete dividend/rente keywords = investment_income
-        # =====================================================================
+        # A2: EIGEN FINANCIEEL DOMEIN (IBAN match)
         elif iban and iban in eigen_fi_ibans:
-            # Check eerst op expliciete dividend/rente
             if any(kw in tekst for kw in INVESTMENT_INCOME_KEYWORDS):
-                inflow_type = 'investment_income'
-                inflow_confidence = 0.90
-                inflow_categorie = 'Beleggingsinkomen'
+                _apply(idx, 'investment_income', 'inkomsten', 'Beleggingsinkomen', 0.90)
+                stats['investment_income'] += 1
+                herclassificaties.append((idx, 'Laag A', 'investment_income', 'Beleggingsinkomen', f'FI-domein IBAN + dividend-keyword'))
             else:
-                inflow_type = 'asset_withdrawal'
-                inflow_confidence = 0.95
-                # Specifieke categorie
                 if any(kw in tekst for kw in ['BITVAVO', 'COINBASE', 'KRAKEN', 'BINANCE', 'BYBIT']):
-                    inflow_categorie = 'Crypto (terugstorting)'
+                    cat = 'Crypto (terugstorting)'
                 elif any(kw in tekst for kw in ['MINTOS', 'LENDAHAND', 'PEERBERRY', 'BONDORA',
                                                  'TWINO', 'OCTOBER', 'FUNDING CIRCLE', 'COLLIN']):
-                    inflow_categorie = 'Crowdlending (terugbetaling)'
+                    cat = 'Crowdlending (terugbetaling)'
                 elif 'BRAND NEW DAY' in tekst:
-                    inflow_categorie = 'Pensioen (terugstorting)'
+                    cat = 'Pensioen (terugstorting)'
                 else:
-                    inflow_categorie = 'Effectenrekening (terugstorting)'
+                    cat = 'Effectenrekening (terugstorting)'
+                _apply(idx, 'asset_withdrawal', 'sparen_beleggen', cat, 0.95)
+                stats['asset_withdrawal'] += 1
+                herclassificaties.append((idx, 'Laag A', 'asset_withdrawal', cat, f'FI-domein IBAN'))
+            classified = True
 
-        # =====================================================================
-        # STAP 3: FINANCIËLE INSTELLING KEYWORD (geen IBAN match maar naam match)
-        # =====================================================================
+        # A3: FINANCIËLE INSTELLING KEYWORD (naam match, geen IBAN match)
         elif any(kw in tekst for kw in FINANCIELE_INSTELLINGEN_KEYWORDS):
             if any(kw in tekst for kw in INVESTMENT_INCOME_KEYWORDS):
-                inflow_type = 'investment_income'
-                inflow_confidence = 0.88
-                inflow_categorie = 'Beleggingsinkomen'
+                _apply(idx, 'investment_income', 'inkomsten', 'Beleggingsinkomen', 0.88)
+                stats['investment_income'] += 1
+                herclassificaties.append((idx, 'Laag A', 'investment_income', 'Beleggingsinkomen', f'FI-keyword + dividend'))
             else:
-                inflow_type = 'asset_withdrawal'
-                inflow_confidence = 0.92
                 if any(kw in tekst for kw in ['BITVAVO', 'COINBASE', 'KRAKEN', 'BINANCE', 'BYBIT']):
-                    inflow_categorie = 'Crypto (terugstorting)'
+                    cat = 'Crypto (terugstorting)'
                 elif any(kw in tekst for kw in ['MINTOS', 'LENDAHAND', 'PEERBERRY', 'BONDORA',
                                                  'TWINO', 'OCTOBER', 'FUNDING CIRCLE', 'COLLIN']):
-                    inflow_categorie = 'Crowdlending (terugbetaling)'
+                    cat = 'Crowdlending (terugbetaling)'
                 elif 'BRAND NEW DAY' in tekst:
-                    inflow_categorie = 'Pensioen (terugstorting)'
+                    cat = 'Pensioen (terugstorting)'
                 else:
-                    inflow_categorie = 'Effectenrekening (terugstorting)'
+                    cat = 'Effectenrekening (terugstorting)'
+                _apply(idx, 'asset_withdrawal', 'sparen_beleggen', cat, 0.92)
+                stats['asset_withdrawal'] += 1
+                herclassificaties.append((idx, 'Laag A', 'asset_withdrawal', cat, f'FI-keyword naam'))
+            classified = True
 
-        # =====================================================================
-        # STAP 4: REFUND — expliciete refund keywords
-        # =====================================================================
+        # A4: REFUND KEYWORD
         elif any(kw in tekst for kw in REFUND_KEYWORDS):
-            inflow_type = 'refund'
-            inflow_confidence = 0.88
-            inflow_categorie = 'Terugbetaling/Refund'
-
-        # =====================================================================
-        # STAP 5: REFUND — positief bedrag van bekende kosten-merchant
-        # =====================================================================
-        elif any(m in tekst for m in kosten_merchants):
-            inflow_type = 'refund'
-            inflow_confidence = 0.85
-            matched_merchant = next((m for m in kosten_merchants if m in tekst), '')
-            inflow_categorie = f'Terugbetaling ({matched_merchant.title()})'
-
-        # =====================================================================
-        # STAP 6: REFUND — bedrag-matching (exact match met eerder negatief bedrag)
-        # =====================================================================
-        elif iban and iban in negatieve_bedragen_per_iban:
-            neg_bedragen = negatieve_bedragen_per_iban[iban]
-            if any(abs(bedrag - nb) < 0.02 for nb in neg_bedragen):
-                inflow_type = 'refund'
-                inflow_confidence = 0.82
-                inflow_categorie = 'Terugbetaling (bedrag-match)'
-
-        # =====================================================================
-        # STAP 7: TRANSFER — eigen rekening / spaar keywords
-        # =====================================================================
-        elif any(kw in tekst for kw in TRANSFER_KEYWORDS):
-            inflow_type = 'internal_transfer'
-            inflow_confidence = 0.85
-            inflow_categorie = 'Overboeking (intern)'
-
-        # =====================================================================
-        # STAP 8: LENING / HYPOTHEEK — geld van hypotheekverstrekker/krediet
-        # =====================================================================
-        elif any(kw in tekst for kw in LENING_KEYWORDS):
-            inflow_type = 'loan_inflow'
-            inflow_confidence = 0.80
-            inflow_categorie = 'Lening/Hypotheek (uitbetaling)'
-
-        # =====================================================================
-        # STAP 9: VERZEKERING — uitkering/schadevergoeding
-        # Multi-role logica: premie (negatief) al in MERCHANT_MAPPING.
-        # Positief bedrag + uitkering-keyword = verzekeringsuitkering
-        # Positief bedrag van verzekeraar ZONDER uitkering-keyword = uncertain
-        # =====================================================================
-        elif any(kw in tekst for kw in VERZEKERING_KEYWORDS):
-            inflow_type = 'insurance'
-            inflow_confidence = 0.85
-            inflow_categorie = 'Verzekeringsuitkering'
-        elif any(v in tekst for v in VERZEKERAAR_NAMEN):
-            # Verzekeraar ZONDER uitkering-keyword → uncertain (kan correctie zijn)
-            inflow_type = 'uncertain'
-            inflow_confidence = 0.50
-            inflow_categorie = 'Onzeker positief (verzekeraar)'
-
-        # =====================================================================
-        # STAP 10: BIDIRECTIONEEL — geld naar EN van dezelfde IBAN
-        # =====================================================================
-        elif iban and iban in bidi_ibans:
-            # Bidirectioneel = waarschijnlijk geen inkomen
-            if bedrag < 500:
-                inflow_type = 'refund'
-                inflow_confidence = 0.70
-                inflow_categorie = 'Terugbetaling (bidirectioneel)'
-            else:
-                # Groter bedrag, bidirectioneel → uncertain
-                inflow_type = 'uncertain'
-                inflow_confidence = 0.50
-                inflow_categorie = 'Onzeker positief (bidirectioneel)'
-
-        # =====================================================================
-        # STAP 11: UNCERTAIN — geen signalen gevonden
-        # Dit is het KERNPRINCIPE: onbekend = NIET inkomen
-        # Wordt uitgesloten van structurele inkomensconclusies
-        # =====================================================================
-        else:
-            inflow_type = 'uncertain'
-            inflow_confidence = 0.30
-            inflow_categorie = 'Onzeker positief'
-
-        # =====================================================================
-        # CLASSIFICATIE TOEPASSEN
-        # =====================================================================
-        df.at[idx, 'inflow_type'] = inflow_type
-
-        if inflow_type == 'government':
-            df.at[idx, 'regel_sectie'] = 'inkomsten'
-            df.at[idx, 'regel_categorie'] = inflow_categorie
-            df.at[idx, 'regel_confidence'] = inflow_confidence
-            df.at[idx, 'classificatie_bron'] = 'rule'
-            stats['government'] += 1
-
-        elif inflow_type == 'asset_withdrawal':
-            df.at[idx, 'regel_sectie'] = 'sparen_beleggen'
-            df.at[idx, 'regel_categorie'] = inflow_categorie
-            df.at[idx, 'regel_confidence'] = inflow_confidence
-            df.at[idx, 'classificatie_bron'] = 'rule'
-            stats['asset_withdrawal'] += 1
-
-        elif inflow_type == 'investment_income':
-            # Expliciete dividend/rente = echt beleggingsinkomen
-            df.at[idx, 'regel_sectie'] = 'inkomsten'
-            df.at[idx, 'regel_categorie'] = inflow_categorie
-            df.at[idx, 'regel_confidence'] = inflow_confidence
-            df.at[idx, 'classificatie_bron'] = 'rule'
-            stats['investment_income'] += 1
-
-        elif inflow_type == 'refund':
-            df.at[idx, 'regel_sectie'] = 'variabele_kosten'
-            df.at[idx, 'regel_categorie'] = inflow_categorie
-            df.at[idx, 'regel_confidence'] = inflow_confidence
-            df.at[idx, 'classificatie_bron'] = 'rule'
+            _apply(idx, 'refund', 'variabele_kosten', 'Terugbetaling/Refund', 0.88)
             stats['refund'] += 1
+            herclassificaties.append((idx, 'Laag A', 'refund', 'Terugbetaling/Refund', f'Refund-keyword'))
+            classified = True
 
-        elif inflow_type == 'internal_transfer':
-            df.at[idx, 'is_intern'] = True
-            df.at[idx, 'regel_sectie'] = 'intern'
-            df.at[idx, 'regel_categorie'] = inflow_categorie
-            df.at[idx, 'regel_confidence'] = inflow_confidence
-            df.at[idx, 'classificatie_bron'] = 'rule'
+        # A5: TRANSFER KEYWORD
+        elif any(kw in tekst for kw in TRANSFER_KEYWORDS):
+            _apply(idx, 'internal_transfer', 'intern', 'Overboeking (intern)', 0.85)
             stats['internal_transfer'] += 1
+            herclassificaties.append((idx, 'Laag A', 'internal_transfer', 'Overboeking (intern)', f'Transfer-keyword'))
+            classified = True
 
-        elif inflow_type == 'loan_inflow':
-            # Lening-uitbetaling = GEEN inkomen, maar ook geen kosten
-            df.at[idx, 'regel_sectie'] = 'sparen_beleggen'
-            df.at[idx, 'regel_categorie'] = inflow_categorie
-            df.at[idx, 'regel_confidence'] = inflow_confidence
-            df.at[idx, 'classificatie_bron'] = 'rule'
+        # A6: LENING KEYWORD
+        elif any(kw in tekst for kw in LENING_KEYWORDS):
+            _apply(idx, 'loan_inflow', 'sparen_beleggen', 'Lening/Hypotheek (uitbetaling)', 0.80)
             stats['loan_inflow'] += 1
+            herclassificaties.append((idx, 'Laag A', 'loan_inflow', 'Lening/Hypotheek (uitbetaling)', f'Lening-keyword'))
+            classified = True
 
-        elif inflow_type == 'insurance':
-            df.at[idx, 'regel_sectie'] = 'inkomsten'
-            df.at[idx, 'regel_categorie'] = inflow_categorie
-            df.at[idx, 'regel_confidence'] = inflow_confidence
-            df.at[idx, 'classificatie_bron'] = 'rule'
+        # A7: VERZEKERING MET UITKERING-KEYWORD
+        elif any(kw in tekst for kw in VERZEKERING_KEYWORDS):
+            _apply(idx, 'insurance', 'inkomsten', 'Verzekeringsuitkering', 0.85)
             stats['insurance'] += 1
+            herclassificaties.append((idx, 'Laag A', 'insurance', 'Verzekeringsuitkering', f'Verzekering + uitkering-keyword'))
+            classified = True
 
-        elif inflow_type == 'uncertain':
-            # UNCERTAIN: classificeer als rule-based zodat het NIET meer naar de AI
-            # gaat als vrij-te-classificeren transactie. Zet in aparte categorie
-            # die NIET meetelt als structureel inkomen.
-            df.at[idx, 'regel_sectie'] = 'inkomsten'
-            df.at[idx, 'regel_categorie'] = 'Onzeker positief (niet-geverifieerd inkomen)'
-            df.at[idx, 'regel_confidence'] = inflow_confidence
-            df.at[idx, 'classificatie_bron'] = 'rule'
-            stats['uncertain'] += 1
-            uncertain_bedrag += bedrag
+        if classified:
+            fase1_handled.add(idx)
 
-    # Logging
-    totaal_classified = sum(stats.values())
+    # ===================================================================
+    # FASE 2: LAAG B — Evidence-Based Classifiers (per groep)
+    # ===================================================================
+    # Resterende ongeclass positieve transacties na Laag A
+    rest_mask = mask & (~df.index.isin(fase1_handled))
+    rest = df[rest_mask].copy()
+
+    if len(rest) > 0:
+        # Groepeer op tegenpartij voor rent classifier
+        if heeft_tegenrek:
+            rest['_groep_key'] = rest['Tegenrekening'].apply(
+                lambda x: _normaliseer_iban(str(x)) if pd.notna(x) else '')
+            lege = rest['_groep_key'] == ''
+            if lege.any():
+                rest.loc[lege, '_groep_key'] = (
+                    rest.loc[lege, 'tegenpartij_naam'].astype(str).str.upper().str.strip()
+                    .where(lambda s: (s != '') & (s != 'NAN'),
+                           rest.loc[lege, 'Omschrijving'].astype(str).str.upper().str.split().str[:3].str.join(' '))
+                )
+        else:
+            rest['_groep_key'] = (
+                rest['tegenpartij_naam'].astype(str).str.upper().str.strip()
+                .where(lambda s: (s != '') & (s != 'NAN'),
+                       rest['Omschrijving'].astype(str).str.upper().str.split().str[:3].str.join(' '))
+            )
+
+        rest = rest[rest['_groep_key'] != '']
+
+        # B1: Refund matcher (per transactie, voor groepering)
+        refund_handled = set()
+        for idx, row in rest.iterrows():
+            uitkomst, cat = _refund_matcher(row, negatieve_bedragen_per_iban,
+                                            negatieve_bedragen_per_naam, kosten_merchants_set)
+            if uitkomst == 'likely':
+                _apply(idx, 'refund', 'variabele_kosten', cat, 0.82)
+                stats['refund'] += 1
+                herclassificaties.append((idx, 'Laag B', 'refund', cat, 'Refund matcher'))
+                refund_handled.add(idx)
+
+        # B2: Rent classifier (per groep)
+        rent_handled = set()
+        for groep_key, groep in rest[~rest.index.isin(refund_handled)].groupby('_groep_key'):
+            uitkomst, cat, evidence = _rent_classifier(
+                groep, df, groep_key, eigen_rek_norm, eigen_fi_ibans,
+                bekende_merchants_set, heeft_tegenrek
+            )
+
+            if uitkomst == 'likely':
+                for gidx in groep.index:
+                    _apply(gidx, 'rent_income', 'inkomsten', 'Huurinkomsten', 0.85)
+                    rent_handled.add(gidx)
+                stats['rent_likely'] += len(groep)
+                # Log evidence
+                evidence_str = ', '.join(f'{k}={"JA" if v else "NEE"}' for k, (v, _) in evidence.items())
+                naam_sample = str(groep.iloc[0].get('tegenpartij_naam', groep.iloc[0]['Omschrijving']))[:30]
+                logger.info(
+                    f"RENT CLASSIFIER: LIKELY — {groep_key[:30]} ({naam_sample}) — "
+                    f"{len(groep)} tx, mediaan EUR {groep['bedrag'].median():,.0f}, "
+                    f"totaal EUR {groep['bedrag'].sum():,.0f}\n"
+                    f"  Evidence: {evidence_str}"
+                )
+                herclassificaties.append((groep.index.tolist(), 'Laag B', 'rent_likely',
+                                         'Huurinkomsten', f'Rent classifier LIKELY: {evidence_str}'))
+
+            elif uitkomst == 'uncertain':
+                # Niet als huur herkend → gaat naar uncertainty gate (fase 3)
+                failed = [k for k, (v, _) in evidence.items() if not v]
+                logger.info(
+                    f"RENT CLASSIFIER: UNCERTAIN — {groep_key[:30]} — "
+                    f"{len(groep)} tx, mediaan EUR {groep['bedrag'].median():,.0f} — "
+                    f"gefaalde checks: {', '.join(failed)}"
+                )
+
+            # 'reject' = exclusion check gefaald, doorschuiven naar uncertainty gate
+
+    # ===================================================================
+    # FASE 3: UNCERTAINTY GATE — alles wat overblijft
+    # ===================================================================
+    alle_handled = fase1_handled | refund_handled | rent_handled
+    final_rest = mask & (~df.index.isin(alle_handled))
+
+    for idx in df[final_rest].index:
+        row = df.loc[idx]
+        bedrag = float(row.get('bedrag', 0))
+        subcategorie = _uncertainty_gate(row, bidi_ibans)
+
+        _apply(idx, 'uncertain', 'inkomsten', subcategorie, 0.30)
+        stats['uncertain'] += 1
+        uncertain_bedrag += bedrag
+        herclassificaties.append((idx, 'Uncertainty Gate', 'uncertain', subcategorie, 'Geen classifier kon dit plaatsen'))
+
+    # === LOGGING ===
+    totaal = sum(stats.values())
     logger.info(
-        f"INFLOW-TYPE v2: {totaal_classified} positieve transacties geclassificeerd:\n"
-        f"  asset_withdrawal:  {stats['asset_withdrawal']} (→ sparen_beleggen)\n"
-        f"  investment_income: {stats['investment_income']} (→ inkomsten, dividend/rente)\n"
-        f"  refund:            {stats['refund']} (→ variabele_kosten)\n"
-        f"  internal_transfer: {stats['internal_transfer']} (→ intern)\n"
-        f"  government:        {stats['government']} (→ inkomsten)\n"
-        f"  insurance:         {stats['insurance']} (→ inkomsten)\n"
-        f"  loan_inflow:       {stats['loan_inflow']} (→ sparen_beleggen)\n"
-        f"  uncertain:         {stats['uncertain']} (→ inkomsten/onzeker, EUR {uncertain_bedrag:,.0f})\n"
-        f"  NIKS meer naar AI als onbekend positief!"
+        f"DECISION ENGINE: {totaal} positieve transacties geclassificeerd:\n"
+        f"  Laag A — government:        {stats['government']}\n"
+        f"  Laag A — asset_withdrawal:   {stats['asset_withdrawal']}\n"
+        f"  Laag A — investment_income:  {stats['investment_income']}\n"
+        f"  Laag A — refund (keyword):   {stats['refund'] - len(refund_handled) if 'refund_handled' in dir() else stats['refund']}\n"
+        f"  Laag A — internal_transfer:  {stats['internal_transfer']}\n"
+        f"  Laag A — insurance:          {stats['insurance']}\n"
+        f"  Laag A — loan_inflow:        {stats['loan_inflow']}\n"
+        f"  Laag B — refund (matcher):   {len(refund_handled) if 'refund_handled' in dir() else 0}\n"
+        f"  Laag B — rent (likely):      {stats['rent_likely']}\n"
+        f"  Uncertainty Gate:            {stats['uncertain']} (EUR {uncertain_bedrag:,.0f})\n"
+        f"  → Geen positieve tx naar AI!"
     )
+
+    # Log herclassificaties samenvatting
+    if herclassificaties:
+        logger.info(f"DECISION ENGINE: {len(herclassificaties)} herclassificatie-acties gelogd")
 
     return df
 
@@ -2769,15 +2838,13 @@ def _rapport_kwaliteitscheck(data: dict, df: pd.DataFrame, eigen_rekeningen: set
     # =========================================================================
 
     # Check 1: 'Overig inkomen' mag niet groter zijn dan 40% van GEVERIFIEERD inkomen
-    # "Onzeker positief" categorieën tellen NIET mee in de berekening
-    _UNCERTAIN_CATS = {'Onzeker positief (niet-geverifieerd inkomen)', 'Onzeker positief',
-                       'Onzeker positief (verzekeraar)', 'Onzeker positief (bidirectioneel)'}
+    # Gebruikt de globale _STRUCTURAL_INCOME_WHITELIST voor consistentie
     for rek, totalen in jaartotalen.items():
         inkomsten = totalen.get('inkomsten', {})
         if isinstance(inkomsten, dict):
             overig = abs(float(inkomsten.get('Overig inkomen', 0)))
             totaal_ink = sum(abs(float(v)) for k, v in inkomsten.items()
-                           if isinstance(v, (int, float)) and k not in _UNCERTAIN_CATS)
+                           if isinstance(v, (int, float)) and k in _STRUCTURAL_INCOME_WHITELIST)
             if totaal_ink > 0 and overig > 0:
                 ratio = overig / totaal_ink
                 if ratio > 0.40:
@@ -3265,16 +3332,25 @@ class RapportPDF(FPDF):
         totaal_vaste = 0
         totaal_variabel = 0
         totaal_sparen = 0
+        totaal_uncertain = 0
 
-        # Categorieën die NIET meetellen als structureel inkomen op page 1
-        _UNCERTAIN_CATS = {'Onzeker positief (niet-geverifieerd inkomen)', 'Onzeker positief',
-                           'Onzeker positief (verzekeraar)', 'Onzeker positief (bidirectioneel)'}
+        # PAGE-1 WHITELIST: ALLEEN deze categorieën tellen als structureel inkomen
+        # Dit is een whitelist, geen blacklist. Alles wat niet expliciet op de lijst
+        # staat, telt NIET mee — ook niet als het in de 'inkomsten' sectie staat.
+        _PAGE1_WHITELIST = {
+            'Netto salaris', 'DGA-loon/Managementfee', 'Huurinkomsten',
+            'UWV/Uitkeringen', 'Kinderbijslag/Kindregelingen', 'Toeslagen',
+            'Freelance/Opdrachten', 'Pensioen/AOW', 'Studiefinanciering',
+            'Overheid overig',
+        }
 
         if jaartotalen:
             for rek, totalen in jaartotalen.items():
                 for cat, bedrag in totalen.get('inkomsten', {}).items():
-                    if cat not in _UNCERTAIN_CATS:
+                    if cat in _PAGE1_WHITELIST:
                         totaal_inkomen += abs(bedrag or 0)
+                    else:
+                        totaal_uncertain += abs(bedrag or 0)  # Track voor apart vermelding
                 for cat, bedrag in totalen.get('vaste_lasten', {}).items():
                     totaal_vaste += abs(bedrag or 0)
                 for cat, bedrag in totalen.get('variabele_kosten', {}).items():
@@ -4129,10 +4205,9 @@ def _run_rapport_pipeline(job_id: str, bestanden: list, email: str):
         n_regel = len(df[df['classificatie_bron'] == 'rule'])
         update(f'{n_regel} transacties rule-based geclassificeerd', 24)
 
-        # 1d. Patroon-detectie: vast inkomen en huurinkomsten (vóór AI)
-        update('Vast inkomen en huurinkomsten detecteren...', 24)
+        # 1d. Patroon-detectie: vast inkomen (salaris/DGA-loon, vóór AI)
+        update('Vast inkomen detecteren...', 24)
         df = _detecteer_vast_inkomen(df)
-        df = _detecteer_huurinkomsten(df)
         n_regel_na = len(df[df['classificatie_bron'] == 'rule'])
         n_patroon = n_regel_na - n_regel
         if n_patroon > 0:
@@ -4140,15 +4215,15 @@ def _run_rapport_pipeline(job_id: str, bestanden: list, email: str):
         else:
             update('Patroondetectie afgerond', 25)
 
-        # 1d2. Eigen financieel domein + inflow type classificatie
-        update('Financieel domein en inflow types analyseren...', 25)
+        # 1d2. Decision Engine: eigen financieel domein + inflow classificatie
+        update('Decision engine: positieve inflows classificeren...', 25)
         eigen_fi_ibans = _bouw_eigen_financieel_domein(df)
         n_voor_inflow = len(df[df['classificatie_bron'] == 'rule'])
-        df = _classificeer_inflow_type(df, eigen_fi_ibans=eigen_fi_ibans)
+        df = _classify_positive_inflows(df, eigen_fi_ibans=eigen_fi_ibans, eigen_rekeningen=eigen_rekeningen)
         n_na_inflow = len(df[df['classificatie_bron'] == 'rule'])
         n_inflow = n_na_inflow - n_voor_inflow
         if n_inflow > 0:
-            update(f'{n_inflow} positieve transacties als niet-inkomen geclassificeerd', 25)
+            update(f'{n_inflow} positieve transacties geclassificeerd door decision engine', 25)
 
         # 1e. Consistentie-afdwinging: propageer classificaties via IBAN
         update('Consistentie afdwingen...', 26)

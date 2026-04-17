@@ -1337,9 +1337,9 @@ def _classificeer_rule_based(df: pd.DataFrame) -> pd.DataFrame:
                     df.at[idx, 'classificatie_bron'] = 'rule'
                     n_geclassificeerd += 1
                     break
-                # Effectenrekening: positief = terugstorting (niet als "inkomen")
+                # Effectenrekening: positief = terugstorting (vermogensmutatie, NIET inkomen)
                 elif sectie == 'sparen_beleggen' and bedrag > 0:
-                    df.at[idx, 'regel_sectie'] = 'inkomsten'
+                    df.at[idx, 'regel_sectie'] = 'sparen_beleggen'
                     df.at[idx, 'regel_categorie'] = 'Effectenrekening (terugstorting)'
                     df.at[idx, 'regel_confidence'] = confidence
                     df.at[idx, 'classificatie_bron'] = 'rule'
@@ -1709,6 +1709,344 @@ def _detecteer_huurinkomsten(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# INFLOW TYPE CLASSIFICATIE — Yapily/Plaid-geïnspireerd
+# ---------------------------------------------------------------------------
+# Het "inflow classification problem": een positief bedrag op je bankrekening
+# kan 6 fundamenteel verschillende dingen betekenen. Alleen 'inkomen' en
+# 'overheid' zijn echt inkomen. De rest (beleggingsretour, refund, transfer,
+# verzekeringspayout) mag NIET als inkomen geteld worden.
+#
+# Gebaseerd op:
+# - Yapily's productie-taxonomie (90+ categorieën, 6 top-level credit types)
+# - Plaid's twee-fase classificatie (is_income binary → dan categoriseren)
+# ---------------------------------------------------------------------------
+
+# Financiële instellingen: als geld van hier TERUGKOMT, is het vermogensmutatie
+FINANCIELE_INSTELLINGEN_KEYWORDS = [
+    # Brokers / beleggingsplatformen
+    'SAXO', 'DEGIRO', 'IBKR', 'INTERACTIVE BROKERS', 'BINCK', 'LYNX',
+    'FLATEX', 'ETORO', 'TRADING 212', 'MEESMAN', 'NORTHERN TRUST',
+    'BRAND NEW DAY', 'VANGUARD', 'BLACKROCK', 'FIDELITY', 'ROBECO',
+    'ACTIAM', 'KEMPEN', 'VAN LANSCHOT', 'THINK ETF', 'BUX',
+    # Crypto
+    'BITVAVO', 'COINBASE', 'KRAKEN', 'BINANCE', 'BYBIT',
+    # Crowdlending / P2P
+    'MINTOS', 'LENDAHAND', 'PEERBERRY', 'BONDORA', 'TWINO', 'OCTOBER',
+    'FUNDING CIRCLE', 'COLLIN CROWDFUND',
+    # Verzekeraars (als ze UITKEREN is het verzekeringspayout)
+    # NB: verzekeraars die premie INNEN staan al in MERCHANT_MAPPING als vaste_lasten
+]
+
+# Overheidsinstanties die geld uitkeren
+OVERHEID_KEYWORDS = [
+    'BELASTINGDIENST', 'BELASTING DIENST',
+    'UWV', 'SVB',
+    'ZORGTOESLAG', 'HUURTOESLAG', 'KINDGEBONDEN BUDGET',
+    'KINDERBIJSLAG',
+    'DUO ', 'DIENST UITVOERING ONDERWIJS',
+    'GEMEENTE',  # Let op: gemeentebelasting (negatief) al apart afgehandeld
+    'RIJKSOVERHEID', 'MINISTERIE',
+    'CAK ', 'CENTRAAL ADMINISTRATIE KANTOOR',
+    'RVO ', 'RIJKSDIENST VOOR ONDERNEMEND',
+    'CJIB',  # Kan ook boete zijn, maar positief = teruggave
+]
+
+# Refund / terugbetaling keywords
+REFUND_KEYWORDS = [
+    'RETOUR', 'REFUND', 'TERUGBET', 'STORNO', 'CREDITNOTA',
+    'TERUGSTORT', 'RESTITUTIE', 'TERUGGAVE', 'REVERSAL',
+    'TERUGBOEKING', 'ANNULERING', 'CORRECTIE', 'CREDIT',
+    'CASHBACK', 'GELD TERUG', 'REIMBURSEMENT',
+]
+
+# Transfer keywords (eigen rekeningen, Tikkie, peer-to-peer)
+TRANSFER_KEYWORDS = [
+    'TIKKIE', 'BETAALVERZOEK',
+    'SPAARREKENING', 'SPAAR',
+    'OVERBOEKING EIGEN', 'EIGEN REKENING',
+    'SAVINGS', 'DEPOSIT',
+]
+
+# Verzekering-uitkering keywords
+VERZEKERING_KEYWORDS = [
+    'UITKERING', 'SCHADEVERGOEDING', 'SCHADE-UITKERING',
+    'LETSELSCHADE', 'VERZEKERINGSUITKERING', 'CLAIM',
+    'SCHADEREGELING', 'POLIS', 'POLISUITKERING',
+]
+
+# Verzekeraars die uitkeringen doen (als positief bedrag)
+VERZEKERAAR_NAMEN = [
+    'CENTRAAL BEHEER', 'ACHMEA', 'INTERPOLIS', 'NATIONALE-NEDERLANDEN',
+    'NN GROUP', 'AEGON', 'DELTA LLOYD', 'ASR', 'A.S.R',
+    'ZILVEREN KRUIS', 'CZ GROEP', 'CZ ZORGVERZEKERING',
+    'MENZIS', 'VGZ', 'COOPERATIE VGZ', 'UNIVE', 'UNIVÉ',
+    'FBTO', 'REAAL', 'ALLIANZ', 'INSHARED', 'ALLSECUR',
+    'OHRA', 'DITZO', 'DSW', 'ZORG EN ZEKERHEID',
+    'ENO ZORGVERZEKERAAR', 'SALLAND VERZEKERINGEN',
+    'DELA', 'MONUTA', 'YARDEN',
+]
+
+
+def _classificeer_inflow_type(df: pd.DataFrame) -> pd.DataFrame:
+    """Classificeer ELKE positieve, niet-geclassificeerde transactie naar inflow type.
+
+    Dit lost het "inflow classification problem" op: een positief bedrag kan zijn:
+    1. inkomen          — salaris, pensioen, huur, freelance (= echte inkomsten)
+    2. vermogensmutatie — retour van broker, crowdlending terugbetaling, crypto verkoop
+    3. terugbetaling    — refund van winkel, storno, cashback
+    4. transfer         — eigen rekening, Tikkie, peer-to-peer
+    5. overheid         — belastingteruggave, toeslagen, UWV (= echte inkomsten)
+    6. verzekering      — uitkering van verzekeraar, schadevergoeding
+
+    ALLEEN types 'inkomen' en 'overheid' tellen als echte inkomsten.
+    De rest gaat naar 'sparen_beleggen' of wordt als niet-inkomen gemarkeerd.
+
+    Draait NA _detecteer_huurinkomsten() en VOOR _afdwing_iban_consistentie().
+    Werkt alleen op transacties die nog NIET geclassificeerd zijn (classificatie_bron is None).
+
+    Signalen die we gebruiken:
+    - Tegenpartij-type: financiële instelling vs werkgever vs winkel
+    - Bidirectionaliteit: als je OOK geld naar deze IBAN stuurt → waarschijnlijk transfer/vermogen
+    - Keywords: retour, refund, storno → terugbetaling
+    - Merchant mapping: als een merchant in de MERCHANT_MAPPING staat als kosten-categorie,
+      dan is een positief bedrag van diezelfde merchant een terugbetaling
+    - Bedragmatching: positief bedrag dat matcht met eerder negatief bedrag = terugbetaling
+    """
+    if 'classificatie_bron' not in df.columns:
+        return df
+
+    # Alleen niet-interne, niet-geclassificeerde, POSITIEVE transacties
+    mask = (~df['is_intern']) & (df['classificatie_bron'].isna()) & (df['bedrag'] > 0)
+    kandidaten = df[mask].copy()
+
+    if len(kandidaten) == 0:
+        logger.info("INFLOW-TYPE: geen ongeclassificeerde positieve transacties")
+        return df
+
+    # Bouw lookup: bekende merchants die normaal kosten zijn (voor refund-detectie)
+    kosten_merchants = set()
+    for zoekterm, sectie, categorie, _ in MERCHANT_MAPPING:
+        if sectie in ('vaste_lasten', 'variabele_kosten'):
+            kosten_merchants.add(zoekterm)
+
+    # Bouw lookup: IBANs waar we OOK geld naartoe sturen (bidirectioneel)
+    bidi_ibans = set()
+    if 'Tegenrekening' in df.columns:
+        df_negatief = df[(df['bedrag'] < 0) & (~df['is_intern']) & df['Tegenrekening'].notna()]
+        for iban in df_negatief['Tegenrekening'].unique():
+            iban_norm = _normaliseer_iban(str(iban))
+            if iban_norm:
+                bidi_ibans.add(iban_norm)
+
+    # Bouw lookup: IBANs met negatief bedrag → bedragen (voor bedrag-matching refunds)
+    negatieve_bedragen_per_iban = {}
+    if 'Tegenrekening' in df.columns:
+        for _, row in df[(df['bedrag'] < 0) & (~df['is_intern'])].iterrows():
+            iban = _normaliseer_iban(str(row.get('Tegenrekening', '')))
+            if iban:
+                if iban not in negatieve_bedragen_per_iban:
+                    negatieve_bedragen_per_iban[iban] = []
+                negatieve_bedragen_per_iban[iban].append(abs(float(row['bedrag'])))
+
+    # Statistieken
+    n_vermogen = 0
+    n_terugbetaling = 0
+    n_transfer = 0
+    n_overheid = 0
+    n_verzekering = 0
+    n_inkomen = 0
+    n_onbekend = 0
+
+    for idx, row in kandidaten.iterrows():
+        omschr = str(row.get('Omschrijving', '')).upper()
+        bedrag = float(row.get('bedrag', 0))
+        iban = _normaliseer_iban(str(row.get('Tegenrekening', ''))) if 'Tegenrekening' in df.columns else ''
+        naam = str(row.get('tegenpartij_naam', '')).upper() if 'tegenpartij_naam' in df.columns else ''
+        tekst = omschr + ' ' + naam  # Gecombineerde tekst voor keyword matching
+
+        inflow_type = None
+        inflow_confidence = 0.0
+        inflow_categorie = None
+
+        # =====================================================================
+        # STAP 1: OVERHEID — belastingteruggave, toeslagen, UWV, SVB
+        # (al deels afgevangen door rule-based, maar catch-all voor gemiste)
+        # =====================================================================
+        if any(kw in tekst for kw in OVERHEID_KEYWORDS):
+            inflow_type = 'overheid'
+            inflow_confidence = 0.90
+            # Specifieke categorie bepalen
+            if 'BELASTINGDIENST' in tekst or 'BELASTING DIENST' in tekst:
+                inflow_categorie = 'Belastingteruggave'
+            elif 'UWV' in tekst:
+                inflow_categorie = 'UWV/Uitkeringen'
+            elif 'SVB' in tekst or 'KINDERBIJSLAG' in tekst:
+                inflow_categorie = 'Kinderbijslag/Kindregelingen'
+            elif any(kw in tekst for kw in ['ZORGTOESLAG', 'HUURTOESLAG', 'KINDGEBONDEN']):
+                inflow_categorie = 'Toeslagen'
+            elif 'DUO' in tekst or 'DIENST UITVOERING' in tekst:
+                inflow_categorie = 'Studiefinanciering'
+            else:
+                inflow_categorie = 'Overheid overig'
+
+        # =====================================================================
+        # STAP 2: VERMOGENSMUTATIE — geld terug van broker/crypto/crowdlending
+        # Signaal: tegenpartij is een financiële instelling
+        # =====================================================================
+        elif any(kw in tekst for kw in FINANCIELE_INSTELLINGEN_KEYWORDS):
+            inflow_type = 'vermogensmutatie'
+            inflow_confidence = 0.92
+            # Specifieke categorie
+            if any(kw in tekst for kw in ['BITVAVO', 'COINBASE', 'KRAKEN', 'BINANCE', 'BYBIT']):
+                inflow_categorie = 'Crypto (terugstorting)'
+            elif any(kw in tekst for kw in ['MINTOS', 'LENDAHAND', 'PEERBERRY', 'BONDORA',
+                                             'TWINO', 'OCTOBER', 'FUNDING CIRCLE', 'COLLIN']):
+                inflow_categorie = 'Crowdlending (terugbetaling)'
+            elif 'BRAND NEW DAY' in tekst:
+                inflow_categorie = 'Pensioen (terugstorting)'
+            else:
+                inflow_categorie = 'Effectenrekening (terugstorting)'
+
+        # =====================================================================
+        # STAP 3: TERUGBETALING — refund keywords in omschrijving
+        # =====================================================================
+        elif any(kw in tekst for kw in REFUND_KEYWORDS):
+            inflow_type = 'terugbetaling'
+            inflow_confidence = 0.88
+            inflow_categorie = 'Terugbetaling/Refund'
+
+        # =====================================================================
+        # STAP 4: TERUGBETALING — positief bedrag van een bekende kosten-merchant
+        # Als je normaal BETAALT bij Albert Heijn en nu €15 ONTVANGT = retour
+        # =====================================================================
+        elif any(m in tekst for m in kosten_merchants):
+            inflow_type = 'terugbetaling'
+            inflow_confidence = 0.85
+            # Zoek welke merchant het is voor logging
+            matched_merchant = next((m for m in kosten_merchants if m in tekst), '')
+            inflow_categorie = f'Terugbetaling ({matched_merchant.title()})'
+
+        # =====================================================================
+        # STAP 5: TERUGBETALING — bedrag-matching
+        # Positief bedrag dat exact matcht met eerder negatief bedrag aan zelfde IBAN
+        # (bijv. borg terug, dubbel betaald, storno)
+        # =====================================================================
+        elif iban and iban in negatieve_bedragen_per_iban:
+            neg_bedragen = negatieve_bedragen_per_iban[iban]
+            # Exact match (op 1 cent na) of bijna-match (binnen 5%)
+            if any(abs(bedrag - nb) < 0.02 for nb in neg_bedragen):
+                inflow_type = 'terugbetaling'
+                inflow_confidence = 0.82
+                inflow_categorie = 'Terugbetaling (bedrag-match)'
+
+        # =====================================================================
+        # STAP 6: TRANSFER — eigen rekening keywords
+        # =====================================================================
+        elif any(kw in tekst for kw in TRANSFER_KEYWORDS):
+            inflow_type = 'transfer'
+            inflow_confidence = 0.85
+            inflow_categorie = 'Overboeking (intern)'
+
+        # =====================================================================
+        # STAP 7: VERZEKERING — uitkering van verzekeraar
+        # Belangrijk: verzekeraars staan in MERCHANT_MAPPING als vaste_lasten (premie).
+        # Een POSITIEF bedrag van een verzekeraar = uitkering, geen premie.
+        # =====================================================================
+        elif any(kw in tekst for kw in VERZEKERING_KEYWORDS):
+            inflow_type = 'verzekering'
+            inflow_confidence = 0.85
+            inflow_categorie = 'Verzekeringsuitkering'
+        elif any(v in tekst for v in VERZEKERAAR_NAMEN) and bedrag > 50:
+            # Positief bedrag van verzekeraar > €50 = waarschijnlijk uitkering
+            # (kleine bedragen <€50 kunnen correcties zijn)
+            inflow_type = 'verzekering'
+            inflow_confidence = 0.78
+            inflow_categorie = 'Verzekeringsuitkering'
+
+        # =====================================================================
+        # STAP 8: BIDIRECTIONEEL — als we OOK geld naar deze IBAN sturen
+        # en het NIET al als inkomen gedetecteerd is door vast_inkomen/huurinkomsten,
+        # dan is het waarschijnlijk een transfer of terugbetaling
+        # =====================================================================
+        elif iban and iban in bidi_ibans and bedrag < 500:
+            # Bidirectioneel + laag bedrag = waarschijnlijk terugbetaling/Tikkie
+            inflow_type = 'terugbetaling'
+            inflow_confidence = 0.70
+            inflow_categorie = 'Terugbetaling (bidirectioneel)'
+
+        # =====================================================================
+        # STAP 9: ONBEKEND — niet genoeg signalen, laat aan AI
+        # Maar geef de AI een hint dat dit GEEN bewezen inkomen is
+        # =====================================================================
+        else:
+            inflow_type = 'onbekend'
+            inflow_confidence = 0.0
+            n_onbekend += 1
+            # Geen classificatie → AI mag beslissen, maar met context
+            continue
+
+        # =====================================================================
+        # CLASSIFICATIE TOEPASSEN
+        # =====================================================================
+        if inflow_type == 'overheid':
+            # Overheid = echte inkomsten
+            df.at[idx, 'regel_sectie'] = 'inkomsten'
+            df.at[idx, 'regel_categorie'] = inflow_categorie
+            df.at[idx, 'regel_confidence'] = inflow_confidence
+            df.at[idx, 'classificatie_bron'] = 'rule'
+            n_overheid += 1
+
+        elif inflow_type == 'vermogensmutatie':
+            # Vermogensmutatie → sparen_beleggen (NIET inkomen!)
+            df.at[idx, 'regel_sectie'] = 'sparen_beleggen'
+            df.at[idx, 'regel_categorie'] = inflow_categorie
+            df.at[idx, 'regel_confidence'] = inflow_confidence
+            df.at[idx, 'classificatie_bron'] = 'rule'
+            n_vermogen += 1
+
+        elif inflow_type == 'terugbetaling':
+            # Terugbetaling → variabele_kosten (verrekend met de oorspronkelijke uitgave)
+            # Dit is correct: als je €15 retour krijgt van AH, dan zijn je boodschappen €15 minder
+            df.at[idx, 'regel_sectie'] = 'variabele_kosten'
+            df.at[idx, 'regel_categorie'] = inflow_categorie
+            df.at[idx, 'regel_confidence'] = inflow_confidence
+            df.at[idx, 'classificatie_bron'] = 'rule'
+            n_terugbetaling += 1
+
+        elif inflow_type == 'transfer':
+            # Transfer → intern (wordt niet meegeteld)
+            df.at[idx, 'is_intern'] = True
+            df.at[idx, 'regel_sectie'] = 'intern'
+            df.at[idx, 'regel_categorie'] = inflow_categorie
+            df.at[idx, 'regel_confidence'] = inflow_confidence
+            df.at[idx, 'classificatie_bron'] = 'rule'
+            n_transfer += 1
+
+        elif inflow_type == 'verzekering':
+            # Verzekeringspayout → inkomsten maar als aparte categorie
+            # Niet structureel inkomen, maar wel ontvangen geld
+            df.at[idx, 'regel_sectie'] = 'inkomsten'
+            df.at[idx, 'regel_categorie'] = inflow_categorie
+            df.at[idx, 'regel_confidence'] = inflow_confidence
+            df.at[idx, 'classificatie_bron'] = 'rule'
+            n_verzekering += 1
+
+    # Logging
+    totaal = n_vermogen + n_terugbetaling + n_transfer + n_overheid + n_verzekering
+    logger.info(
+        f"INFLOW-TYPE: {totaal} positieve transacties geclassificeerd, "
+        f"{n_onbekend} naar AI:\n"
+        f"  vermogensmutatie: {n_vermogen} (→ sparen_beleggen)\n"
+        f"  terugbetaling:   {n_terugbetaling} (→ variabele_kosten)\n"
+        f"  transfer:        {n_transfer} (→ intern)\n"
+        f"  overheid:        {n_overheid} (→ inkomsten)\n"
+        f"  verzekering:     {n_verzekering} (→ inkomsten)"
+    )
+
+    return df
+
+
+# ---------------------------------------------------------------------------
 # CONSISTENTIE-AFDWINGING: zelfde IBAN → zelfde categorie
 # ---------------------------------------------------------------------------
 
@@ -2002,6 +2340,21 @@ Hieronder staan {len(df_ai_only)} banktransacties die JIJ moet classificeren.
    BELANGRIJK: "Overig" categorieën mogen MAXIMAAL 5% van het totaalbedrag per sectie bevatten.
    Als er veel in "Overig" dreigt te belanden, kies dan de best passende bestaande categorie.
 
+## INFLOW CLASSIFICATIE — KRITIEK
+Een positief bedrag is NIET automatisch inkomen! Er zijn 6 types positieve transacties:
+1. INKOMEN: salaris, pensioen, huur, freelance → sectie inkomsten
+2. OVERHEID: belastingteruggave, toeslagen, UWV → sectie inkomsten
+3. VERMOGENSMUTATIE: geld terug van broker/crowdlending/crypto → sectie sparen_beleggen
+4. TERUGBETALING: refund, storno, retour van winkel → sectie variabele_kosten (als negatieve kosten)
+5. TRANSFER: eigen rekening, Tikkie → intern
+6. VERZEKERING: schadevergoeding, uitkering verzekeraar → sectie inkomsten (aparte categorie)
+
+De meeste vermogensmutaties, terugbetalingen en transfers zijn AL door het systeem geclassificeerd.
+Maar als jij nog positieve transacties ziet die duidelijk GEEN inkomen zijn, classificeer ze correct:
+- Geld van een broker/beleggingsplatform → Effectenrekening (terugstorting) in sparen_beleggen
+- Geld van een webshop/winkel → Terugbetaling, NIET "Overig inkomen"
+- "Overig inkomen" mag ALLEEN voor echte inkomsten die nergens anders passen
+
 ## CONSISTENTIE — KRITIEK
 - Dezelfde tegenpartij MOET ALTIJD dezelfde categorie krijgen.
 - Zoek patronen: als "Sevi B.V." 12x voorkomt met vast bedrag, classificeer ze ALLEMAAL hetzelfde.
@@ -2014,7 +2367,7 @@ De omschrijving is gestructureerd als "Tegenpartij — Kenmerk" (bv "Sevi B.V. �
 Als IBAN beschikbaar is, gebruik deze voor consistentie: dezelfde IBAN = altijd dezelfde categorie.
 Let op: sommige transacties hebben nog ruwe bankomschrijvingen — lees dan de HELE tekst om de naam te vinden.
 
-2. INKOMSTEN (12 categorieën):
+2. INKOMSTEN (11 categorieën — ALLEEN echt verdiend geld):
    - Netto salaris (loon van werkgever of eigen BV)
    - UWV/Uitkeringen (WW, WIA, Ziektewet, bijstand)
    - DGA-loon/Managementfee (vanuit eigen BV)
@@ -2022,10 +2375,10 @@ Let op: sommige transacties hebben nog ruwe bankomschrijvingen — lees dan de H
    - Toeslagen (zorgtoeslag, huurtoeslag, kindgebonden budget)
    - Belastingteruggave (teruggave IB, BTW, voorlopige aanslag)
    - Kinderbijslag/Kindregelingen
-   - Effectenrekening (terugstorting) (geld terug van Saxo, DeGiro, broker → GEEN inkomen, wel bijschrijving)
    - Freelance/Opdrachten (losse inkomsten, facturen)
-   - Beleggingsinkomen (dividend, rente, uitkeringen)
-   - Overig inkomen
+   - Verzekeringsuitkering (schadevergoeding, letselschade, uitkering)
+   - Beleggingsinkomen (dividend, rente — ALLEEN daadwerkelijke opbrengst, NIET terugstortingen)
+   - Overig inkomen (STRIKT: alleen echt inkomen dat nergens anders past, NOOIT terugbetalingen/refunds)
 
 3. VASTE LASTEN (20 categorieën):
    - Hypotheek/Huur
@@ -2079,12 +2432,17 @@ Let op: sommige transacties hebben nog ruwe bankomschrijvingen — lees dan de H
    - Cadeaus
    - School/Studie/Cursussen
    - Huisdieren
+   - Terugbetaling/Refund (retour, storno, cashback — positief bedrag van een winkel/webshop)
    - Overig variabel
 
-5. SPAREN & BELEGGEN (10 categorieën):
-   - Effectenrekening (Saxo, DeGiro, IBKR)
-   - Crowdlending (Mintos, Lendahand, PeerBerry)
+5. SPAREN & BELEGGEN (14 categorieën — inclusief terugstortingen):
+   - Effectenrekening (stortingen NAAR Saxo, DeGiro, IBKR = negatief bedrag)
+   - Effectenrekening (terugstorting) (geld TERUG van broker → positief bedrag, GEEN inkomen!)
+   - Crowdlending (stortingen naar Mintos, Lendahand, PeerBerry = negatief)
+   - Crowdlending (terugbetaling) (aflossingen/terugbetalingen van crowdlending = positief, GEEN inkomen!)
+   - Crypto (terugstorting) (geld terug van crypto-exchange = positief, GEEN inkomen!)
    - Pensioenopbouw (Brand New Day, lijfrente)
+   - Pensioen (terugstorting) (geld terug van pensioenfonds = positief)
    - Kindersparen
    - Spaarrekening
    - Crypto
@@ -2267,9 +2625,9 @@ def _rapport_kwaliteitscheck(data: dict, df: pd.DataFrame, eigen_rekeningen: set
     # BLOKKERENDE CHECKS — rapport wordt NIET gegenereerd
     # =========================================================================
 
-    # Check 1: 'Overig inkomen' mag niet groter zijn dan 60% van totaal inkomen
-    # NB: drempel is hoger (60%) omdat rule-based transacties apart worden berekend
-    # en de AI alleen de onbekende transacties classificeert — "Overig" is dan relatief groter
+    # Check 1: 'Overig inkomen' mag niet groter zijn dan 40% van totaal inkomen
+    # Na de inflow classificatie zouden de meeste niet-inkomen transacties al
+    # correct geclassificeerd zijn, dus de AI hoeft minder in "Overig" te stoppen.
     for rek, totalen in jaartotalen.items():
         inkomsten = totalen.get('inkomsten', {})
         if isinstance(inkomsten, dict):
@@ -2277,7 +2635,7 @@ def _rapport_kwaliteitscheck(data: dict, df: pd.DataFrame, eigen_rekeningen: set
             totaal_ink = sum(abs(float(v)) for v in inkomsten.values() if isinstance(v, (int, float)))
             if totaal_ink > 0 and overig > 0:
                 ratio = overig / totaal_ink
-                if ratio > 0.60:
+                if ratio > 0.40:
                     blockers.append(
                         f"BLOKKADE: Rekening {rek}: 'Overig inkomen' is {ratio:.0%} van totaal inkomen "
                         f"(EUR {overig:,.0f} / EUR {totaal_ink:,.0f}). "
@@ -3631,6 +3989,15 @@ def _run_rapport_pipeline(job_id: str, bestanden: list, email: str):
             update(f'{n_patroon} extra transacties via patroondetectie', 25)
         else:
             update('Patroondetectie afgerond', 25)
+
+        # 1d2. Inflow type classificatie (vóór AI, na patroondetectie)
+        update('Inflow types classificeren...', 25)
+        n_voor_inflow = len(df[df['classificatie_bron'] == 'rule'])
+        df = _classificeer_inflow_type(df)
+        n_na_inflow = len(df[df['classificatie_bron'] == 'rule'])
+        n_inflow = n_na_inflow - n_voor_inflow
+        if n_inflow > 0:
+            update(f'{n_inflow} positieve transacties als niet-inkomen geclassificeerd', 25)
 
         # 1e. Consistentie-afdwinging: propageer classificaties via IBAN
         update('Consistentie afdwingen...', 26)

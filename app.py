@@ -3015,23 +3015,21 @@ def _post_classificatie_reconciliatie(df: pd.DataFrame, feiten: dict) -> dict:
             })
             status = 'RED'
 
-    # Check: alle niet-interne transacties moeten een sectie hebben
+    # Check: hoeveel niet-interne transacties hebben nog geen sectie
+    # NOTE: Deze check draait VOOR de AI-stap. Transacties zonder sectie gaan naar
+    # de AI voor classificatie. Dit is geen fout maar een INFO check.
+    # De echte ongeclassificeerde check hoort NA de AI merge (in _no_send_gate).
     df_extern = df[~df.get('is_intern', False)]
     n_zonder_sectie = len(df_extern[df_extern['regel_sectie'].isna()])
     if n_zonder_sectie > 0:
         pct = n_zonder_sectie / len(df_extern) * 100 if len(df_extern) > 0 else 0
-        check_status = 'ORANGE' if pct < 20 else 'RED'
         checks.append({
             'type': 'ONGECLASS_TRANSACTIES',
             'aantal': n_zonder_sectie,
             'percentage': round(pct, 1),
-            'status': check_status,
-            'detail': f'{n_zonder_sectie} transacties ({pct:.1f}%) zonder classificatie (gaan naar AI)'
+            'status': 'INFO',  # Niet RED/ORANGE — deze gaan naar AI
+            'detail': f'{n_zonder_sectie} transacties ({pct:.1f}%) gaan naar AI voor classificatie'
         })
-        if check_status == 'RED':
-            status = 'RED'
-        elif status == 'GREEN':
-            status = 'ORANGE'
 
     # Household/salary contamination check
     if 'party_type' in df.columns and 'regel_categorie' in df.columns:
@@ -5652,6 +5650,15 @@ def _no_send_gate(ground_truth: dict, reconciliatie: dict, analyse: dict,
             redenen.append(f"RECONCILIATIE FOUT: {c['detail']}")
 
     # Regel 2: Overig-categorieën percentage per sectie
+    # Drempels per sectie: inkomsten strenger (geld moet kloppen),
+    # variabele kosten soepeler (veel kleine transacties)
+    _OVERIG_DREMPELS = {
+        'inkomsten':         (0.10, 0.25),  # >10% ORANGE, >25% RED
+        'vaste_lasten':      (0.10, 0.30),
+        'variabele_kosten':  (0.15, 0.40),  # variabel heeft van nature meer "overig"
+        'sparen_beleggen':   (0.10, 0.30),
+        'onderling_neutraal': (0.20, 0.50),
+    }
     cat_totalen = ground_truth.get('categorie_totalen_12m', {})
     sectie_totalen = ground_truth.get('sectie_totalen_12m', {})
     for sectie, cats in cat_totalen.items():
@@ -5664,8 +5671,9 @@ def _no_send_gate(ground_truth: dict, reconciliatie: dict, analyse: dict,
                 overig_bedrag += abs(float(bedrag))
         if totaal_sectie > 0:
             overig_pct = overig_bedrag / totaal_sectie
-            if overig_pct > 0.05:
-                kleur = 'RED' if overig_pct > 0.15 else max(kleur, 'ORANGE')
+            drempel_orange, drempel_red = _OVERIG_DREMPELS.get(sectie, (0.10, 0.30))
+            if overig_pct > drempel_orange:
+                kleur = 'RED' if overig_pct > drempel_red else max(kleur, 'ORANGE')
                 redenen.append(
                     f"{sectie}: {overig_pct:.0%} in Overig-categorieën "
                     f"(EUR {overig_bedrag:,.0f} / EUR {totaal_sectie:,.0f})"

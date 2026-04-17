@@ -806,26 +806,26 @@ _NTROPY_TO_ONZE_MAPPING = {
 
 
 def _ntropy_enrich_batch(df: pd.DataFrame) -> pd.DataFrame:
-    """Verrijk transacties via Ntropy API. Voegt kolommen toe:
+    """Verrijk transacties via Ntropy Batch API. Voegt kolommen toe:
     - ntropy_entity: schone merchant naam
     - ntropy_category: Ntropy categorie (bv. 'groceries')
     - ntropy_sectie: onze sectie-mapping (bv. 'vaste_lasten')
     - ntropy_categorie: onze categorie-mapping (bv. 'Energie')
     - ntropy_website: merchant website
 
-    Faalt graceful: als API niet beschikbaar, gaat pipeline gewoon door
-    zonder Ntropy-data.
+    Gebruikt de Batch API voor snelheid (alle tx in één request).
+    Faalt graceful: als API niet beschikbaar, gaat pipeline gewoon door.
     """
+    _EMPTY_COLS = ['ntropy_entity', 'ntropy_category', 'ntropy_sectie', 'ntropy_categorie', 'ntropy_website']
+
     if not NTROPY_API_KEY:
         logger.info("NTROPY: geen API key geconfigureerd, skip enrichment")
-        df['ntropy_entity'] = ''
-        df['ntropy_category'] = ''
-        df['ntropy_sectie'] = ''
-        df['ntropy_categorie'] = ''
-        df['ntropy_website'] = ''
+        for col in _EMPTY_COLS:
+            df[col] = ''
         return df
 
     import requests as req
+    import time
 
     headers = {
         'X-API-KEY': NTROPY_API_KEY,
@@ -833,49 +833,33 @@ def _ntropy_enrich_batch(df: pd.DataFrame) -> pd.DataFrame:
         'Accept': 'application/json'
     }
 
-    # Maak unieke account holder per job (of hergebruik bestaande)
+    # Initialiseer kolommen
+    for col in _EMPTY_COLS:
+        df[col] = ''
+
+    # Maak account holder
     ah_id = f"ph-{uuid.uuid4().hex[:8]}"
     try:
         ah_resp = req.post(f"{NTROPY_BASE}/account_holders", headers=headers, json={
             'id': ah_id, 'type': 'consumer', 'name': 'PH Klant'
         }, timeout=10)
         if ah_resp.status_code != 200:
-            logger.warning(f"NTROPY: account_holder aanmaken mislukt: {ah_resp.status_code}")
-            df['ntropy_entity'] = ''
-            df['ntropy_category'] = ''
-            df['ntropy_sectie'] = ''
-            df['ntropy_categorie'] = ''
-            df['ntropy_website'] = ''
+            logger.warning(f"NTROPY: account_holder mislukt: {ah_resp.status_code} {ah_resp.text[:100]}")
             return df
     except Exception as e:
         logger.warning(f"NTROPY: verbinding mislukt: {e}")
-        df['ntropy_entity'] = ''
-        df['ntropy_category'] = ''
-        df['ntropy_sectie'] = ''
-        df['ntropy_categorie'] = ''
-        df['ntropy_website'] = ''
         return df
 
-    # Initialiseer kolommen
-    df['ntropy_entity'] = ''
-    df['ntropy_category'] = ''
-    df['ntropy_sectie'] = ''
-    df['ntropy_categorie'] = ''
-    df['ntropy_website'] = ''
-
-    n_success = 0
-    n_mapped = 0
-    n_errors = 0
+    # Bouw batch payload — idx_map koppelt Ntropy tx-id aan DataFrame index
+    batch_items = []
+    idx_map = {}  # ntropy_id -> df_index
 
     for idx, row in df.iterrows():
-        # Skip interne overboekingen (als al gemarkeerd)
-        if row.get('is_intern', False):
+        bedrag = abs(float(row.get('Transactiebedrag', 0)))
+        if bedrag == 0:
             continue
 
-        bedrag = abs(float(row.get('Transactiebedrag', 0)))
         entry_type = 'incoming' if float(row.get('Transactiebedrag', 0)) > 0 else 'outgoing'
-
-        # Datum van YYYYMMDD naar YYYY-MM-DD
         raw_datum = str(row.get('Transactiedatum', '20250101'))
         if len(raw_datum) == 8 and raw_datum.isdigit():
             api_datum = f"{raw_datum[:4]}-{raw_datum[4:6]}-{raw_datum[6:8]}"
@@ -883,9 +867,11 @@ def _ntropy_enrich_batch(df: pd.DataFrame) -> pd.DataFrame:
             api_datum = raw_datum
 
         omschrijving = str(row.get('Omschrijving', ''))[:200]
+        tx_id = f"ph-{idx}-{uuid.uuid4().hex[:6]}"
+        idx_map[tx_id] = idx
 
-        tx_payload = {
-            'id': f"ph-{idx}-{uuid.uuid4().hex[:6]}",
+        batch_items.append({
+            'id': tx_id,
             'description': omschrijving,
             'date': api_datum,
             'amount': bedrag,
@@ -893,44 +879,98 @@ def _ntropy_enrich_batch(df: pd.DataFrame) -> pd.DataFrame:
             'currency': 'EUR',
             'account_holder_id': ah_id,
             'location': {'country': 'NL'}
-        }
+        })
 
+    if not batch_items:
+        logger.info("NTROPY: geen transacties om te verrijken")
+        return df
+
+    logger.info(f"NTROPY: {len(batch_items)} transacties voorbereid voor batch enrichment")
+
+    # Submit batch
+    try:
+        batch_resp = req.post(f"{NTROPY_BASE}/batches", headers=headers, json={
+            'operation': 'POST /v3/transactions',
+            'data': batch_items
+        }, timeout=30)
+        if batch_resp.status_code != 200:
+            logger.warning(f"NTROPY batch submit mislukt: {batch_resp.status_code} {batch_resp.text[:200]}")
+            return df
+        batch_data = batch_resp.json()
+        batch_id = batch_data['id']
+        logger.info(f"NTROPY: batch {batch_id} submitted, {batch_data.get('total', '?')} items")
+    except Exception as e:
+        logger.warning(f"NTROPY: batch submit exception: {e}")
+        return df
+
+    # Poll voor resultaat (max 5 minuten)
+    max_wait = 300
+    poll_interval = 3
+    waited = 0
+    while waited < max_wait:
+        time.sleep(poll_interval)
+        waited += poll_interval
         try:
-            resp = req.post(f"{NTROPY_BASE}/transactions", headers=headers,
-                           json=tx_payload, timeout=10)
-            if resp.status_code == 200:
-                data = resp.json()
-                n_success += 1
-
-                # Entity (merchant naam)
-                cp = data.get('entities', {}).get('counterparty') or {}
-                entity_name = cp.get('name', '')
-                website = cp.get('website', '')
-                category = data.get('categories', {}).get('general', '')
-
-                df.at[idx, 'ntropy_entity'] = entity_name or ''
-                df.at[idx, 'ntropy_category'] = category or ''
-                df.at[idx, 'ntropy_website'] = website or ''
-
-                # Map naar onze categorieën
-                if category and category in _NTROPY_TO_ONZE_MAPPING:
-                    sectie, cat = _NTROPY_TO_ONZE_MAPPING[category]
-                    df.at[idx, 'ntropy_sectie'] = sectie
-                    df.at[idx, 'ntropy_categorie'] = cat
-                    n_mapped += 1
-            else:
-                n_errors += 1
-                if n_errors <= 3:
-                    logger.warning(f"NTROPY tx error {resp.status_code}: {resp.text[:100]}")
+            status_resp = req.get(f"{NTROPY_BASE}/batches/{batch_id}", headers=headers, timeout=10)
+            if status_resp.status_code == 200:
+                status_data = status_resp.json()
+                progress = status_data.get('progress', 0)
+                total = status_data.get('total', len(batch_items))
+                status = status_data.get('status', '')
+                if waited % 15 == 0:
+                    logger.info(f"NTROPY: batch {progress}/{total} ({status})")
+                if status == 'completed':
+                    break
+                if status == 'error':
+                    logger.error(f"NTROPY: batch failed: {status_data}")
+                    return df
         except Exception as e:
-            n_errors += 1
-            if n_errors <= 3:
-                logger.warning(f"NTROPY tx exception: {e}")
-            if n_errors > 20:
-                logger.error("NTROPY: >20 fouten, stop enrichment voor rest van batch")
-                break
+            logger.warning(f"NTROPY: poll error: {e}")
 
-    logger.info(f"NTROPY: {n_success}/{len(df)} verrijkt, {n_mapped} gemapped naar onze categorieën, {n_errors} fouten")
+    if waited >= max_wait:
+        logger.warning(f"NTROPY: batch timeout na {max_wait}s")
+        return df
+
+    # Haal resultaten op
+    try:
+        results_resp = req.get(f"{NTROPY_BASE}/batches/{batch_id}/results", headers=headers, timeout=30)
+        if results_resp.status_code != 200:
+            logger.warning(f"NTROPY: results ophalen mislukt: {results_resp.status_code}")
+            return df
+        results_data = results_resp.json()
+    except Exception as e:
+        logger.warning(f"NTROPY: results exception: {e}")
+        return df
+
+    # Verwerk resultaten
+    n_success = 0
+    n_mapped = 0
+    for result in results_data.get('results', []):
+        tx_id = result.get('id', '')
+        if tx_id not in idx_map:
+            continue
+        idx = idx_map[tx_id]
+
+        if result.get('error'):
+            continue
+
+        n_success += 1
+        cp = result.get('entities', {}).get('counterparty') or {}
+        entity_name = cp.get('name', '') or ''
+        website = cp.get('website', '') or ''
+        category = result.get('categories', {}).get('general', '') or ''
+
+        df.at[idx, 'ntropy_entity'] = entity_name
+        df.at[idx, 'ntropy_category'] = category
+        df.at[idx, 'ntropy_website'] = website
+
+        if category and category in _NTROPY_TO_ONZE_MAPPING:
+            sectie, cat = _NTROPY_TO_ONZE_MAPPING[category]
+            df.at[idx, 'ntropy_sectie'] = sectie
+            df.at[idx, 'ntropy_categorie'] = cat
+            n_mapped += 1
+
+    logger.info(f"NTROPY: {n_success}/{len(batch_items)} verrijkt, {n_mapped} gemapped naar onze categorieën")
     return df
 
 

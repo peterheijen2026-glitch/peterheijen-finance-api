@@ -3756,10 +3756,14 @@ class RapportPDF(FPDF):
     def cover_page(self, feiten: dict, rapport_datum: str, jaartotalen: dict = None, maandoverzicht: dict = None):
         """Pagina 1: Executive summary — economische lens voor vermogende particulieren.
 
-        Sprint 2: ombouw van huishoudboekje-logica naar executive buckets.
-        6 blokken: structureel inkomen, belastingdruk, woonlasten,
-        levensstijl, vermogensopbouw, onzekere posten.
-        "Vrij besteedbaar" is BEWUST verwijderd als headline metric.
+        Sprint 2v2 (signed-off mapping):
+        - Blok 1: Kerninkomen (breed, bovenaan) + aanvullende instroom
+        - Blok 2: Belastingdruk
+        - Blok 3: Woonlasten
+        - Blok 4: Leefkosten (vast + discretionair)
+        - Blok 5: Netto vermogensallocatie (algebraisch, positief gelabeld)
+        - Blok 6: Buiten kernbeeld (niet-kern + review/onzeker)
+        Layout A: kerninkomen full-width, 2x2 grid, buiten kernbeeld onderaan.
         """
         # Donkere header
         self.set_fill_color(*INK)
@@ -3795,7 +3799,9 @@ class RapportPDF(FPDF):
         tot = max(periodes) if periodes else ''
         self.cell(0, 6, f'{len(feiten)} rekening(en) geanalyseerd  |  {van} t/m {tot}', 0, 1, 'L')
 
-        # --- Executive Buckets: economische lens ---
+        # =====================================================================
+        # EXECUTIVE BUCKETS v2 — signed-off mapping
+        # =====================================================================
         n_maanden = 1
         if maandoverzicht:
             all_months = set()
@@ -3803,16 +3809,23 @@ class RapportPDF(FPDF):
                 all_months.update(rek_m.keys())
             n_maanden = max(len(all_months), 1)
 
-        # === BUCKET MAPPING ===
-        # Structureel inkomen: PAGE-1 WHITELIST (ongewijzigd)
-        _PAGE1_WHITELIST = {
+        # --- Bucket definities ---
+        # Kerninkomen: alleen verdienvermogen + dragende inkomensbasis
+        _KERNINKOMEN = {
             'Netto salaris', 'DGA-loon/Managementfee', 'Huurinkomsten',
-            'UWV/Uitkeringen', 'Kinderbijslag/Kindregelingen', 'Toeslagen',
-            'Freelance/Opdrachten', 'Pensioen/AOW', 'Studiefinanciering',
-            'Overheid overig',
+            'UWV/Uitkeringen', 'Pensioen/AOW',
+        }
+        # Freelance/Opdrachten: alleen kerninkomen als recurring evidence
+        # (>= 3 maanden aanwezig in het maandoverzicht)
+        _FREELANCE_CAT = 'Freelance/Opdrachten'
+
+        # Aanvullende structurele instroom (zichtbaar, niet headline)
+        _AANVULLEND = {
+            'Kinderbijslag/Kindregelingen', 'Toeslagen',
+            'Studiefinanciering', 'Overheid overig',
         }
 
-        # Belastingdruk: belasting-categorieën uit vaste_lasten + inkomsten
+        # Belastingdruk
         _BELASTING_CATS = {
             'Inkomstenbelasting/Voorlopige aanslag',
             'BTW/Omzetbelasting',
@@ -3820,30 +3833,62 @@ class RapportPDF(FPDF):
             'Gemeentebelasting/OZB/Waterschapsbelasting',
         }
 
-        # Woonlasten: woon-gerelateerde categorieën uit vaste_lasten
+        # Woonlasten
         _WOONLASTEN_CATS = {
-            'Hypotheek/Huur',
-            'Energie',
-            'Water',
+            'Hypotheek/Huur', 'Energie', 'Water',
         }
 
-        totaal_inkomen = 0
+        # Niet-kerninstroom (bekend maar niet structureel)
+        _NIET_KERN = {
+            'Belastingteruggave', 'Verzekeringsuitkering', 'Beleggingsinkomen',
+        }
+
+        # --- Freelance recurring check ---
+        freelance_is_recurring = False
+        if maandoverzicht:
+            freelance_months = set()
+            for rek_m in maandoverzicht.values():
+                for maand, cats in rek_m.items():
+                    if isinstance(cats, dict):
+                        for sectie_cats in cats.values():
+                            if isinstance(sectie_cats, dict) and _FREELANCE_CAT in sectie_cats:
+                                freelance_months.add(maand)
+                    # Soms is cats een plat dict van categorienamen
+            freelance_is_recurring = len(freelance_months) >= 3
+
+        # --- Bereken bucket-totalen ---
+        totaal_kern = 0
+        totaal_aanvullend = 0
         totaal_belasting = 0
         totaal_woonlasten = 0
-        totaal_levensstijl = 0
-        totaal_vermogen = 0
-        totaal_onzeker = 0
+        totaal_leef_vast = 0
+        totaal_leef_disc = 0
+        totaal_vermogen_netto = 0  # algebraisch! niet abs()
+        totaal_niet_kern = 0
+        totaal_review = 0
+        totaal_overige_verz = 0  # apart bijhouden voor review-markering
 
         if jaartotalen:
             for rek, totalen in jaartotalen.items():
-                # Inkomsten → structureel of onzeker
+                # Inkomsten → kerninkomen, aanvullend, niet-kern, of review
                 for cat, bedrag in totalen.get('inkomsten', {}).items():
-                    if cat in _PAGE1_WHITELIST:
-                        totaal_inkomen += abs(bedrag or 0)
+                    b = abs(bedrag or 0)
+                    if cat in _KERNINKOMEN:
+                        totaal_kern += b
+                    elif cat == _FREELANCE_CAT:
+                        if freelance_is_recurring:
+                            totaal_kern += b
+                        else:
+                            totaal_aanvullend += b
+                    elif cat in _AANVULLEND:
+                        totaal_aanvullend += b
+                    elif cat in _NIET_KERN:
+                        totaal_niet_kern += b
                     else:
-                        totaal_onzeker += abs(bedrag or 0)
+                        # Alles met "Onzeker" of niet-geclassificeerd → review
+                        totaal_review += b
 
-                # Vaste lasten → belasting, woonlasten, of levensstijl
+                # Vaste lasten → belasting, woonlasten, of vaste leefkosten
                 for cat, bedrag in totalen.get('vaste_lasten', {}).items():
                     b = abs(bedrag or 0)
                     if cat in _BELASTING_CATS:
@@ -3851,78 +3896,195 @@ class RapportPDF(FPDF):
                     elif cat in _WOONLASTEN_CATS:
                         totaal_woonlasten += b
                     else:
-                        totaal_levensstijl += b  # overige vaste = levensstijl
+                        totaal_leef_vast += b
+                        # Track "Overige verzekeringen" apart voor review-markering
+                        if cat == 'Overige verzekeringen':
+                            totaal_overige_verz += b
 
-                # Variabele kosten → levensstijl
+                # Variabele kosten → discretionaire leefkosten
                 for cat, bedrag in totalen.get('variabele_kosten', {}).items():
-                    totaal_levensstijl += abs(bedrag or 0)
+                    totaal_leef_disc += abs(bedrag or 0)
 
-                # Sparen/beleggen → vermogensopbouw
+                # Sparen/beleggen → NETTO vermogensallocatie (algebraisch!)
                 for cat, bedrag in totalen.get('sparen_beleggen', {}).items():
-                    totaal_vermogen += abs(bedrag or 0)
+                    # bedrag is negatief voor stortingen, positief voor terugstortingen
+                    # We willen netto: negatief = er gaat geld naar vermogen
+                    totaal_vermogen_netto += (bedrag or 0)
 
-        pm_inkomen = totaal_inkomen / n_maanden
+        # Per maand
+        pm_kern = totaal_kern / n_maanden
+        pm_aanvullend = totaal_aanvullend / n_maanden
         pm_belasting = totaal_belasting / n_maanden
         pm_woonlasten = totaal_woonlasten / n_maanden
-        pm_levensstijl = totaal_levensstijl / n_maanden
-        pm_vermogen = totaal_vermogen / n_maanden
-        pm_onzeker = totaal_onzeker / n_maanden
+        pm_leef_vast = totaal_leef_vast / n_maanden
+        pm_leef_disc = totaal_leef_disc / n_maanden
+        pm_leef_totaal = pm_leef_vast + pm_leef_disc
+        # Netto naar vermogen: abs() voor weergave, want stortingen zijn negatief
+        pm_vermogen_netto = abs(totaal_vermogen_netto) / n_maanden
+        vermogen_richting = 'naar' if totaal_vermogen_netto <= 0 else 'uit'
+        pm_niet_kern = totaal_niet_kern / n_maanden
+        pm_review = totaal_review / n_maanden
+        pm_buiten_kern = pm_niet_kern + pm_review
 
-        # Metrics grid — 6 blokken (3 rijen x 2 kolommen)
-        metrics = [
-            ('Structureel inkomen',   pm_inkomen,     '/mnd', ACCENT),
-            ('Belastingdruk',         pm_belasting,   '/mnd', (139, 69, 19)),
-            ('Woonlasten',            pm_woonlasten,  '/mnd', (74, 85, 104)),
-            ('Levensstijl',           pm_levensstijl, '/mnd', (74, 85, 104)),
-            ('Vermogensopbouw',       pm_vermogen,    '/mnd', (26, 107, 60)),
-            ('Onzeker (buiten beeld)', pm_onzeker,    '/mnd', (140, 140, 155)),
-        ]
+        # =====================================================================
+        # LAYOUT A: kerninkomen breed → 2x2 grid → buiten kernbeeld
+        # =====================================================================
+        start_y = 88
 
-        box_w = 85
-        box_h = 28
-        gap = 10
-        start_x = 15
-        start_y = 90
+        # --- BLOK 1: Kerninkomen (full width) ---
+        kern_w = 180
+        kern_h = 32
+        x0 = 15
+        self.set_fill_color(*SURFACE)
+        self.set_draw_color(*BORDER)
+        self.rect(x0, start_y, kern_w, kern_h, 'FD')
 
-        for i, (label, value, suffix, color) in enumerate(metrics):
-            col = i % 2
-            row = i // 2
-            x = start_x + col * (box_w + gap)
-            y = start_y + row * (box_h + 6)
+        # Label
+        self.set_font(self.DATA, '', 8)
+        self.set_text_color(*INK_SOFT)
+        self.set_xy(x0 + 10, start_y + 4)
+        self.cell(80, 4, 'Kerninkomen', 0, 0, 'L')
 
-            # Achtergrond
-            self.set_fill_color(*SURFACE)
-            self.set_draw_color(*BORDER)
-            self.rect(x, y, box_w, box_h, 'FD')
+        # Bedrag (groot)
+        self.set_font(self.DATA, 'B', 16)
+        self.set_text_color(*ACCENT)
+        self.set_xy(x0 + 10, start_y + 12)
+        self.cell(80, 8, eur(pm_kern) + '/mnd', 0, 0, 'L')
 
-            # Label
+        # Aanvullende instroom (rechts, kleiner)
+        if pm_aanvullend > 0:
             self.set_font(self.DATA, '', 7.5)
             self.set_text_color(*INK_SOFT)
-            self.set_xy(x + 8, y + 5)
-            self.cell(box_w - 16, 4, label, 0, 0, 'L')
+            self.set_xy(x0 + 100, start_y + 6)
+            self.cell(70, 4, '+ aanvullende instroom', 0, 0, 'L')
+            self.set_font(self.DATA, '', 9)
+            self.set_text_color(161, 137, 75)  # licht goud
+            self.set_xy(x0 + 100, start_y + 13)
+            self.cell(70, 5, eur(pm_aanvullend) + '/mnd', 0, 0, 'L')
+            # Detail
+            self.set_font(self.DATA, '', 6.5)
+            self.set_text_color(*INK_SOFT)
+            self.set_xy(x0 + 100, start_y + 21)
+            self.cell(70, 3, '(kinderbijslag, toeslagen, overheid)', 0, 0, 'L')
 
-            # Bedrag
-            self.set_font(self.DATA, 'B', 13)
-            self.set_text_color(*color)
-            self.set_xy(x + 8, y + 13)
-            self.cell(box_w - 16, 7, eur(value) + suffix, 0, 0, 'L')
+        # --- 2x2 GRID: belasting, woon, leefkosten, vermogen ---
+        grid_y = start_y + kern_h + 6
+        box_w = 85
+        box_h = 35
+        gap = 10
+
+        # Blok 2: Belastingdruk (links boven)
+        bx, by = x0, grid_y
+        self.set_fill_color(*SURFACE)
+        self.set_draw_color(*BORDER)
+        self.rect(bx, by, box_w, box_h, 'FD')
+        self.set_font(self.DATA, '', 7.5)
+        self.set_text_color(*INK_SOFT)
+        self.set_xy(bx + 8, by + 5)
+        self.cell(box_w - 16, 4, 'Belastingdruk', 0, 0, 'L')
+        self.set_font(self.DATA, 'B', 13)
+        self.set_text_color(139, 69, 19)  # bruin
+        self.set_xy(bx + 8, by + 14)
+        self.cell(box_w - 16, 7, eur(pm_belasting) + '/mnd', 0, 0, 'L')
+
+        # Blok 3: Woonlasten (rechts boven)
+        bx2 = x0 + box_w + gap
+        self.set_fill_color(*SURFACE)
+        self.set_draw_color(*BORDER)
+        self.rect(bx2, by, box_w, box_h, 'FD')
+        self.set_font(self.DATA, '', 7.5)
+        self.set_text_color(*INK_SOFT)
+        self.set_xy(bx2 + 8, by + 5)
+        self.cell(box_w - 16, 4, 'Woonlasten', 0, 0, 'L')
+        self.set_font(self.DATA, 'B', 13)
+        self.set_text_color(74, 85, 104)  # slate
+        self.set_xy(bx2 + 8, by + 14)
+        self.cell(box_w - 16, 7, eur(pm_woonlasten) + '/mnd', 0, 0, 'L')
+
+        # Blok 4: Leefkosten (links onder) — met vast/discretionair split
+        by2 = grid_y + box_h + 6
+        self.set_fill_color(*SURFACE)
+        self.set_draw_color(*BORDER)
+        self.rect(bx, by2, box_w, box_h, 'FD')
+        self.set_font(self.DATA, '', 7.5)
+        self.set_text_color(*INK_SOFT)
+        self.set_xy(bx + 8, by2 + 4)
+        self.cell(box_w - 16, 4, 'Leefkosten', 0, 0, 'L')
+        self.set_font(self.DATA, 'B', 13)
+        self.set_text_color(74, 85, 104)  # slate
+        self.set_xy(bx + 8, by2 + 12)
+        self.cell(box_w - 16, 7, eur(pm_leef_totaal) + '/mnd', 0, 0, 'L')
+        # Sub-split
+        self.set_font(self.DATA, '', 6.5)
+        self.set_text_color(*INK_SOFT)
+        self.set_xy(bx + 8, by2 + 22)
+        self.cell(box_w - 16, 3, f'vast: {eur(pm_leef_vast)}  |  discretionair: {eur(pm_leef_disc)}', 0, 0, 'L')
+        # Overige verzekeringen review-markering (Optie B)
+        if totaal_overige_verz > 2000:
+            self.set_font(self.DATA, '', 5.5)
+            self.set_text_color(160, 120, 50)
+            self.set_xy(bx + 8, by2 + 28)
+            self.cell(box_w - 16, 3, f'* incl. {eur(totaal_overige_verz / n_maanden)}/mnd overige verzekeringen', 0, 0, 'L')
+
+        # Blok 5: Netto vermogensallocatie (rechts onder) — positief gelabeld
+        self.set_fill_color(*SURFACE)
+        self.set_draw_color(*BORDER)
+        self.rect(bx2, by2, box_w, box_h, 'FD')
+        self.set_font(self.DATA, '', 7.5)
+        self.set_text_color(*INK_SOFT)
+        self.set_xy(bx2 + 8, by2 + 4)
+        self.cell(box_w - 16, 4, f'Netto {vermogen_richting} vermogen', 0, 0, 'L')
+        self.set_font(self.DATA, 'B', 13)
+        self.set_text_color(26, 107, 60)  # groen
+        self.set_xy(bx2 + 8, by2 + 12)
+        self.cell(box_w - 16, 7, eur(pm_vermogen_netto) + '/mnd', 0, 0, 'L')
+        # Toelichting
+        self.set_font(self.DATA, '', 6.5)
+        self.set_text_color(*INK_SOFT)
+        self.set_xy(bx2 + 8, by2 + 22)
+        self.cell(box_w - 16, 3, f'per saldo {"gestort" if vermogen_richting == "naar" else "onttrokken"}', 0, 0, 'L')
+
+        # --- BLOK 6: Buiten kernbeeld (full width, kleiner, onderaan) ---
+        buiten_y = by2 + box_h + 6
+        buiten_h = 20
+        self.set_fill_color(240, 240, 242)  # iets lichter grijs
+        self.set_draw_color(*BORDER)
+        self.rect(x0, buiten_y, kern_w, buiten_h, 'FD')
+
+        self.set_font(self.DATA, '', 7)
+        self.set_text_color(140, 140, 155)  # grijs
+        self.set_xy(x0 + 10, buiten_y + 3)
+        self.cell(60, 4, 'Buiten kernbeeld', 0, 0, 'L')
+
+        # Niet-kerninstroom (links)
+        self.set_font(self.DATA, '', 7)
+        self.set_text_color(*INK_SOFT)
+        self.set_xy(x0 + 10, buiten_y + 10)
+        niet_kern_label = f'Niet-kerninstroom: {eur(pm_niet_kern)}/mnd' if pm_niet_kern > 0 else 'Niet-kerninstroom: -'
+        self.cell(80, 4, niet_kern_label, 0, 0, 'L')
+
+        # Review/onzeker (rechts)
+        self.set_xy(x0 + 100, buiten_y + 10)
+        review_label = f'Review/onzeker: {eur(pm_review)}/mnd' if pm_review > 0 else 'Review/onzeker: -'
+        self.cell(70, 4, review_label, 0, 0, 'L')
 
         # --- Uitleg onder metrics ---
-        self.set_y(start_y + 3 * (box_h + 6) + 4)
+        uitleg_y = buiten_y + buiten_h + 4
         self.set_draw_color(*GOLD)
         self.set_line_width(0.4)
-        self.line(15, self.get_y(), 195, self.get_y())
-        self.ln(4)
+        self.line(15, uitleg_y, 195, uitleg_y)
+        self.set_y(uitleg_y + 3)
 
-        self.set_font(self.BODY, 'I', 8.5)
+        self.set_font(self.BODY, 'I', 8)
         self.set_text_color(*INK_SOFT)
         uitleg = (
             f'Dit overzicht toont uw gemiddelde maandelijkse geldstromen over {n_maanden} maanden, '
             f'berekend op basis van {len(feiten)} rekening(en). '
             f'Interne overboekingen tussen eigen rekeningen zijn uitgesloten. '
-            f'Onzekere posten (niet-geverifieerde inflows) zijn apart vermeld en tellen niet mee in de kerngetallen.'
+            f'Niet-kerninstroom (belastingteruggave, incidentele uitkeringen) en onzekere posten '
+            f'staan apart en tellen niet mee in de kerngetallen.'
         )
-        self.multi_cell(180, 4.5, uitleg, 0, 'L')
+        self.multi_cell(180, 4, uitleg, 0, 'L')
 
         # Disclaimer onderaan cover
         self.set_y(258)

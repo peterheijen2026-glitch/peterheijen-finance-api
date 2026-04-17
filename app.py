@@ -2160,8 +2160,12 @@ def _detecteer_vast_inkomen(df: pd.DataFrame) -> pd.DataFrame:
     gevonden_ibans = set()
 
     # =========================================================================
-    # LAAG 1: KEYWORD — "SALARIS" / "LOON" in omschrijving
+    # LAAG 1: KEYWORD — expliciete inkomens-keywords in omschrijving
     # =========================================================================
+    # Twee sub-categorieën:
+    # A) Salaris-keywords → Netto salaris
+    # B) Management fee keywords → DGA-loon/Managementfee
+    n_mgmt_keyword = 0
     for idx, row in df_kandidaat.iterrows():
         omschr = str(row.get('Omschrijving', '')).upper()
         bedrag = float(row.get('bedrag', 0))
@@ -2172,24 +2176,46 @@ def _detecteer_vast_inkomen(df: pd.DataFrame) -> pd.DataFrame:
             n_geblokkeerd_party_type += 1
             continue
 
+        if bedrag < 200:
+            continue
+
+        # A) Salaris-keywords → Netto salaris
         salaris_keywords = ['SALARIS', ' LOON ', 'LOON/', '/LOON', 'SALARY',
                             'NETTO LOON', 'NETTOLOON', 'LOONBETALING',
                             'SALARISBETALING', 'MAANDLOON']
         if any(kw in omschr or omschr.startswith(kw.lstrip()) for kw in salaris_keywords):
-            if bedrag >= 200:
-                df.at[idx, 'regel_sectie'] = 'inkomsten'
-                df.at[idx, 'regel_categorie'] = 'Netto salaris'
-                df.at[idx, 'regel_confidence'] = 0.95
-                df.at[idx, 'classificatie_bron'] = 'rule'
-                df.at[idx, 'source_family'] = 'salary_employment'
-                n_keyword += 1
-                if 'Tegenrekening' in df.columns:
-                    tegen = _normaliseer_iban(str(row.get('Tegenrekening', '')))
-                    if tegen:
-                        gevonden_ibans.add(tegen)
+            df.at[idx, 'regel_sectie'] = 'inkomsten'
+            df.at[idx, 'regel_categorie'] = 'Netto salaris'
+            df.at[idx, 'regel_confidence'] = 0.95
+            df.at[idx, 'classificatie_bron'] = 'rule'
+            df.at[idx, 'source_family'] = 'salary_employment'
+            n_keyword += 1
+            if 'Tegenrekening' in df.columns:
+                tegen = _normaliseer_iban(str(row.get('Tegenrekening', '')))
+                if tegen:
+                    gevonden_ibans.add(tegen)
+            continue
+
+        # B) Management fee keywords → DGA-loon/Managementfee
+        mgmt_keywords = ['MANAGEMENT FEE', 'MANAGEMENTFEE', 'MANAGEMENTVERGOEDING',
+                         'MGMT FEE', 'MANAGEMENT VERGOEDING', 'BEHEERVERGOEDING']
+        if any(kw in omschr for kw in mgmt_keywords):
+            df.at[idx, 'regel_sectie'] = 'inkomsten'
+            df.at[idx, 'regel_categorie'] = 'DGA-loon/Managementfee'
+            df.at[idx, 'regel_confidence'] = 0.93
+            df.at[idx, 'classificatie_bron'] = 'rule'
+            df.at[idx, 'source_family'] = 'management_fee'
+            n_mgmt_keyword += 1
+            if 'Tegenrekening' in df.columns:
+                tegen = _normaliseer_iban(str(row.get('Tegenrekening', '')))
+                if tegen:
+                    gevonden_ibans.add(tegen)
+            continue
 
     if n_keyword > 0:
         logger.info(f"SALARIS-KEYWORD: {n_keyword} transacties met 'SALARIS'/'LOON' in omschrijving")
+    if n_mgmt_keyword > 0:
+        logger.info(f"MGMT-KEYWORD: {n_mgmt_keyword} transacties met 'MANAGEMENT FEE' in omschrijving")
 
     # Update kandidaten
     mask = (~df['is_intern']) & (df['classificatie_bron'].isna()) & (df['bedrag'] > 0)
@@ -2198,12 +2224,6 @@ def _detecteer_vast_inkomen(df: pd.DataFrame) -> pd.DataFrame:
     # =========================================================================
     # LAAG 2: RECHTSVORM — B.V., Stichting, N.V., Gemeente, etc.
     # =========================================================================
-    # Bidirectionele IBANs: IBANs waar we OOK geld naartoe sturen
-    _bidi_ibans_salary = set()
-    if 'Tegenrekening' in df.columns:
-        for iban_val in df[(df['bedrag'] < 0) & (~df['is_intern']) & df['Tegenrekening'].notna()]['Tegenrekening'].unique():
-            _bidi_ibans_salary.add(_normaliseer_iban(str(iban_val)))
-
     # =========================================================================
     # ZAKELIJKE REKENING DETECTIE (simpel & robuust)
     # =========================================================================
@@ -2297,25 +2317,17 @@ def _detecteer_vast_inkomen(df: pd.DataFrame) -> pd.DataFrame:
 
         # Classificatielogica geïnspireerd op Shortcut.ai:
         # Kernprincipe: classificeer eerlijk op basis van bewijs.
-        # "Dat weet ik niet 100% alleen uit de bankregel."
+        # Salaris/management-fee keywords zijn al afgehandeld in Laag 1.
+        # Laag 2 classificeert op basis van rechtsvorm + rekeningtype.
         #
-        # 1. Salaris-keyword → Netto salaris (sterkste signaal, altijd)
-        # 2. Holding/Management → DGA-loon/Managementfee
-        # 3. Eigen BV (bidirectioneel) → Inkomen uit eigen BV
-        # 4. Op zakelijke rekening (=BV-rekening) → Freelance/Opdrachten
-        # 5. Werkgever op privérekening → Netto salaris
-        # 6. Overige BV/NV → Netto salaris (veilige default)
+        # 1. Holding/Management in naam → DGA-loon/Managementfee
+        # 2. Op BV-rekening → Freelance/Opdrachten (bedrijfsomzet)
+        # 3. Werkgever op privérekening → Netto salaris
+        # 4. Overige BV/NV op privérekening → Netto salaris (default)
 
         heeft_salaris_kw = any(kw in tekst_check for kw in ['SALARIS', 'LOON', 'SALARY',
                                                              'NETTOLOON', 'PAYROLL', 'LOONRUN'])
         is_holding_mgmt = (heeft_holding or mgmt_met_bedrijf) and not heeft_werkgever
-
-        # Bidirectioneel: stuur je ook geld NAAR deze tegenpartij? → eigen BV
-        is_eigen_bv = False
-        if heeft_bv and 'Tegenrekening' in df.columns:
-            groep_iban = _normaliseer_iban(key_str) if key_str[:2].isalpha() else ''
-            if groep_iban and groep_iban in _bidi_ibans_salary:
-                is_eigen_bv = True
 
         # Zakelijke rekening: komt dit inkomen binnen op je BV-rekening?
         op_zakelijke_rek = False
@@ -2324,7 +2336,7 @@ def _detecteer_vast_inkomen(df: pd.DataFrame) -> pd.DataFrame:
             op_zakelijke_rek = bool(groep_rekeningen & _zakelijke_rekeningen)
 
         if heeft_salaris_kw:
-            # Sterkste signaal: expliciet salaris/loon in tekst
+            # Salaris-keyword (backup voor als Laag 1 het miste)
             categorie = 'Netto salaris'
             source_fam = 'salary_employment'
             confidence = 0.95
@@ -2332,19 +2344,9 @@ def _detecteer_vast_inkomen(df: pd.DataFrame) -> pd.DataFrame:
             categorie = 'DGA-loon/Managementfee'
             source_fam = 'management_fee'
             confidence = 0.90
-        elif is_eigen_bv:
-            # Shortcut: "het is inkomen, het komt maandelijks, het komt uit
-            # jouw eigen BV — maar het zegt niet expliciet loon/salaris."
-            categorie = 'Inkomen uit eigen BV'
-            source_fam = 'management_fee'
-            confidence = 0.85
-            logger.info(
-                f"EIGEN-BV: {key_str[:50]} — bidirectioneel bewezen, "
-                f"geen salaris-keyword → Inkomen uit eigen BV"
-            )
         elif op_zakelijke_rek:
             # Inkomen op BV-rekening van derde partij = bedrijfsomzet.
-            # Foundation, Stichting, Gemeente etc. die je BV betaalt =
+            # Sevi BV, Foundation, Gemeente etc. die je BV betaalt =
             # opdrachtgever, niet werkgever.
             categorie = 'Freelance/Opdrachten'
             source_fam = 'freelance_business'

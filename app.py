@@ -3149,7 +3149,84 @@ def bereken_top(df: pd.DataFrame, n: int = 15) -> dict:
 # STAP 3: CLAUDE CATEGORISEERT EN ANALYSEERT
 # ---------------------------------------------------------------------------
 
-def bouw_prompt(df: pd.DataFrame, feiten: dict, top: dict, eigen_rekeningen: set = None) -> str:
+def _bouw_ground_truth_prompt_sectie(ground_truth: dict) -> str:
+    """Bouw de GRONDWAARHEID sectie voor de AI-prompt.
+
+    Dit vertelt de AI welke getallen bevroren zijn en dat het NIETS zelf
+    mag berekenen. Elk getal in de AI-tekst moet hieruit komen.
+    """
+    lines = []
+    lines.append("## ======================================================")
+    lines.append("## GRONDWAARHEID — BEREKENDE TOTALEN (V3)")
+    lines.append("## ======================================================")
+    lines.append("## KRITIEK: Gebruik UITSLUITEND onderstaande getallen in je analyse.")
+    lines.append("## Je mag NIET zelf optellen, aftrekken, of percentages berekenen.")
+    lines.append("## Elk getal in je tekst MOET letterlijk voorkomen in deze lijst.")
+    lines.append("## Als een getal niet in deze lijst staat, noem het dan NIET.")
+    lines.append("")
+
+    # Periode
+    periode = ground_truth.get('periode', {})
+    n_mnd = periode.get('n_mnd', 12)
+    lines.append(f"Analyseperiode: {n_mnd} volle maanden")
+    if periode.get('volle_maanden'):
+        lines.append(f"  Van: {min(periode['volle_maanden'])} t/m {max(periode['volle_maanden'])}")
+    if periode.get('onvolledige_maanden'):
+        lines.append(f"  Onvolledige maanden (niet meegeteld): {', '.join(periode['onvolledige_maanden'])}")
+    lines.append("")
+
+    # Saldo
+    saldo = ground_truth.get('saldo', {})
+    lines.append(f"Totaal beginsaldo: EUR {saldo.get('totaal_begin', 0):,.2f}")
+    lines.append(f"Totaal eindsaldo: EUR {saldo.get('totaal_eind', 0):,.2f}")
+    lines.append("")
+
+    # Sectie-totalen
+    sectie_labels = {
+        'inkomsten': 'INKOMSTEN',
+        'vaste_lasten': 'VASTE LASTEN',
+        'variabele_kosten': 'VARIABELE UITGAVEN',
+        'sparen_beleggen': 'SPAREN & BELEGGEN',
+        'onderling_neutraal': 'ONDERLING / NEUTRAAL',
+    }
+    sectie_totalen = ground_truth.get('sectie_totalen_12m', {})
+    sectie_gem = ground_truth.get('sectie_gemiddelden_pm', {})
+    cat_totalen = ground_truth.get('categorie_totalen_12m', {})
+
+    for sectie_key, label in sectie_labels.items():
+        totaal = sectie_totalen.get(sectie_key, 0)
+        gem = sectie_gem.get(sectie_key, 0)
+        lines.append(f"### {label}")
+        lines.append(f"  Totaal {n_mnd}m: EUR {totaal:,.2f}")
+        lines.append(f"  Gemiddeld p/m: EUR {gem:,.2f}")
+
+        # Categorieën
+        cats = cat_totalen.get(sectie_key, {})
+        for cat, bedrag in sorted(cats.items(), key=lambda x: abs(x[1]), reverse=True):
+            if abs(bedrag) >= 0.01:
+                lines.append(f"    - {cat}: EUR {bedrag:,.2f}")
+        lines.append("")
+
+    # Income sources (bronopbouw)
+    income_sources = ground_truth.get('income_sources', {})
+    if income_sources:
+        lines.append("### INKOMSTENBRONOPBOUW (source_family)")
+        for sf, data in sorted(income_sources.items(), key=lambda x: abs(x[1].get('bedrag_12m', 0)), reverse=True):
+            bedrag = data.get('bedrag_12m', 0)
+            n_tx = data.get('transacties', 0)
+            lines.append(f"  - {sf}: EUR {bedrag:,.2f} ({n_tx} transacties)")
+        lines.append("")
+
+    # Netto mutaties
+    netto = saldo.get('totaal_eind', 0) - saldo.get('totaal_begin', 0)
+    lines.append(f"Netto vermogensmutatie over periode: EUR {netto:,.2f}")
+    lines.append("")
+
+    return "\n".join(lines)
+
+
+def bouw_prompt(df: pd.DataFrame, feiten: dict, top: dict, eigen_rekeningen: set = None,
+                ground_truth: dict = None) -> str:
     # Splits interne transfers van echte transacties
     if 'is_intern' in df.columns:
         df_extern = df[~df['is_intern']].copy()
@@ -3437,14 +3514,13 @@ Gebruik deze kenmerken om het TYPE belasting te bepalen:
 - Bekijk het bedrag: kleine bedragen bij een onbekende tegenpartij passen vaak bij Boodschappen, Huishoudelijke artikelen, of Café. Grotere bedragen bij onbekenden passen vaak bij Onderhoud woning, Meubels, of Vakantie.
 - BV-eigendom: zeg ALLEEN "uw BV" als de BV voorkomt in de CATEGORISATIE-HINTS als eigen BV van de gebruiker. Als een BV NIET in de hints staat, beschrijf dan alleen de feitelijke geldstroom zonder eigendom aan te nemen. Een betaling AAN een BV betekent NIET dat de gebruiker eigenaar is.
 
-## CORRECTE TOTALEN
-{json.dumps(feiten, indent=2, ensure_ascii=False)}
-
 ## TOP TEGENPARTIJEN
 {json.dumps(top, indent=2, ensure_ascii=False)}
 
 ## TRANSACTIES (datum|rekening|bedrag|omschrijving)
 {chr(10).join(regels)}
+
+{_bouw_ground_truth_prompt_sectie(ground_truth) if ground_truth else f"## CORRECTE TOTALEN{chr(10)}{json.dumps(feiten, indent=2, ensure_ascii=False)}"}
 
 ## OUTPUT FORMAT
 Antwoord ALLEEN in valid JSON:
@@ -3470,11 +3546,11 @@ Antwoord ALLEEN in valid JSON:
     }}
   }},
   "analyse": {{
-    "samenvatting": "3-4 alinea's. Schrijf als een senior financieel adviseur die een vermogende particulier of DGA informeert — rustig, zakelijk, respectvol. Begin met het totaalbeeld: hoeveel komt er structureel binnen, hoeveel gaat er structureel uit, hoeveel gaat naar vermogensopbouw. Benoem dan de cashflowdynamiek: zijn er grote interne verschuivingen, beleggingstransacties, of seizoenseffecten die het beeld vertekenen? Eindig met de kern: waar zit de financiele kracht en waar de kwetsbaarheid. Noem altijd concrete bedragen. TOON-REGELS: (1) Gebruik NOOIT een oordelende of budgetcoach-achtige toon. Gebruik neutrale financiele taal. (2) Wees EERLIJK over onzekerheden: als een classificatie onzeker is, zeg dat. Schrijf 'Op basis van de transactiepatronen lijkt dit...' in plaats van stellige beweringen. (3) Spreek de gebruiker NOOIT aan met 'uw BV' tenzij je ZEKER weet dat het een eigen BV is. (4) Als er grote bedragen zijn die niet eenduidig te classificeren zijn, benoem dit expliciet als punt van aandacht. Een betrouwbaar rapport dat eerlijk is over zijn beperkingen is meer waard dan een zelfverzekerd rapport dat fouten bevat.",
-    "sterke_punten": ["Noem 3-5 financiele sterktes met concrete bedragen. Schrijf bevestigend en zakelijk, bv: 'Stabiel structureel inkomen van gemiddeld €X/mnd via DGA-loon en huurinkomsten', 'Actieve vermogensopbouw: gemiddeld €X/mnd naar beleggingen en pensioen'"],
-    "aandachtspunten": ["Noem 3-5 signalen die aandacht verdienen. Gebruik GEEN oordelende taal. Schrijf als observaties, bv: 'Discretionaire uitgaven vertonen maandelijkse spreiding van €X tot €Y — mogelijke grip-verbetering', 'Liquiditeitsmarge na vaste lasten en vermogensopbouw is beperkt tot ca. €X/mnd'"],
-    "aanbevelingen": ["Geef 3-5 concrete, strategische aanbevelingen. Denk op het niveau van financieel advies, niet budgetcoaching. Bv: 'Overweeg een liquiditeitsbuffer van 3-6 maanden vaste lasten (ca. €X) aan te houden alvorens extra beleggingen', 'Consolidatie van beleggingsrekeningen kan beheerkosten en overzicht verbeteren'"],
-    "verrassende_inzichten": ["Geef 2-3 patronen of inzichten die een drukke vermogende particulier NIET zelf zou zien maar die een AI wel opvalt. Denk aan: seizoenspatronen in cashflow, verborgen belastingoptimalisatie-mogelijkheden, structurele mismatch tussen inkomen en vermogensopbouw, ongewone correlaties, DGA-loon vs dividendoptimalisatie, effectief belastingtarief dat te hoog lijkt, categorieën die relatief hoog zijn vergeleken met vergelijkbare huishoudens. Dit is de WOW-factor van het rapport — maak het concreet met bedragen en vertel iets dat de klant verrast."]
+    "samenvatting": "3-4 alinea's. Schrijf als een senior financieel adviseur die een vermogende particulier of DGA informeert — rustig, zakelijk, respectvol. Begin met het totaalbeeld: hoeveel komt er structureel binnen, hoeveel gaat er structureel uit, hoeveel gaat naar vermogensopbouw. Benoem dan de cashflowdynamiek: zijn er grote interne verschuivingen, beleggingstransacties, of seizoenseffecten die het beeld vertekenen? Eindig met de kern: waar zit de financiele kracht en waar de kwetsbaarheid. KRITIEK: Elk getal in je tekst MOET letterlijk voorkomen in de GRONDWAARHEID sectie hierboven. Je mag NIET zelf optellen, aftrekken, of percentages berekenen. TOON-REGELS: (1) Gebruik NOOIT een oordelende of budgetcoach-achtige toon. Gebruik neutrale financiele taal. (2) Wees EERLIJK over onzekerheden. (3) Spreek de gebruiker NOOIT aan met 'uw BV' tenzij je ZEKER weet dat het een eigen BV is.",
+    "sterke_punten": ["Noem 3-5 financiele sterktes. Gebruik ALLEEN bedragen uit de GRONDWAARHEID. Schrijf bevestigend en zakelijk."],
+    "aandachtspunten": ["Noem 3-5 signalen die aandacht verdienen. Gebruik ALLEEN bedragen uit de GRONDWAARHEID. Geen oordelende taal."],
+    "aanbevelingen": ["Geef 3-5 concrete, strategische aanbevelingen op het niveau van financieel advies, niet budgetcoaching."],
+    "verrassende_inzichten": ["Geef 2-3 patronen of inzichten die een drukke vermogende particulier NIET zelf zou zien maar die een AI wel opvalt. Gebruik ALLEEN bedragen uit de GRONDWAARHEID."]
   }}
 }}"""
 
@@ -4822,7 +4898,8 @@ def genereer_pdf(rapport: dict) -> bytes:
 # STAP 5: EMAIL VERSTUREN VIA RESEND
 # ---------------------------------------------------------------------------
 
-def verstuur_rapport_email(email: str, pdf_bytes: bytes, report_id: str):
+def verstuur_rapport_email(email: str, pdf_bytes: bytes, report_id: str,
+                           reconciliatie_excel: bytes = None):
     """Verstuur het PDF rapport per email via Resend.
 
     Retourneert True bij succes, False bij falen.
@@ -4912,9 +4989,19 @@ def verstuur_rapport_email(email: str, pdf_bytes: bytes, report_id: str):
                 "filename": f"financieel-rapport-{report_id}.pdf",
                 "content": pdf_base64,
                 "type": "application/pdf",
-            }
+            },
         ],
     }
+
+    # V3: Reconciliatie Excel als extra bijlage
+    if reconciliatie_excel:
+        excel_base64 = base64.b64encode(reconciliatie_excel).decode('utf-8')
+        payload["attachments"].append({
+            "filename": f"cashflow-overzicht-{report_id}.xlsx",
+            "content": excel_base64,
+            "type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        })
+        logger.info(f"Reconciliatie Excel bijlage: {len(reconciliatie_excel)} bytes")
 
     try:
         resp = httpx.post(
@@ -5061,6 +5148,413 @@ async def analyseer(bestand: UploadFile):
     return rapport
 
 
+# ---------------------------------------------------------------------------
+# V3: FROZEN GROUND TRUTH PAYLOAD
+# ---------------------------------------------------------------------------
+
+def _bouw_ground_truth(merged_data: dict, feiten: dict, rapportperiode: dict,
+                       reconciliatie: dict, df: pd.DataFrame) -> dict:
+    """V3: Bouw bevroren ground truth payload.
+
+    Na dit punt komen ALLE getallen in het rapport (PDF, Excel, AI-tekst)
+    uitsluitend hieruit. Niets wordt meer opnieuw berekend.
+    """
+    volle_maanden = set(rapportperiode.get('volle_maanden', []))
+    n_mnd = rapportperiode.get('n_mnd', 12) or 12
+
+    maandoverzicht = merged_data.get('maandoverzicht', {})
+    jaartotalen = merged_data.get('jaartotalen', {})
+
+    # Combineer alle rekeningen naar TOTAAL
+    combined_maand = {}  # {maand: {sectie: {categorie: bedrag}}}
+    combined_jaar = {}   # {sectie: {categorie: bedrag}}
+
+    for rek, maanden in maandoverzicht.items():
+        for maand, secties in maanden.items():
+            if maand not in combined_maand:
+                combined_maand[maand] = {}
+            for sectie, cats in secties.items():
+                if sectie == 'interne_verschuivingen':
+                    continue
+                if sectie not in combined_maand[maand]:
+                    combined_maand[maand][sectie] = {}
+                if isinstance(cats, dict):
+                    for cat, data in cats.items():
+                        bedrag = data.get('bedrag', 0) if isinstance(data, dict) else float(data)
+                        bestaand = combined_maand[maand][sectie].get(cat, 0)
+                        combined_maand[maand][sectie][cat] = round(bestaand + bedrag, 2)
+
+    for rek, secties in jaartotalen.items():
+        for sectie, cats in secties.items():
+            if sectie == 'interne_verschuivingen':
+                continue
+            if sectie not in combined_jaar:
+                combined_jaar[sectie] = {}
+            if isinstance(cats, dict):
+                for cat, bedrag in cats.items():
+                    bestaand = combined_jaar[sectie].get(cat, 0)
+                    combined_jaar[sectie][cat] = round(bestaand + float(bedrag), 2)
+
+    # Bereken sectie-totalen (alleen volle maanden)
+    sectie_totalen_12m = {}
+    for sectie, cats in combined_jaar.items():
+        sectie_totalen_12m[sectie] = round(sum(float(v) for v in cats.values()), 2)
+
+    # Per-maand sectie-totalen
+    maand_sectie_totalen = {}
+    for maand, secties in combined_maand.items():
+        maand_sectie_totalen[maand] = {}
+        for sectie, cats in secties.items():
+            maand_sectie_totalen[maand][sectie] = round(sum(float(v) for v in cats.values()), 2)
+
+    # Saldo per rekening per maand
+    saldo_per_rekening = {}
+    for rek, rek_feiten in feiten.items():
+        saldo_per_rekening[rek] = {
+            'beginsaldo': rek_feiten['saldo']['beginsaldo'],
+            'eindsaldo': rek_feiten['saldo']['eindsaldo'],
+            'maanden': rek_feiten.get('maanden', {}),
+        }
+
+    # Geconsolideerd saldo
+    totaal_begin = sum(f['saldo']['beginsaldo'] for f in feiten.values())
+    totaal_eind = sum(f['saldo']['eindsaldo'] for f in feiten.values())
+
+    # Income source breakdown (V3: expliciete bronopbouw)
+    income_sources = {}
+    if 'source_family' in df.columns:
+        df_income = df[(df['regel_sectie'] == 'inkomsten') & (~df.get('is_intern', False))]
+        for sf, groep in df_income.groupby('source_family'):
+            if pd.notna(sf):
+                income_sources[str(sf)] = {
+                    'bedrag_12m': round(float(groep['bedrag'].sum()), 2),
+                    'transacties': len(groep),
+                    'categorieën': list(groep['regel_categorie'].dropna().unique()),
+                }
+
+    ground_truth = {
+        'versie': 'V3',
+        'periode': {
+            'volle_maanden': sorted(volle_maanden),
+            'onvolledige_maanden': rapportperiode.get('onvolledige_maanden', []),
+            'n_mnd': n_mnd,
+            'alle_maanden': sorted(combined_maand.keys()),
+        },
+        'saldo': {
+            'totaal_begin': round(totaal_begin, 2),
+            'totaal_eind': round(totaal_eind, 2),
+            'per_rekening': saldo_per_rekening,
+        },
+        'sectie_totalen_12m': sectie_totalen_12m,
+        'sectie_gemiddelden_pm': {
+            s: round(t / n_mnd, 2) for s, t in sectie_totalen_12m.items()
+        } if n_mnd > 0 else {},
+        'categorie_totalen_12m': combined_jaar,
+        'maandoverzicht': combined_maand,
+        'maand_sectie_totalen': maand_sectie_totalen,
+        'income_sources': income_sources,
+        'reconciliatie': reconciliatie,
+    }
+
+    # Log de ground truth samenvatting
+    logger.info("V3 GROUND TRUTH gebouwd:")
+    for sectie, totaal in sectie_totalen_12m.items():
+        logger.info(f"  {sectie}: EUR {totaal:,.2f}")
+    logger.info(f"  Saldo: begin EUR {totaal_begin:,.2f} → eind EUR {totaal_eind:,.2f}")
+
+    return ground_truth
+
+
+# ---------------------------------------------------------------------------
+# V3: RECONCILIATIE EXCEL GENERATOR
+# ---------------------------------------------------------------------------
+
+def _genereer_reconciliatie_excel(ground_truth: dict, feiten: dict, df: pd.DataFrame) -> bytes:
+    """V3: Genereer reconciliatie Excel in Shortcut.ai Cashflow Overzicht format.
+
+    Output: bytes (xlsx bestand)
+    """
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+    from io import BytesIO
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Cashflow Overzicht"
+
+    # Styling
+    font_header = Font(name='Arial', bold=True, size=11)
+    font_section = Font(name='Arial', bold=True, size=10, color='FFFFFF')
+    font_data = Font(name='Arial', size=10)
+    font_totaal = Font(name='Arial', bold=True, size=10)
+    font_controle = Font(name='Arial', bold=True, size=10, color='008000')
+    font_red = Font(name='Arial', bold=True, size=10, color='FF0000')
+    fill_section = PatternFill('solid', fgColor='2F5496')
+    fill_totaal = PatternFill('solid', fgColor='D6E4F0')
+    fill_saldo = PatternFill('solid', fgColor='E2EFDA')
+    fill_controle = PatternFill('solid', fgColor='C6EFCE')
+    align_right = Alignment(horizontal='right')
+    align_left = Alignment(horizontal='left')
+    border_thin = Border(
+        bottom=Side(style='thin', color='CCCCCC')
+    )
+
+    # Maanden bepalen
+    alle_maanden = sorted(ground_truth['periode']['alle_maanden'])
+    volle_maanden = set(ground_truth['periode']['volle_maanden'])
+
+    # Kolom-layout: B=labels, C..=maanden, dan Totaal 12m, Gem p/m
+    col_offset = 2  # B = kolom 2
+    maand_cols = {}
+    for i, maand in enumerate(alle_maanden):
+        col = col_offset + 1 + i
+        maand_cols[maand] = col
+
+    totaal_col = col_offset + 1 + len(alle_maanden)
+    gem_col = totaal_col + 1
+    n_mnd = ground_truth['periode']['n_mnd'] or 12
+
+    # Helper functies
+    def write_cell(row, col, value, font=font_data, fill=None, alignment=None, border=None, number_format=None):
+        cell = ws.cell(row=row, column=col, value=value)
+        cell.font = font
+        if fill:
+            cell.fill = fill
+        if alignment:
+            cell.alignment = alignment
+        if border:
+            cell.border = border
+        if number_format:
+            cell.number_format = number_format
+
+    def write_section_header(row, label):
+        for col in range(col_offset, gem_col + 1):
+            ws.cell(row=row, column=col).fill = fill_section
+            ws.cell(row=row, column=col).font = font_section
+        write_cell(row, col_offset, label, font=font_section, fill=fill_section)
+
+    def write_data_row(row, label, maand_waarden, is_totaal=False):
+        f = font_totaal if is_totaal else font_data
+        fl = fill_totaal if is_totaal else None
+        write_cell(row, col_offset, label, font=f, fill=fl)
+
+        totaal_12m = 0
+        for maand, col in maand_cols.items():
+            val = maand_waarden.get(maand, 0)
+            if val != 0:
+                write_cell(row, col, round(val, 2), font=f, fill=fl,
+                           alignment=align_right, number_format='#,##0.00')
+            if maand in volle_maanden:
+                totaal_12m += val
+
+        write_cell(row, totaal_col, round(totaal_12m, 2), font=f, fill=fl,
+                   alignment=align_right, number_format='#,##0.00')
+        if n_mnd > 0:
+            write_cell(row, gem_col, round(totaal_12m / n_mnd, 2), font=f, fill=fl,
+                       alignment=align_right, number_format='#,##0.00')
+
+    # === ROW 1: Titel ===
+    row = 1
+    write_cell(row, col_offset, "Cashflow Overzicht", font=Font(name='Arial', bold=True, size=14))
+
+    # === ROW 2: Periode info ===
+    row = 2
+    if volle_maanden:
+        eerste = min(volle_maanden)
+        laatste = max(volle_maanden)
+        write_cell(row, col_offset, f"Periode: {eerste} t/m {laatste} ({n_mnd} volle maanden)",
+                   font=Font(name='Arial', size=9, italic=True))
+
+    # === ROW 3: Headers ===
+    row = 3
+    write_cell(row, col_offset, "", font=font_header)
+    for maand, col in maand_cols.items():
+        label = maand  # YYYY-MM
+        is_vol = maand in volle_maanden
+        f = font_header if is_vol else Font(name='Arial', bold=True, size=10, color='999999')
+        write_cell(row, col, label, font=f, alignment=Alignment(horizontal='center'))
+    write_cell(row, totaal_col, f"Totaal {n_mnd}m", font=font_header, alignment=Alignment(horizontal='center'))
+    write_cell(row, gem_col, "Gem p/m", font=font_header, alignment=Alignment(horizontal='center'))
+
+    # === ROW 4: Begin saldo ===
+    row = 4
+    # Bereken begin saldo per maand (som van alle rekeningen)
+    begin_saldi = {}
+    eind_saldi = {}
+    for rek, rek_data in feiten.items():
+        for maand_str, mdata in rek_data.get('maanden', {}).items():
+            # We need per-maand begin/eind saldo per rekening
+            # feiten.maanden has inkomsten/uitgaven/netto but not begin/eind per maand
+            pass
+
+    # Beter: bereken begin/eind saldo per maand uit het DataFrame
+    if 'maand' in df.columns:
+        for maand in alle_maanden:
+            mdf = df[df['maand'].astype(str) == maand]
+            if len(mdf) > 0:
+                # Begin saldo = eerste transactie's Beginsaldo per rekening
+                begin = 0
+                eind = 0
+                for rek in mdf['Rekeningnummer'].unique():
+                    rdf = mdf[mdf['Rekeningnummer'] == rek].sort_values('datum')
+                    if len(rdf) > 0:
+                        begin += float(rdf.iloc[0].get('Beginsaldo', 0))
+                        eind += float(rdf.iloc[-1].get('Eindsaldo', 0))
+                begin_saldi[maand] = round(begin, 2)
+                eind_saldi[maand] = round(eind, 2)
+
+    write_cell(row, col_offset, "Begin saldo totaal", font=font_totaal, fill=fill_saldo)
+    for maand, col in maand_cols.items():
+        if maand in begin_saldi:
+            write_cell(row, col, begin_saldi[maand], font=font_totaal, fill=fill_saldo,
+                       alignment=align_right, number_format='#,##0.00')
+
+    row += 1  # Lege rij
+
+    # === SECTIES ===
+    sectie_volgorde = [
+        ('inkomsten', 'INKOMSTEN'),
+        ('vaste_lasten', 'VASTE LASTEN'),
+        ('variabele_kosten', 'VARIABELE UITGAVEN'),
+        ('sparen_beleggen', 'SPAREN & BELEGGEN'),
+        ('onderling_neutraal', 'ONDERLING / NEUTRAAL'),
+    ]
+
+    maandoverzicht = ground_truth.get('maandoverzicht', {})
+    sectie_netto_per_maand = {}  # voor netto mutaties berekening
+
+    for sectie_key, sectie_label in sectie_volgorde:
+        row += 1
+        write_section_header(row, sectie_label)
+
+        # Verzamel categorieën voor deze sectie
+        cats_in_sectie = set()
+        for maand, secties in maandoverzicht.items():
+            for cat in secties.get(sectie_key, {}).keys():
+                cats_in_sectie.add(cat)
+
+        # Ook uit jaartotalen
+        for cat in ground_truth.get('categorie_totalen_12m', {}).get(sectie_key, {}).keys():
+            cats_in_sectie.add(cat)
+
+        # Sorteer categorieën op totaalbedrag (grootste eerst)
+        cat_totalen = {}
+        for cat in cats_in_sectie:
+            cat_totalen[cat] = abs(ground_truth.get('categorie_totalen_12m', {}).get(sectie_key, {}).get(cat, 0))
+        cats_sorted = sorted(cats_in_sectie, key=lambda c: cat_totalen.get(c, 0), reverse=True)
+
+        for cat in cats_sorted:
+            row += 1
+            maand_waarden = {}
+            for maand, secties in maandoverzicht.items():
+                val = secties.get(sectie_key, {}).get(cat, 0)
+                maand_waarden[maand] = float(val) if val else 0
+            write_data_row(row, cat, maand_waarden)
+
+        # Totaal rij
+        row += 1
+        totaal_maand = {}
+        for maand, secties in maandoverzicht.items():
+            sec_data = secties.get(sectie_key, {})
+            totaal_maand[maand] = sum(float(v) for v in sec_data.values())
+
+            # Track voor netto mutaties
+            if maand not in sectie_netto_per_maand:
+                sectie_netto_per_maand[maand] = 0
+            sectie_netto_per_maand[maand] += totaal_maand[maand]
+
+        write_data_row(row, f"Totaal {sectie_label.lower()}", totaal_maand, is_totaal=True)
+
+    # === NETTO MUTATIES ===
+    row += 2
+    write_cell(row, col_offset, "Netto mutaties", font=font_totaal, fill=fill_saldo)
+    for maand, col in maand_cols.items():
+        val = sectie_netto_per_maand.get(maand, 0)
+        write_cell(row, col, round(val, 2), font=font_totaal, fill=fill_saldo,
+                   alignment=align_right, number_format='#,##0.00')
+
+    # Totaal 12m netto
+    totaal_netto_12m = sum(v for m, v in sectie_netto_per_maand.items() if m in volle_maanden)
+    write_cell(row, totaal_col, round(totaal_netto_12m, 2), font=font_totaal, fill=fill_saldo,
+               alignment=align_right, number_format='#,##0.00')
+
+    # === BEREKEND EINDSALDO ===
+    row += 1
+    write_cell(row, col_offset, "Berekend eindsaldo", font=font_totaal, fill=fill_saldo)
+    for maand, col in maand_cols.items():
+        begin = begin_saldi.get(maand, 0)
+        netto = sectie_netto_per_maand.get(maand, 0)
+        write_cell(row, col, round(begin + netto, 2), font=font_totaal, fill=fill_saldo,
+                   alignment=align_right, number_format='#,##0.00')
+
+    # === WERKELIJK EINDSALDO ===
+    row += 1
+    write_cell(row, col_offset, "Werkelijk eindsaldo", font=font_totaal, fill=fill_saldo)
+    for maand, col in maand_cols.items():
+        if maand in eind_saldi:
+            write_cell(row, col, eind_saldi[maand], font=font_totaal, fill=fill_saldo,
+                       alignment=align_right, number_format='#,##0.00')
+
+    # === CONTROLE (=0) ===
+    row += 1
+    write_cell(row, col_offset, "Controle (=0)", font=font_controle, fill=fill_controle)
+    alle_controle_ok = True
+    for maand, col in maand_cols.items():
+        begin = begin_saldi.get(maand, 0)
+        netto = sectie_netto_per_maand.get(maand, 0)
+        berekend = round(begin + netto, 2)
+        werkelijk = eind_saldi.get(maand, 0)
+        controle = round(berekend - werkelijk, 2)
+
+        f = font_controle if abs(controle) < 0.02 else font_red
+        fl = fill_controle if abs(controle) < 0.02 else PatternFill('solid', fgColor='FFC7CE')
+        write_cell(row, col, controle, font=f, fill=fl,
+                   alignment=align_right, number_format='#,##0.00')
+        if abs(controle) >= 0.02:
+            alle_controle_ok = False
+
+    # === SALDO PER REKENING ===
+    row += 2
+    write_section_header(row, "SALDO PER REKENING")
+
+    for rek in sorted(feiten.keys()):
+        # Begin per maand
+        row += 1
+        write_cell(row, col_offset, f"{rek} begin", font=font_data)
+        for maand, col_num in maand_cols.items():
+            mdf = df[(df['Rekeningnummer'].astype(str) == str(rek)) & (df['maand'].astype(str) == maand)]
+            if len(mdf) > 0:
+                val = float(mdf.sort_values('datum').iloc[0].get('Beginsaldo', 0))
+                write_cell(row, col_num, round(val, 2), font=font_data,
+                           alignment=align_right, number_format='#,##0.00')
+
+        # Eind per maand
+        row += 1
+        write_cell(row, col_offset, f"{rek} eind", font=font_data)
+        for maand, col_num in maand_cols.items():
+            mdf = df[(df['Rekeningnummer'].astype(str) == str(rek)) & (df['maand'].astype(str) == maand)]
+            if len(mdf) > 0:
+                val = float(mdf.sort_values('datum').iloc[-1].get('Eindsaldo', 0))
+                write_cell(row, col_num, round(val, 2), font=font_data,
+                           alignment=align_right, number_format='#,##0.00')
+
+    # Kolombreedte
+    ws.column_dimensions['B'].width = 35
+    for maand, col in maand_cols.items():
+        ws.column_dimensions[get_column_letter(col)].width = 14
+    ws.column_dimensions[get_column_letter(totaal_col)].width = 16
+    ws.column_dimensions[get_column_letter(gem_col)].width = 14
+
+    # Save to bytes
+    buffer = BytesIO()
+    wb.save(buffer)
+    buffer.seek(0)
+
+    logger.info(f"V3 RECONCILIATIE EXCEL: {row} rijen, controle={'OK' if alle_controle_ok else 'FOUT'}")
+    return buffer.getvalue()
+
+
 def _run_rapport_pipeline(job_id: str, bestanden: list, email: str):
     """Achtergrond-thread: volledige pipeline upload → analyse → PDF → email.
 
@@ -5169,24 +5663,34 @@ def _run_rapport_pipeline(job_id: str, bestanden: list, email: str):
             # Nog niet blokkeren (no-send gate komt in Sprint 3), maar wel loggen
         update(f"Reconciliatie: {reconciliatie['status']}, {rapportperiode['n_mnd']} volle maanden", 30)
 
-        # 3. AI categoriseren + analyseren (langste stap: 30s-300s)
-        provider = os.environ.get('AI_PROVIDER', 'claude').lower()
-        model_naam = os.environ.get('OPENAI_MODEL', 'gpt-5.4') if provider == 'openai' else os.environ.get('CLAUDE_MODEL', 'claude-opus-4-6')
-        update(f'AI analyseert uw transacties ({model_naam})...', 35)
-        prompt = bouw_prompt(df, feiten, top, eigen_rekeningen=eigen_rekeningen)
-        logger.info(f"[{job_id}] Prompt: {len(prompt)} tekens, {len(df)} transacties")
-        claude_result = vraag_claude(prompt)
-
-        if not claude_result.get('data'):
-            raise ValueError(f"AI-analyse ongeldig: {claude_result.get('error', 'onbekend')}")
-
-        # 3b. Rule-based totalen berekenen uit DataFrame (ground truth)
+        # 2c. Rule-based totalen berekenen uit DataFrame (vóór AI — voor ground truth prompt)
         rule_totalen = _bereken_rule_based_totalen(df)
         n_rule_cats = sum(
             len(cats) for secties in rule_totalen['jaartotalen'].values()
             for cats in secties.values()
         )
         logger.info(f"[{job_id}] Rule-based: {n_rule_cats} categorieën berekend uit DataFrame")
+
+        # 2d. V3: Voorlopige ground truth bouwen (rule-based only — voor AI-prompt)
+        pre_ground_truth = _bouw_ground_truth(
+            merged_data=rule_totalen,
+            feiten=feiten,
+            rapportperiode=rapportperiode,
+            reconciliatie=reconciliatie,
+            df=df,
+        )
+        logger.info(f"[{job_id}] Voorlopige ground truth gebouwd (rule-based only)")
+
+        # 3. AI categoriseren + analyseren (langste stap: 30s-300s)
+        provider = os.environ.get('AI_PROVIDER', 'claude').lower()
+        model_naam = os.environ.get('OPENAI_MODEL', 'gpt-5.4') if provider == 'openai' else os.environ.get('CLAUDE_MODEL', 'claude-opus-4-6')
+        update(f'AI analyseert uw transacties ({model_naam})...', 35)
+        prompt = bouw_prompt(df, feiten, top, eigen_rekeningen=eigen_rekeningen, ground_truth=pre_ground_truth)
+        logger.info(f"[{job_id}] Prompt: {len(prompt)} tekens, {len(df)} transacties")
+        claude_result = vraag_claude(prompt)
+
+        if not claude_result.get('data'):
+            raise ValueError(f"AI-analyse ongeldig: {claude_result.get('error', 'onbekend')}")
 
         # 3c. Merge: rule-based + AI totalen samenvoegen (geen overlap)
         claude_result['data'] = _merge_rule_en_ai_totalen(rule_totalen, claude_result['data'])
@@ -5199,7 +5703,27 @@ def _run_rapport_pipeline(job_id: str, bestanden: list, email: str):
         else:
             update('AI-analyse compleet, kwaliteitscheck geslaagd', 70)
 
-        # 4. Rapport data samenstellen
+        # 4. V3: Ground Truth bouwen (bevroren payload — alle downstream outputs lezen hieruit)
+        update('Ground truth payload bouwen...', 72)
+        ground_truth = _bouw_ground_truth(
+            merged_data=claude_result['data'],
+            feiten=feiten,
+            rapportperiode=rapportperiode,
+            reconciliatie=reconciliatie,
+            df=df,
+        )
+        logger.info(f"[{job_id}] Ground truth V3 gebouwd: {len(ground_truth['periode']['volle_maanden'])} volle maanden")
+
+        # 4b. V3: Reconciliatie Excel genereren
+        update('Reconciliatie Excel genereren...', 74)
+        try:
+            reconciliatie_excel_bytes = _genereer_reconciliatie_excel(ground_truth, feiten, df)
+            logger.info(f"[{job_id}] Reconciliatie Excel: {len(reconciliatie_excel_bytes)} bytes")
+        except Exception as exc:
+            logger.error(f"[{job_id}] Reconciliatie Excel FOUT: {exc}")
+            reconciliatie_excel_bytes = None
+
+        # 4c. Rapport data samenstellen
         rapport_data = {
             'report_id': job_id,
             'gegenereerd': datetime.now().isoformat(),
@@ -5210,6 +5734,7 @@ def _run_rapport_pipeline(job_id: str, bestanden: list, email: str):
             'analyse': claude_result['data'].get('analyse', {}),
             'reconciliatie': reconciliatie,       # V3
             'rapportperiode': rapportperiode,     # V3
+            'ground_truth': ground_truth,         # V3
         }
 
         # 5. PDF genereren
@@ -5218,9 +5743,12 @@ def _run_rapport_pipeline(job_id: str, bestanden: list, email: str):
         logger.info(f"[{job_id}] PDF gegenereerd ({len(pdf_bytes)} bytes)")
         update('PDF klaar', 85)
 
-        # 6. Email versturen
+        # 6. Email versturen (met reconciliatie Excel als extra bijlage)
         update('Rapport per email versturen...', 90)
-        email_verstuurd = verstuur_rapport_email(email, pdf_bytes, job_id)
+        email_verstuurd = verstuur_rapport_email(
+            email, pdf_bytes, job_id,
+            reconciliatie_excel=reconciliatie_excel_bytes,
+        )
 
         if not email_verstuurd:
             raise ValueError(

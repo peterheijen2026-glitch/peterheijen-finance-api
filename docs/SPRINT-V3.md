@@ -5,29 +5,31 @@
 
 ---
 
-## Sprint 1: Anti-Gok Fundament (huidige sprint)
+## Sprint 1: Anti-Gok Fundament ✅ COMPLEET
 
 ### Gedaan:
-- [x] `source_family` veld op elke transactie (salary_employment, management_fee, rental_income, benefits_uwv, child_benefit, tax_refund, household_transfer, internal_transfer, broker_return, wealth_allocation, creditcard_settlement, neutral_technical)
-- [x] `party_type` gating in `_detecteer_vast_inkomen()` — household_related_party en own_account kunnen NOOIT salary zijn
-- [x] Logging bij geblokkeerde salary-classificaties
-- [x] Management_fee als aparte source_family (niet meer onder salary_employment)
-- [x] MERCHANT_MAPPING uitgebreid: VvE apart, Levensverzekering/ORV apart, Mobiliteit vast, Cash opname
-- [x] Household-transacties → `onderling_neutraal` sectie (niet meer is_intern)
-- [x] Post-classificatie reconciliatie functie (`_post_classificatie_reconciliatie()`)
-- [x] Periodeberekening: onvolledige maanden detectie (`_bepaal_rapportperiode()`)
-- [x] Reconciliatie en rapportperiode in pipeline geïntegreerd
+- [x] `source_family` veld op elke transactie
+- [x] `party_type` gating — household_related_party en own_account kunnen NOOIT salary zijn
+- [x] MERCHANT_MAPPING uitgebreid: VvE, Levensverzekering/ORV, Mobiliteit vast, Cash opname
+- [x] Household-transacties → `onderling_neutraal` sectie
+- [x] Post-classificatie reconciliatie + periodeberekening
+- [x] Commit + push naar Railway (489a9e9)
 
-### Nog te doen in Sprint 1:
+## Sprint 2: Ground Truth + Excel Output (huidige sprint)
+
+### Gedaan:
+- [x] `_bouw_ground_truth()` — bevroren payload met combined totalen, income_sources, saldo
+- [x] `_genereer_reconciliatie_excel()` — openpyxl Excel in Shortcut.ai Cashflow Overzicht format
+- [x] `_bouw_ground_truth_prompt_sectie()` — formatteert ground truth voor AI-prompt
+- [x] AI prompt herschreven: ground truth sectie meegegeven, AI mag niet zelf rekenen
+- [x] Pipeline geherstructureerd: rule_totalen + voorlopige GT vóór AI-call, definitieve GT na merge
+- [x] Reconciliatie Excel als email-bijlage (naast PDF)
+- [x] Inkomstenbronopbouw via source_family in ground truth
+
+### Nog te doen in Sprint 2:
 - [ ] Commit + push naar Railway
 - [ ] Test met Peter's bankdata
-- [ ] Verificatie: Esther's overboekingen in onderling_neutraal
-
-## Sprint 2: Ground Truth + Excel Output
-- [ ] Frozen ground truth payload na reconciliatie
-- [ ] Reconciliatie Excel generator (Shortcut.ai format)
-- [ ] AI prompt herschrijven: alleen ground truth
-- [ ] Inkomstenbronopbouw i.p.v. "Netto salaris"
+- [ ] Verificatie: Controle(=0) in Excel, ground truth in AI-tekst
 
 ## Sprint 3: QA Gate + Sobere Rapportversie
 - [ ] RED/ORANGE/GREEN no-send gate

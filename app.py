@@ -2380,7 +2380,7 @@ def _detecteer_vast_inkomen(df: pd.DataFrame) -> pd.DataFrame:
         if 'Tegenrekening' in df.columns:
             gevonden_ibans.add(_normaliseer_iban(key_str))
         logger.info(
-            f"{'DGA-LOON' if is_dga else 'SALARIS'} GEDETECTEERD: {key_str[:50]} — "
+            f"INKOMEN GEDETECTEERD: {key_str[:50]} — "
             f"{len(groep_pos)}x, gem EUR {gemiddeld:,.0f}, {variatie*100:.0f}% var → {categorie}"
         )
 

@@ -31,8 +31,23 @@
 - [ ] Test met Peter's bankdata
 - [ ] Verificatie: Controle(=0) in Excel, ground truth in AI-tekst
 
-## Sprint 3: QA Gate + Sobere Rapportversie
-- [ ] RED/ORANGE/GREEN no-send gate
-- [ ] Audit package JSON voor ChatGPT
-- [ ] PDF page-1 op reconciled cijfers
-- [ ] Automatisch blokkeren bij RED
+## Sprint 3: QA Gate + Audit Package (huidige sprint)
+
+### Gedaan:
+- [x] `_no_send_gate()` — RED/ORANGE/GREEN besluit op basis van:
+  - Reconciliatie status (saldo mismatch → RED)
+  - >5% in Overig-categorieën → ORANGE, >15% → RED
+  - AI-samenvatting met getallen buiten ground truth → ORANGE
+  - Lage rule-based coverage (<40%) → ORANGE
+- [x] `_bouw_audit_package()` — compleet dossier voor ChatGPT review
+- [x] Pipeline blokkering: bij RED geen PDF/rapport verzonden
+- [x] Blokkade-email naar Peter met reconciliatie Excel voor review
+- [x] `/rapport/{job_id}/audit` endpoint voor audit package ophalen
+- [x] Gate-info in `/rapport/{job_id}/status` response
+- [x] Job status 'geblokkeerd' als gate BLOCK geeft
+
+- [x] PDF page-1 op reconciled cijfers: n_maanden uit ground truth, periode-info, kwaliteitsindicator
+
+### Nog te doen:
+- [ ] Commit + push naar Railway
+- [ ] Test met Peter's bankdata

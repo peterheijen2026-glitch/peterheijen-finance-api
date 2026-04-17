@@ -4071,16 +4071,11 @@ class RapportPDF(FPDF):
         self.set_text_color(*INK_SOFT)
         self.cell(0, 10, 'Dit rapport is gegenereerd door PeterHeijen.com  |  Vertrouwelijk', 0, 0, 'C')
 
-    def cover_page(self, feiten: dict, rapport_datum: str, jaartotalen: dict = None, maandoverzicht: dict = None):
+    def cover_page(self, feiten: dict, rapport_datum: str, jaartotalen: dict = None, maandoverzicht: dict = None,
+                   ground_truth: dict = None, gate: dict = None):
         """Pagina 1: Executive summary — economische lens voor vermogende particulieren.
 
-        Sprint 2v2 (signed-off mapping):
-        - Blok 1: Kerninkomen (breed, bovenaan) + aanvullende instroom
-        - Blok 2: Belastingdruk
-        - Blok 3: Woonlasten
-        - Blok 4: Leefkosten (vast + discretionair)
-        - Blok 5: Netto vermogensallocatie (algebraisch, positief gelabeld)
-        - Blok 6: Buiten kernbeeld (niet-kern + review/onzeker)
+        V3: Gebruikt ground_truth voor n_maanden en periode-info als beschikbaar.
         Layout A: kerninkomen full-width, 2x2 grid, buiten kernbeeld onderaan.
         """
         # Donkere header
@@ -4110,18 +4105,28 @@ class RapportPDF(FPDF):
         self.set_xy(15, 52)
         self.cell(0, 6, f'Gegenereerd op {rapport_datum}', 0, 1, 'L')
         self.set_xy(15, 58)
-        periodes = []
-        for f in feiten.values():
-            periodes.extend([f['periode']['van'], f['periode']['tot']])
-        van = min(periodes) if periodes else ''
-        tot = max(periodes) if periodes else ''
-        self.cell(0, 6, f'{len(feiten)} rekening(en) geanalyseerd  |  {van} t/m {tot}', 0, 1, 'L')
+        if ground_truth and ground_truth.get('periode', {}).get('volle_maanden'):
+            vm = ground_truth['periode']['volle_maanden']
+            van = min(vm) if vm else ''
+            tot = max(vm) if vm else ''
+            n_mnd = ground_truth['periode'].get('n_mnd', len(vm))
+            self.cell(0, 6, f'{len(feiten)} rekening(en)  |  {van} t/m {tot}  |  {n_mnd} volle maanden', 0, 1, 'L')
+        else:
+            periodes = []
+            for f in feiten.values():
+                periodes.extend([f['periode']['van'], f['periode']['tot']])
+            van = min(periodes) if periodes else ''
+            tot = max(periodes) if periodes else ''
+            self.cell(0, 6, f'{len(feiten)} rekening(en) geanalyseerd  |  {van} t/m {tot}', 0, 1, 'L')
 
         # =====================================================================
         # EXECUTIVE BUCKETS v2 — signed-off mapping
+        # V3: n_maanden uit ground truth (als beschikbaar)
         # =====================================================================
         n_maanden = 1
-        if maandoverzicht:
+        if ground_truth and ground_truth.get('periode', {}).get('n_mnd'):
+            n_maanden = max(ground_truth['periode']['n_mnd'], 1)
+        elif maandoverzicht:
             all_months = set()
             for rek_m in maandoverzicht.values():
                 all_months.update(rek_m.keys())
@@ -4404,8 +4409,23 @@ class RapportPDF(FPDF):
         )
         self.multi_cell(180, 4, uitleg, 0, 'L')
 
+        # V3: Kwaliteitsindicator
+        if gate:
+            kleur = gate.get('kleur', 'GREEN')
+            kleur_rgb = {'GREEN': (0, 128, 0), 'ORANGE': (200, 130, 0), 'RED': (200, 0, 0)}.get(kleur, (128, 128, 128))
+            kleur_label = {'GREEN': 'Gevalideerd', 'ORANGE': 'Aandachtspunten', 'RED': 'Review vereist'}.get(kleur, 'Onbekend')
+            self.set_y(250)
+            self.set_font(self.DATA, 'B', 7)
+            self.set_text_color(*kleur_rgb)
+            self.cell(180, 4, f'Kwaliteitscheck: {kleur_label}', 0, 1, 'C')
+            if gate.get('redenen'):
+                self.set_font(self.DATA, '', 6)
+                self.set_text_color(140, 140, 155)
+                for reden in gate['redenen'][:2]:
+                    self.cell(180, 3.5, reden[:100], 0, 1, 'C')
+
         # Disclaimer onderaan cover
-        self.set_y(258)
+        self.set_y(265)
         self.set_font(self.DATA, '', 6.5)
         self.set_text_color(*INK_SOFT)
         self.cell(180, 4, 'Dit rapport is uitsluitend bedoeld als financieel inzicht en vormt geen financieel advies.', 0, 1, 'C')
@@ -4846,11 +4866,14 @@ def genereer_pdf(rapport: dict) -> bytes:
     analyse = rapport.get('analyse', {})
     maandoverzicht = rapport.get('maandoverzicht', {})
     jaartotalen = rapport.get('jaartotalen', {})
+    ground_truth = rapport.get('ground_truth')
+    gate = rapport.get('gate')
     datum = datetime.now().strftime('%d-%m-%Y')
 
     # Pagina 1: Executive summary op huishoudniveau
     pdf.add_page()
-    pdf.cover_page(feiten, datum, jaartotalen=jaartotalen, maandoverzicht=maandoverzicht)
+    pdf.cover_page(feiten, datum, jaartotalen=jaartotalen, maandoverzicht=maandoverzicht,
+                   ground_truth=ground_truth, gate=gate)
 
     # Pagina 2: Analyse & Inzichten
     if analyse and analyse.get('samenvatting'):
@@ -4899,8 +4922,13 @@ def genereer_pdf(rapport: dict) -> bytes:
 # ---------------------------------------------------------------------------
 
 def verstuur_rapport_email(email: str, pdf_bytes: bytes, report_id: str,
-                           reconciliatie_excel: bytes = None):
+                           reconciliatie_excel: bytes = None,
+                           geblokkeerd: bool = False,
+                           gate_redenen: list = None):
     """Verstuur het PDF rapport per email via Resend.
+
+    Als geblokkeerd=True, wordt een blokkade-email verstuurd met alleen de
+    reconciliatie Excel (geen PDF) zodat de gebruiker kan reviewen.
 
     Retourneert True bij succes, False bij falen.
     Logt altijd de volledige Resend-response voor diagnose.
@@ -4917,6 +4945,44 @@ def verstuur_rapport_email(email: str, pdf_bytes: bytes, report_id: str,
 
     pdf_base64 = base64.b64encode(pdf_bytes).decode('utf-8')
     logger.info(f"PDF bijlage: {len(pdf_bytes)} bytes, base64: {len(pdf_base64)} chars")
+
+    # Bij geblokkeerd rapport: stuur alleen review-email naar Peter
+    if geblokkeerd:
+        redenen_tekst = '\n'.join(f'- {r}' for r in (gate_redenen or ['Onbekende reden']))
+        plain_text = (
+            f"RAPPORT GEBLOKKEERD — Kwaliteitscheck niet doorstaan\n\n"
+            f"Rapport ID: {report_id}\n\n"
+            f"Redenen:\n{redenen_tekst}\n\n"
+            f"Het Cashflow Overzicht Excel is bijgevoegd voor handmatige review.\n"
+            f"Na correctie kan het rapport opnieuw worden gegenereerd.\n\n"
+            f"PeterHeijen.com"
+        )
+        payload = {
+            "from": "Peter Heijen <rapport@peterheijen.com>",
+            "reply_to": "info@peterheijen.com",
+            "to": ["peterheijen2026@gmail.com"],  # Altijd naar Peter, niet naar klant
+            "subject": f"[GEBLOKKEERD] Rapport {report_id} — kwaliteitscheck",
+            "text": plain_text,
+            "attachments": [],
+        }
+        if reconciliatie_excel:
+            excel_base64 = base64.b64encode(reconciliatie_excel).decode('utf-8')
+            payload["attachments"].append({
+                "filename": f"cashflow-overzicht-{report_id}.xlsx",
+                "content": excel_base64,
+                "type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            })
+        try:
+            resp = httpx.post(
+                "https://api.resend.com/emails",
+                headers={"Authorization": f"Bearer {resend_key}", "Content-Type": "application/json"},
+                json=payload, timeout=30.0,
+            )
+            logger.info(f"Blokkade-email: {resp.status_code}")
+            return resp.status_code == 200
+        except Exception as exc:
+            logger.error(f"Blokkade-email fout: {exc}")
+            return False
 
     # Anti-spam: platte tekst versie (HTML-only is een spam signaal)
     plain_text = (
@@ -5555,6 +5621,169 @@ def _genereer_reconciliatie_excel(ground_truth: dict, feiten: dict, df: pd.DataF
     return buffer.getvalue()
 
 
+# ---------------------------------------------------------------------------
+# V3 SPRINT 3: NO-SEND GATE + AUDIT PACKAGE
+# ---------------------------------------------------------------------------
+
+def _no_send_gate(ground_truth: dict, reconciliatie: dict, analyse: dict,
+                  kwaliteit: dict) -> dict:
+    """V3: Bepaal of het rapport verzonden mag worden.
+
+    Regels (uit KWALITEITSPLAN-V1):
+    1. RED reconciliatie → BLOCK (saldo klopt niet)
+    2. >5% van totaalbedrag in "Overig" categorieën → BLOCK
+    3. AI-samenvatting bevat getallen die niet in ground truth staan → WARN
+    4. Onvolledige maand telt mee in 12m-totalen → BLOCK (maar is al gefixed door _bepaal_rapportperiode)
+
+    Returns dict met:
+    - besluit: 'SEND' / 'BLOCK' / 'REVIEW'
+    - kleur: 'GREEN' / 'ORANGE' / 'RED'
+    - redenen: lijst van redenen
+    """
+    redenen = []
+    kleur = 'GREEN'
+
+    # Regel 1: Reconciliatie status
+    recon_status = reconciliatie.get('status', 'GREEN')
+    if recon_status == 'RED':
+        kleur = 'RED'
+        red_checks = [c for c in reconciliatie.get('checks', []) if c['status'] == 'RED']
+        for c in red_checks:
+            redenen.append(f"RECONCILIATIE FOUT: {c['detail']}")
+
+    # Regel 2: Overig-categorieën percentage per sectie
+    cat_totalen = ground_truth.get('categorie_totalen_12m', {})
+    sectie_totalen = ground_truth.get('sectie_totalen_12m', {})
+    for sectie, cats in cat_totalen.items():
+        totaal_sectie = abs(sectie_totalen.get(sectie, 0))
+        if totaal_sectie < 100:
+            continue
+        overig_bedrag = 0
+        for cat, bedrag in cats.items():
+            if cat.lower().startswith('overig'):
+                overig_bedrag += abs(float(bedrag))
+        if totaal_sectie > 0:
+            overig_pct = overig_bedrag / totaal_sectie
+            if overig_pct > 0.05:
+                kleur = 'RED' if overig_pct > 0.15 else max(kleur, 'ORANGE')
+                redenen.append(
+                    f"{sectie}: {overig_pct:.0%} in Overig-categorieën "
+                    f"(EUR {overig_bedrag:,.0f} / EUR {totaal_sectie:,.0f})"
+                )
+
+    # Regel 3: AI-samenvatting bevat getallen die niet in ground truth staan
+    samenvatting = analyse.get('samenvatting', '') if isinstance(analyse, dict) else ''
+    if samenvatting:
+        # Verzamel alle getallen uit ground truth
+        gt_getallen = set()
+        for sectie, cats in cat_totalen.items():
+            for cat, bedrag in cats.items():
+                gt_getallen.add(abs(round(float(bedrag), 0)))
+                gt_getallen.add(abs(round(float(bedrag), 2)))
+        for s, t in sectie_totalen.items():
+            gt_getallen.add(abs(round(float(t), 0)))
+            gt_getallen.add(abs(round(float(t), 2)))
+        for s, g in ground_truth.get('sectie_gemiddelden_pm', {}).items():
+            gt_getallen.add(abs(round(float(g), 0)))
+            gt_getallen.add(abs(round(float(g), 2)))
+        saldo = ground_truth.get('saldo', {})
+        gt_getallen.add(abs(round(saldo.get('totaal_begin', 0), 0)))
+        gt_getallen.add(abs(round(saldo.get('totaal_eind', 0), 0)))
+        # Income sources
+        for sf, data in ground_truth.get('income_sources', {}).items():
+            gt_getallen.add(abs(round(data.get('bedrag_12m', 0), 0)))
+            gt_getallen.add(abs(round(data.get('bedrag_12m', 0), 2)))
+        # Verwijder triviale getallen
+        gt_getallen.discard(0)
+        gt_getallen.discard(0.0)
+
+        # Zoek getallen in de samenvatting
+        import re
+        bedragen_in_tekst = re.findall(r'€\s*([0-9.,]+)', samenvatting)
+        onbekende_bedragen = []
+        for bedrag_str in bedragen_in_tekst:
+            try:
+                # Verwerk Nederlandse notatie: €1.234,56 of €1.234
+                bedrag_str_clean = bedrag_str.replace('.', '').replace(',', '.')
+                bedrag_val = abs(float(bedrag_str_clean))
+                if bedrag_val > 50:  # Negeer kleine bedragen
+                    # Check of dit bedrag in de ground truth staat (met 2% marge)
+                    gevonden = False
+                    for gt_val in gt_getallen:
+                        if gt_val > 0 and abs(bedrag_val - gt_val) / gt_val < 0.02:
+                            gevonden = True
+                            break
+                    if not gevonden:
+                        onbekende_bedragen.append(bedrag_str)
+            except (ValueError, ZeroDivisionError):
+                pass
+
+        if onbekende_bedragen:
+            if kleur == 'GREEN':
+                kleur = 'ORANGE'
+            redenen.append(
+                f"AI-samenvatting bevat {len(onbekende_bedragen)} bedrag(en) niet in ground truth: "
+                f"{', '.join(onbekende_bedragen[:5])}"
+            )
+
+    # Regel 4: Classificatie-kwaliteit
+    pct_rule = kwaliteit.get('pct_rule_based', 0)
+    if pct_rule < 40:
+        if kleur == 'GREEN':
+            kleur = 'ORANGE'
+        redenen.append(f"Slechts {pct_rule:.0f}% rule-based geclassificeerd (target: >60%)")
+
+    # Besluit
+    if kleur == 'RED':
+        besluit = 'BLOCK'
+    elif kleur == 'ORANGE':
+        besluit = 'REVIEW'
+    else:
+        besluit = 'SEND'
+
+    gate_result = {
+        'besluit': besluit,
+        'kleur': kleur,
+        'redenen': redenen,
+        'tijdstip': datetime.now().isoformat(),
+    }
+
+    logger.info(f"V3 NO-SEND GATE: {besluit} ({kleur}), {len(redenen)} redenen")
+    for r in redenen:
+        logger.info(f"  → {r}")
+
+    return gate_result
+
+
+def _bouw_audit_package(ground_truth: dict, gate_result: dict, kwaliteit: dict,
+                        reconciliatie: dict, rapport_data: dict) -> dict:
+    """V3: Bouw audit package JSON voor ChatGPT review.
+
+    Dit is het complete dossier dat ChatGPT CEO kan reviewen voordat
+    het rapport naar de klant gaat. Bevat alles wat nodig is om te
+    beoordelen of de getallen kloppen.
+    """
+    return {
+        'versie': 'V3',
+        'tijdstip': datetime.now().isoformat(),
+        'gate': gate_result,
+        'ground_truth': {
+            'periode': ground_truth.get('periode', {}),
+            'saldo': ground_truth.get('saldo', {}),
+            'sectie_totalen_12m': ground_truth.get('sectie_totalen_12m', {}),
+            'sectie_gemiddelden_pm': ground_truth.get('sectie_gemiddelden_pm', {}),
+            'income_sources': ground_truth.get('income_sources', {}),
+        },
+        'reconciliatie': {
+            'status': reconciliatie.get('status', 'UNKNOWN'),
+            'checks': reconciliatie.get('checks', []),
+        },
+        'classificatie_kwaliteit': kwaliteit,
+        'analyse_samenvatting': rapport_data.get('analyse', {}).get('samenvatting', ''),
+        'review_items': gate_result.get('redenen', []),
+    }
+
+
 def _run_rapport_pipeline(job_id: str, bestanden: list, email: str):
     """Achtergrond-thread: volledige pipeline upload → analyse → PDF → email.
 
@@ -5737,8 +5966,59 @@ def _run_rapport_pipeline(job_id: str, bestanden: list, email: str):
             'ground_truth': ground_truth,         # V3
         }
 
+        # 4d. V3: No-Send Gate — mag dit rapport verzonden worden?
+        update('Kwaliteitsgate controleren...', 75)
+        gate_result = _no_send_gate(
+            ground_truth=ground_truth,
+            reconciliatie=reconciliatie,
+            analyse=claude_result['data'].get('analyse', {}),
+            kwaliteit=kwaliteit,
+        )
+
+        # 4e. V3: Audit package bouwen (altijd, ook bij BLOCK)
+        audit_package = _bouw_audit_package(
+            ground_truth=ground_truth,
+            gate_result=gate_result,
+            kwaliteit=kwaliteit,
+            reconciliatie=reconciliatie,
+            rapport_data=rapport_data,
+        )
+        logger.info(f"[{job_id}] Audit package gebouwd: {gate_result['besluit']} ({gate_result['kleur']})")
+
+        # 4f. V3: Bij RED → BLOCK, geen rapport versturen
+        if gate_result['besluit'] == 'BLOCK':
+            redenen_tekst = '; '.join(gate_result['redenen'][:3])
+            logger.warning(f"[{job_id}] NO-SEND GATE: BLOCKED — {redenen_tekst}")
+
+            # Sla audit package op in job-state zodat het opvraagbaar is
+            with jobs_lock:
+                jobs[job_id]['status'] = 'geblokkeerd'
+                jobs[job_id]['fase'] = f"Rapport geblokkeerd: kwaliteitscheck ({gate_result['kleur']})"
+                jobs[job_id]['voortgang'] = 100
+                jobs[job_id]['gate'] = gate_result
+                jobs[job_id]['audit_package'] = audit_package
+
+            # Stuur WEL de reconciliatie Excel (voor handmatige review)
+            if reconciliatie_excel_bytes:
+                try:
+                    verstuur_rapport_email(
+                        email, b'',  # Geen PDF
+                        job_id,
+                        reconciliatie_excel=reconciliatie_excel_bytes,
+                        geblokkeerd=True,
+                        gate_redenen=gate_result['redenen'],
+                    )
+                except Exception as exc:
+                    logger.error(f"[{job_id}] Blokkade-email fout: {exc}")
+
+            return  # Stop pipeline hier — geen PDF, geen rapport
+
+        rapport_data['gate'] = gate_result
+        rapport_data['audit_package'] = audit_package
+        update(f"Kwaliteitsgate: {gate_result['kleur']} — rapport wordt verzonden", 77)
+
         # 5. PDF genereren
-        update('Premium PDF-rapport genereren...', 75)
+        update('Premium PDF-rapport genereren...', 80)
         pdf_bytes = genereer_pdf(rapport_data)
         logger.info(f"[{job_id}] PDF gegenereerd ({len(pdf_bytes)} bytes)")
         update('PDF klaar', 85)
@@ -5761,6 +6041,7 @@ def _run_rapport_pipeline(job_id: str, bestanden: list, email: str):
             jobs[job_id]['status'] = 'compleet'
             jobs[job_id]['fase'] = 'Rapport verstuurd!'
             jobs[job_id]['voortgang'] = 100
+            jobs[job_id]['gate'] = gate_result
         logger.info(f"[{job_id}] Pipeline compleet — rapport verstuurd naar {email}")
 
     except Exception as e:
@@ -5854,7 +6135,7 @@ def rapport_status(job_id: str):
     if not job:
         raise HTTPException(status_code=404, detail="Job niet gevonden")
 
-    return {
+    response = {
         'job_id': job_id,
         'status': job['status'],
         'fase': job.get('fase', ''),
@@ -5862,6 +6143,37 @@ def rapport_status(job_id: str):
         'email': job.get('email', ''),
         'error': job.get('error'),
     }
+
+    # V3: gate-info meegeven als beschikbaar
+    gate = job.get('gate')
+    if gate:
+        response['gate'] = {
+            'besluit': gate.get('besluit'),
+            'kleur': gate.get('kleur'),
+            'redenen': gate.get('redenen', []),
+        }
+
+    return response
+
+
+@app.get("/rapport/{job_id}/audit")
+def rapport_audit(job_id: str):
+    """V3: Haal het audit package op voor een rapport-job.
+
+    Bevat ground truth, gate-besluit, reconciliatie, en review-items.
+    Bedoeld voor ChatGPT CEO review vóór verzending.
+    """
+    with jobs_lock:
+        job = jobs.get(job_id)
+
+    if not job:
+        raise HTTPException(status_code=404, detail="Job niet gevonden")
+
+    audit = job.get('audit_package')
+    if not audit:
+        raise HTTPException(status_code=404, detail="Audit package niet beschikbaar (job nog in uitvoering?)")
+
+    return audit
 
 
 @app.post("/feiten")

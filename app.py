@@ -2205,43 +2205,37 @@ def _detecteer_vast_inkomen(df: pd.DataFrame) -> pd.DataFrame:
             _bidi_ibans_salary.add(_normaliseer_iban(str(iban_val)))
 
     # =========================================================================
-    # ZAKELIJKE REKENING DETECTIE
+    # ZAKELIJKE REKENING DETECTIE (simpel & robuust)
     # =========================================================================
-    # Een rekening is "zakelijk" als die zowel ontvangt VAN als betaalt AAN
-    # bedrijfsentiteiten (BV, Stichting, etc.) — exclusief interne transfers.
-    # Generiek signaal: een privépersoon heeft 1 werkgever; een BV-rekening
-    # heeft meerdere zakelijke tegenpartijen aan beide kanten.
-    # Inkomen op een zakelijke rekening = bedrijfsinkomen, niet salaris.
-    _BEDRIJF_MARKERS = ['B.V.', ' BV ', ' BV,', 'B.V ', ' B.V', ' BV.',
-                        'HOLDING', 'HLDG', 'STICHTING', 'VERENIGING',
-                        'N.V.', ' NV ', 'GEMEENTE', 'MINISTERIE']
-    _zakelijke_rekeningen = set()
+    # Bij interne transfers (tussen eigen rekeningen) staat de tegenpartij-naam
+    # in de omschrijving. Als die naam BV/Holding bevat → die Tegenrekening
+    # is een zakelijke rekening. Simpel, geen false positives.
+    _BV_DETECT_MARKERS = ['B.V.', ' BV ', ' BV,', 'B.V ', ' B.V', ' BV.',
+                          'HOLDING', 'HLDG']
+    _zakelijke_rekeningen = set()  # Set van Rekeningnummer-strings
     if 'Rekeningnummer' in df.columns and 'Tegenrekening' in df.columns:
+        eigen_genorm = set(_normaliseer_iban(str(r)) for r in df['Rekeningnummer'].unique()
+                          if str(r).strip() and str(r).strip() != 'Onbekend')
+        df_intern = df[df['is_intern']].copy()
+        # Scan interne transfers: als tegenpartij BV/Holding in naam heeft
+        # → die Tegenrekening is de BV-rekening
+        _bv_ibans = set()
+        for _, row in df_intern.iterrows():
+            omschr = str(row.get('Omschrijving', '')).upper()
+            tegen_naam = str(row.get('tegenpartij_naam', '')).upper()
+            tekst = omschr + ' ' + tegen_naam
+            if any(m in tekst for m in _BV_DETECT_MARKERS):
+                tegen_iban = _normaliseer_iban(str(row.get('Tegenrekening', '')))
+                if tegen_iban and tegen_iban in eigen_genorm:
+                    _bv_ibans.add(tegen_iban)
+        # Map BV-IBANs terug naar Rekeningnummer strings
         for rek in df['Rekeningnummer'].unique():
-            rek_str = str(rek).strip()
-            if not rek_str or rek_str == 'Onbekend':
-                continue
-            df_rek = df[(df['Rekeningnummer'] == rek) & (~df['is_intern'])]
-            # Check uitgaand: betaalt aan bedrijven?
-            uit_tekst = ' '.join(df_rek[df_rek['bedrag'] < 0]['Omschrijving'].astype(str).str.upper())
-            betaalt_bedrijven = any(m in uit_tekst for m in _BEDRIJF_MARKERS)
-            # Check inkomend: ontvangt van meerdere bedrijven?
-            ink = df_rek[df_rek['bedrag'] > 0]
-            if 'Tegenrekening' in ink.columns:
-                bedrijf_ibans_in = set()
-                for _, row in ink.iterrows():
-                    omschr = str(row.get('Omschrijving', '')).upper()
-                    if any(m in omschr for m in _BEDRIJF_MARKERS):
-                        tegen = _normaliseer_iban(str(row.get('Tegenrekening', '')))
-                        if tegen:
-                            bedrijf_ibans_in.add(tegen)
-                ontvangt_van_meerdere = len(bedrijf_ibans_in) >= 2
-            else:
-                ontvangt_van_meerdere = False
-            if betaalt_bedrijven and ontvangt_van_meerdere:
-                _zakelijke_rekeningen.add(rek_str)
-                logger.info(f"ZAKELIJKE REKENING: {rek_str} — betaalt + ontvangt van bedrijven")
-    logger.info(f"Zakelijke rekeningen gedetecteerd: {len(_zakelijke_rekeningen)} van {len(df['Rekeningnummer'].unique())}")
+            if _normaliseer_iban(str(rek)) in _bv_ibans:
+                _zakelijke_rekeningen.add(str(rek).strip())
+        if _zakelijke_rekeningen:
+            logger.info(f"ZAKELIJKE REKENINGEN via interne transfers: {_zakelijke_rekeningen}")
+        else:
+            logger.info("Geen zakelijke rekeningen gedetecteerd via interne transfers")
 
     groepeer_col = 'Tegenrekening' if 'Tegenrekening' in df.columns else 'Omschrijving'
 
@@ -2302,73 +2296,69 @@ def _detecteer_vast_inkomen(df: pd.DataFrame) -> pd.DataFrame:
             continue
 
         # Classificatielogica geïnspireerd op Shortcut.ai:
-        # - Expliciet salaris-keyword → Netto salaris (zekerste signaal)
-        # - Holding/Management in naam → DGA-loon/Managementfee
-        # - Eigen BV (bidirectioneel) zonder keyword → Inkomen uit eigen BV (eerlijk)
-        # - Op zakelijke rekening → Freelance/Opdrachten (bedrijfsinkomen)
-        # - Werkgever op privérekening → Netto salaris
-        # - Overige BV → Netto salaris (default)
+        # Kernprincipe: classificeer eerlijk op basis van bewijs.
+        # "Dat weet ik niet 100% alleen uit de bankregel."
+        #
+        # 1. Salaris-keyword → Netto salaris (sterkste signaal, altijd)
+        # 2. Holding/Management → DGA-loon/Managementfee
+        # 3. Eigen BV (bidirectioneel) → Inkomen uit eigen BV
+        # 4. Op zakelijke rekening (=BV-rekening) → Freelance/Opdrachten
+        # 5. Werkgever op privérekening → Netto salaris
+        # 6. Overige BV/NV → Netto salaris (veilige default)
 
         heeft_salaris_kw = any(kw in tekst_check for kw in ['SALARIS', 'LOON', 'SALARY',
                                                              'NETTOLOON', 'PAYROLL', 'LOONRUN'])
         is_holding_mgmt = (heeft_holding or mgmt_met_bedrijf) and not heeft_werkgever
 
-        # Bidirectioneel signaal: als we OOK geld sturen naar deze BV → eigen bedrijf
+        # Bidirectioneel: stuur je ook geld NAAR deze tegenpartij? → eigen BV
         is_eigen_bv = False
         if heeft_bv and 'Tegenrekening' in df.columns:
-            groep_iban = _normaliseer_iban(key_str) if key_str.startswith('NL') or key_str.startswith('DE') or key_str.startswith('BE') else ''
+            groep_iban = _normaliseer_iban(key_str) if key_str[:2].isalpha() else ''
             if groep_iban and groep_iban in _bidi_ibans_salary:
                 is_eigen_bv = True
 
-        # Zakelijke rekening signaal: als dit inkomen binnenkomt op een
-        # gedetecteerde zakelijke rekening → bedrijfsinkomen, niet salaris
+        # Zakelijke rekening: komt dit inkomen binnen op je BV-rekening?
         op_zakelijke_rek = False
-        if 'Rekeningnummer' in groep.columns:
+        if 'Rekeningnummer' in groep.columns and _zakelijke_rekeningen:
             groep_rekeningen = set(groep['Rekeningnummer'].astype(str).str.strip().unique())
             op_zakelijke_rek = bool(groep_rekeningen & _zakelijke_rekeningen)
 
-        if heeft_salaris_kw and not op_zakelijke_rek:
-            # Sterkste signaal: expliciet salaris/loon in tekst op privérekening
+        if heeft_salaris_kw:
+            # Sterkste signaal: expliciet salaris/loon in tekst
             categorie = 'Netto salaris'
             source_fam = 'salary_employment'
             confidence = 0.95
-        elif heeft_salaris_kw and op_zakelijke_rek:
-            # Salaris-keyword maar op zakelijke rekening → toch salaris
-            # (kan payroll via eigen BV zijn)
-            categorie = 'Netto salaris'
-            source_fam = 'salary_employment'
-            confidence = 0.90
         elif is_holding_mgmt:
-            # Holding/Management in naam → DGA-loon
             categorie = 'DGA-loon/Managementfee'
             source_fam = 'management_fee'
             confidence = 0.90
         elif is_eigen_bv:
-            # Eigen BV (bidirectioneel bewezen) zonder expliciet salaris-keyword
+            # Shortcut: "het is inkomen, het komt maandelijks, het komt uit
+            # jouw eigen BV — maar het zegt niet expliciet loon/salaris."
             categorie = 'Inkomen uit eigen BV'
             source_fam = 'management_fee'
             confidence = 0.85
             logger.info(
-                f"EIGEN-BV DETECTIE: {key_str[:50]} — bidirectioneel → "
-                f"Inkomen uit eigen BV (geen salaris-keyword gevonden)"
+                f"EIGEN-BV: {key_str[:50]} — bidirectioneel bewezen, "
+                f"geen salaris-keyword → Inkomen uit eigen BV"
             )
         elif op_zakelijke_rek:
-            # Inkomen op zakelijke rekening van derde partij → freelance/opdrachten
-            # Niet: salaris. Een BV-rekening ontvangt omzet, geen loon.
+            # Inkomen op BV-rekening van derde partij = bedrijfsomzet.
+            # Foundation, Stichting, Gemeente etc. die je BV betaalt =
+            # opdrachtgever, niet werkgever.
             categorie = 'Freelance/Opdrachten'
             source_fam = 'freelance_business'
             confidence = 0.85
             logger.info(
-                f"ZAKELIJK INKOMEN: {key_str[:50]} op zakelijke rekening → "
-                f"Freelance/Opdrachten (geen salaris-keyword)"
+                f"ZAKELIJK: {key_str[:50]} op BV-rekening → "
+                f"Freelance/Opdrachten"
             )
         elif heeft_werkgever:
-            # Stichting/Gemeente/etc. op privérekening → regulier salaris
+            # Stichting/Gemeente/etc. op privérekening → salaris
             categorie = 'Netto salaris'
             source_fam = 'salary_employment'
             confidence = 0.88
         else:
-            # Overige BV/NV zonder verdere aanwijzingen → salaris (veilige default)
             categorie = 'Netto salaris'
             source_fam = 'salary_employment'
             confidence = 0.85

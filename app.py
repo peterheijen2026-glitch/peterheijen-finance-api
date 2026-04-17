@@ -2058,12 +2058,20 @@ def _classificeer_rule_based(df: pd.DataFrame) -> pd.DataFrame:
 
     # Ntropy fallback: voor transacties die MERCHANT_MAPPING niet pakt,
     # gebruik Ntropy-hint als die beschikbaar is (confidence 0.70)
+    # BELANGRIJK: alleen voor UITGAANDE transacties (expenses). Inkomende transacties
+    # worden beter afgehandeld door onze eigen detectoren (salaris, huur, uitkering)
+    # die specifiek getraind zijn op Nederlands bankverkeer. Ntropy is sterk in
+    # merchant-herkenning (Albert Heijn, Ziggo) maar niet in NL salarispatronen.
     n_ntropy_used = 0
     for idx, row in df.iterrows():
         if row.get('classificatie_bron') is not None:
             continue  # Al geclassificeerd door rule of als intern
         if row.get('is_intern', False):
             continue
+        # Alleen uitgaande transacties — inkomende laten we aan salaris/huur/uitkering-detectie
+        bedrag = float(row.get('bedrag', 0))
+        if bedrag > 0:
+            continue  # Positieve (inkomende) transactie → skip, eigen detectoren zijn beter
         ntropy_sectie = row.get('ntropy_sectie', '')
         ntropy_cat = row.get('ntropy_categorie', '')
         if ntropy_sectie and ntropy_cat:
@@ -2071,21 +2079,11 @@ def _classificeer_rule_based(df: pd.DataFrame) -> pd.DataFrame:
             df.at[idx, 'regel_categorie'] = ntropy_cat
             df.at[idx, 'regel_confidence'] = 0.70  # Ntropy-hint, lager dan onze eigen rules
             df.at[idx, 'classificatie_bron'] = 'rule'  # Telt als rule-based (niet AI)
-            # source_family voor Ntropy-geclassificeerde inkomsten
-            if ntropy_sectie == 'inkomsten':
-                sf_map = {
-                    'Salaris': 'salary_employment', 'Freelance inkomen': 'salary_employment',
-                    'Huurinkomsten': 'rental_income', 'Rente-inkomsten': 'interest_dividend',
-                    'Dividend': 'interest_dividend', 'Uitkering/toeslagen': 'benefits_uwv',
-                    'Belastingteruggave': 'tax_refund', 'Verzekeringsuitkering': 'tax_refund',
-                    'Studiefinanciering': 'benefits_uwv',
-                }
-                df.at[idx, 'source_family'] = sf_map.get(ntropy_cat, 'uncertain_positive_inflow')
             n_ntropy_used += 1
             n_geclassificeerd += 1
 
     if n_ntropy_used > 0:
-        logger.info(f"NTROPY-FALLBACK: {n_ntropy_used} extra transacties geclassificeerd via Ntropy-hint")
+        logger.info(f"NTROPY-FALLBACK: {n_ntropy_used} uitgaande transacties geclassificeerd via Ntropy-hint")
 
     # Statistieken
     n_totaal = len(df[~df.get('is_intern', False)])

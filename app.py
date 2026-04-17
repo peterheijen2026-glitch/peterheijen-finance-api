@@ -2197,6 +2197,14 @@ def _detecteer_vast_inkomen(df: pd.DataFrame) -> pd.DataFrame:
     # =========================================================================
     # LAAG 2: RECHTSVORM — B.V., Stichting, N.V., Gemeente, etc.
     # =========================================================================
+    # Bidirectionele IBANs: IBANs waar we OOK geld naartoe sturen
+    # Als je geld ontvangt van een BV EN er ook geld naartoe stuurt → eigen BV → DGA-loon
+    # Een werknemer betaalt nooit geld terug aan zijn werkgever.
+    _bidi_ibans_salary = set()
+    if 'Tegenrekening' in df.columns:
+        for iban_val in df[(df['bedrag'] < 0) & (~df['is_intern']) & df['Tegenrekening'].notna()]['Tegenrekening'].unique():
+            _bidi_ibans_salary.add(_normaliseer_iban(str(iban_val)))
+
     groepeer_col = 'Tegenrekening' if 'Tegenrekening' in df.columns else 'Omschrijving'
 
     for key, groep in df_kandidaat.groupby(groepeer_col):
@@ -2258,10 +2266,27 @@ def _detecteer_vast_inkomen(df: pd.DataFrame) -> pd.DataFrame:
         is_dga = (heeft_holding or mgmt_met_bedrijf) and not heeft_werkgever
         heeft_salaris_kw = any(kw in tekst_check for kw in ['SALARIS', 'LOON', 'SALARY'])
 
-        if is_dga and not heeft_salaris_kw:
+        # Bidirectioneel signaal: als we OOK geld sturen naar deze BV → eigen bedrijf
+        # Een werknemer betaalt nooit terug aan werkgever; een DGA doet dat constant.
+        is_bidi_bv = False
+        if heeft_bv and 'Tegenrekening' in df.columns:
+            groep_iban = _normaliseer_iban(key_str) if key_str.startswith('NL') or key_str.startswith('DE') or key_str.startswith('BE') else ''
+            if groep_iban and groep_iban in _bidi_ibans_salary:
+                is_bidi_bv = True
+
+        if (is_dga or is_bidi_bv) and not heeft_salaris_kw:
             categorie = 'DGA-loon/Managementfee'
             source_fam = 'management_fee'
-            confidence = 0.90
+            confidence = 0.90 if is_dga else 0.85  # bidi-signaal iets lager
+            if is_bidi_bv and not is_dga:
+                logger.info(
+                    f"DGA-DETECTIE via bidirectioneel: {key_str[:50]} — "
+                    f"ontvangt + stuurt geld → eigen BV → DGA-loon"
+                )
+        elif heeft_werkgever:
+            categorie = 'Netto salaris'
+            source_fam = 'salary_employment'
+            confidence = 0.88
         else:
             categorie = 'Netto salaris'
             source_fam = 'salary_employment'

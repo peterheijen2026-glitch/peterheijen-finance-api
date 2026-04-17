@@ -1949,6 +1949,16 @@ MERCHANT_MAPPING = [
     # op basis van bidirectionele geldstromen met persoonsnamen.
 ]
 
+# Extend met MEGA_MERCHANT_MAPPING (1451 extra merchants)
+try:
+    from merchant_registry import MEGA_MERCHANT_MAPPING
+    _existing_terms = set(z for z, _, _, _ in MERCHANT_MAPPING)
+    _extra = [(z, s, c, conf) for z, s, c, conf in MEGA_MERCHANT_MAPPING if z not in _existing_terms]
+    MERCHANT_MAPPING.extend(_extra)
+    logger.info(f"Merchant registry geladen: {len(_extra)} extra merchants, totaal {len(MERCHANT_MAPPING)}")
+except ImportError:
+    logger.warning("merchant_registry.py niet gevonden, alleen basis MERCHANT_MAPPING actief")
+
 
 def _classificeer_rule_based(df: pd.DataFrame) -> pd.DataFrame:
     """Classificeer transacties op basis van harde regels VOORDAT de AI eraan te pas komt.

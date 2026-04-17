@@ -1232,12 +1232,17 @@ def _resolve_related_parties(df: pd.DataFrame, eigen_rekeningen: set,
     # Transacties zonder IBAN → unresolved_private
     df.loc[df['party_type'].isna(), 'party_type'] = 'unresolved_private_counterparty'
 
-    # Mark household_related_party als is_intern (hard exclusion)
+    # V3: household_related_party → NIET meer is_intern, maar eigen sectie 'onderling_neutraal'
+    # Ze moeten zichtbaar zijn in het rapport (ONDERLING/NEUTRAAL) maar NIET als salary/income
     mask_hh = (df['party_type'] == 'household_related_party') & (~df['is_intern'])
     n_hh_extra = mask_hh.sum()
     if n_hh_extra > 0:
-        df.loc[mask_hh, 'is_intern'] = True
-        logger.info(f"RPR: {n_hh_extra} extra transacties als is_intern gemarkeerd via household (S2)")
+        df.loc[mask_hh, 'regel_sectie'] = 'onderling_neutraal'
+        df.loc[mask_hh, 'regel_categorie'] = 'Overboekingen huishouden/partner'
+        df.loc[mask_hh, 'regel_confidence'] = 0.95
+        df.loc[mask_hh, 'classificatie_bron'] = 'rule'
+        df.loc[mask_hh, 'source_family'] = 'household_transfer'
+        logger.info(f"RPR V3: {n_hh_extra} household-transacties → onderling_neutraal (niet meer is_intern)")
 
     # Cleanup
     if '_tegen_norm' in df.columns:
@@ -1295,14 +1300,15 @@ MERCHANT_MAPPING = [
     # --- VASTE LASTEN ---
     # Hypotheek / Woonlasten
     ('ASR HYPOTHEEK', 'vaste_lasten', 'Hypotheek/Huur', 0.99),
-    ('ASR LEVENSVERZEKERING', 'vaste_lasten', 'Hypotheek/Huur', 0.90),
+    ('ASR LEVENSVERZEKERING', 'vaste_lasten', 'Levensverzekering/ORV', 0.90),
     ('ASR', 'vaste_lasten', 'Hypotheek/Huur', 0.85),
     ('A.S.R', 'vaste_lasten', 'Hypotheek/Huur', 0.85),
     ('NATIONALE-NEDERLANDEN', 'vaste_lasten', 'Hypotheek/Huur', 0.80),
     ('NN GROUP', 'vaste_lasten', 'Hypotheek/Huur', 0.80),
     ('AEGON', 'vaste_lasten', 'Hypotheek/Huur', 0.80),
     ('DELTA LLOYD', 'vaste_lasten', 'Hypotheek/Huur', 0.80),
-    ('VVE', 'vaste_lasten', 'Hypotheek/Huur', 0.90),
+    ('VVE', 'vaste_lasten', 'VvE', 0.90),
+    ('VERENIGING VAN EIGENAREN', 'vaste_lasten', 'VvE', 0.95),
     ('OBVION', 'vaste_lasten', 'Hypotheek/Huur', 0.99),
     ('FLORIUS', 'vaste_lasten', 'Hypotheek/Huur', 0.99),
     ('WOONFONDS', 'vaste_lasten', 'Hypotheek/Huur', 0.99),
@@ -1654,6 +1660,21 @@ MERCHANT_MAPPING = [
     ('MEESMAN', 'sparen_beleggen', 'Effectenrekening', 0.99),
     ('NORTHERN TRUST', 'sparen_beleggen', 'Effectenrekening', 0.90),
 
+    # --- MOBILITEIT VAST (wegenbelasting, lease) ---
+    ('MOTORRIJTUIGENBELASTING', 'vaste_lasten', 'Mobiliteit vast', 0.99),
+    ('MRB', 'vaste_lasten', 'Mobiliteit vast', 0.85),
+    ('WEGENBELASTING', 'vaste_lasten', 'Mobiliteit vast', 0.99),
+    ('LEASEPLAN', 'vaste_lasten', 'Mobiliteit vast', 0.95),
+    ('ALPHABET FLEET', 'vaste_lasten', 'Mobiliteit vast', 0.95),
+    ('ATHLON', 'vaste_lasten', 'Mobiliteit vast', 0.90),
+    ('ARVAL', 'vaste_lasten', 'Mobiliteit vast', 0.90),
+
+    # --- CASH OPNAME ---
+    ('GELDAUTOMAAT', 'variabele_kosten', 'Cash opname', 0.99),
+    ('GELDOPNAME', 'variabele_kosten', 'Cash opname', 0.99),
+    ('CASH WITHDRAWAL', 'variabele_kosten', 'Cash opname', 0.99),
+    ('GEA', 'variabele_kosten', 'Cash opname', 0.85),
+
     # --- CREDITCARD (geen consumptie, interne verschuiving) ---
     ('ICS/INT CARD', 'intern', 'Creditcard-aflossing', 0.90),
     ('ICS ', 'intern', 'Creditcard-aflossing', 0.85),
@@ -1685,6 +1706,7 @@ def _classificeer_rule_based(df: pd.DataFrame) -> pd.DataFrame:
     df['regel_categorie'] = None
     df['regel_confidence'] = 0.0
     df['classificatie_bron'] = None
+    df['source_family'] = None  # V3: income source lineage
 
     n_geclassificeerd = 0
 
@@ -1701,6 +1723,7 @@ def _classificeer_rule_based(df: pd.DataFrame) -> pd.DataFrame:
                 df.at[idx, 'regel_sectie'] = 'inkomsten'
                 df.at[idx, 'regel_categorie'] = 'Belastingteruggave'
                 df.at[idx, 'regel_confidence'] = 0.95
+                df.at[idx, 'source_family'] = 'tax_refund'
             else:
                 # Probeer type belasting te herkennen
                 if 'IB' in omschr or 'INKOMSTENBELASTING' in omschr or 'INKOMSTENBEL' in omschr:
@@ -1720,6 +1743,26 @@ def _classificeer_rule_based(df: pd.DataFrame) -> pd.DataFrame:
             continue
 
         # Merchant mapping doorlopen
+        # V3: source_family mapping per categorie
+        _CAT_TO_SOURCE_FAMILY = {
+            'UWV/Uitkeringen': 'benefits_uwv',
+            'Kinderbijslag/Kindregelingen': 'child_benefit',
+            'Toeslagen': 'child_benefit',
+            'Pensioen/AOW': 'benefits_uwv',
+            'Studiefinanciering': 'benefits_uwv',
+            'Huurinkomsten': 'rental_income',
+            'Belastingteruggave': 'tax_refund',
+            'Effectenrekening': 'wealth_allocation',
+            'Effectenrekening (terugstorting)': 'broker_return',
+            'Crowdlending': 'wealth_allocation',
+            'Crowdlending (terugbetaling)': 'broker_return',
+            'Crypto': 'wealth_allocation',
+            'Crypto (terugstorting)': 'broker_return',
+            'Pensioenopbouw': 'wealth_allocation',
+            'Spaarrekening': 'wealth_allocation',
+            'Creditcard-aflossing': 'creditcard_settlement',
+            'Tikkie-terugbetaling': 'internal_transfer',
+        }
         for zoekterm, sectie, categorie, confidence in MERCHANT_MAPPING:
             if zoekterm in omschr:
                 # Creditcard en Tikkie: markeer als intern
@@ -1728,14 +1771,17 @@ def _classificeer_rule_based(df: pd.DataFrame) -> pd.DataFrame:
                     df.at[idx, 'regel_categorie'] = categorie
                     df.at[idx, 'regel_confidence'] = confidence
                     df.at[idx, 'classificatie_bron'] = 'rule'
+                    df.at[idx, 'source_family'] = _CAT_TO_SOURCE_FAMILY.get(categorie, 'neutral_technical')
                     n_geclassificeerd += 1
                     break
                 # Effectenrekening: positief = terugstorting (vermogensmutatie, NIET inkomen)
                 elif sectie == 'sparen_beleggen' and bedrag > 0:
+                    terugstort_cat = categorie.replace('Effectenrekening', 'Effectenrekening (terugstorting)') if 'Effectenrekening' in categorie else categorie + ' (terugstorting)'
                     df.at[idx, 'regel_sectie'] = 'sparen_beleggen'
-                    df.at[idx, 'regel_categorie'] = 'Effectenrekening (terugstorting)'
+                    df.at[idx, 'regel_categorie'] = terugstort_cat
                     df.at[idx, 'regel_confidence'] = confidence
                     df.at[idx, 'classificatie_bron'] = 'rule'
+                    df.at[idx, 'source_family'] = 'broker_return'
                     n_geclassificeerd += 1
                     break
                 # Tankstations: positief bedrag >€100 is GEEN benzine (Shell Energy etc.)
@@ -1747,6 +1793,7 @@ def _classificeer_rule_based(df: pd.DataFrame) -> pd.DataFrame:
                     df.at[idx, 'regel_categorie'] = categorie
                     df.at[idx, 'regel_confidence'] = confidence
                     df.at[idx, 'classificatie_bron'] = 'rule'
+                    df.at[idx, 'source_family'] = _CAT_TO_SOURCE_FAMILY.get(categorie)
                     n_geclassificeerd += 1
                     break
 
@@ -1758,7 +1805,7 @@ def _classificeer_rule_based(df: pd.DataFrame) -> pd.DataFrame:
                 f"geclassificeerd, {n_onzeker} naar AI")
 
     # Log de verdeling per sectie
-    for sectie in ['inkomsten', 'vaste_lasten', 'variabele_kosten', 'sparen_beleggen', 'intern']:
+    for sectie in ['inkomsten', 'vaste_lasten', 'variabele_kosten', 'sparen_beleggen', 'onderling_neutraal', 'intern']:
         n = len(df[df['regel_sectie'] == sectie])
         if n > 0:
             bedrag = abs(df[df['regel_sectie'] == sectie]['bedrag'].sum())
@@ -1780,6 +1827,11 @@ def _detecteer_vast_inkomen(df: pd.DataFrame) -> pd.DataFrame:
     1. KEYWORD: "SALARIS"/"LOON" in omschrijving → confidence 0.95
     2. RECHTSVORM: B.V./Stichting/N.V./Gemeente etc. → confidence 0.88-0.90
     3. PATROON: onbekende bron, ≥6x vast bedrag ≥€800 → confidence 0.80
+
+    HARDE REGELS (V3 No Guess Zone):
+    - household_related_party kan NOOIT salary_employment zijn
+    - own_account kan NOOIT extern inkomen zijn
+    - merchant kan NOOIT salary zijn
     """
     if 'Omschrijving' not in df.columns:
         return df
@@ -1791,6 +1843,12 @@ def _detecteer_vast_inkomen(df: pd.DataFrame) -> pd.DataFrame:
     if len(df_kandidaat) == 0:
         return df
 
+    # === V3 HARDE REGELS: party_types die NOOIT salary/income mogen zijn ===
+    _VERBODEN_SALARY_PARTY_TYPES = {
+        'household_related_party',
+        'own_account',
+    }
+
     # Bekende merchants uitsluiten
     bekende_merchants = set()
     for zoekterm, _, _, _ in MERCHANT_MAPPING:
@@ -1799,6 +1857,7 @@ def _detecteer_vast_inkomen(df: pd.DataFrame) -> pd.DataFrame:
     n_dga = 0
     n_salaris = 0
     n_keyword = 0
+    n_geblokkeerd_party_type = 0
     gevonden_ibans = set()
 
     # =========================================================================
@@ -1807,6 +1866,12 @@ def _detecteer_vast_inkomen(df: pd.DataFrame) -> pd.DataFrame:
     for idx, row in df_kandidaat.iterrows():
         omschr = str(row.get('Omschrijving', '')).upper()
         bedrag = float(row.get('bedrag', 0))
+
+        # V3: party_type gating — blokkeer salary voor verboden party types
+        pt = row.get('party_type', '')
+        if pt in _VERBODEN_SALARY_PARTY_TYPES:
+            n_geblokkeerd_party_type += 1
+            continue
 
         salaris_keywords = ['SALARIS', ' LOON ', 'LOON/', '/LOON', 'SALARY',
                             'NETTO LOON', 'NETTOLOON', 'LOONBETALING',
@@ -1817,6 +1882,7 @@ def _detecteer_vast_inkomen(df: pd.DataFrame) -> pd.DataFrame:
                 df.at[idx, 'regel_categorie'] = 'Netto salaris'
                 df.at[idx, 'regel_confidence'] = 0.95
                 df.at[idx, 'classificatie_bron'] = 'rule'
+                df.at[idx, 'source_family'] = 'salary_employment'
                 n_keyword += 1
                 if 'Tegenrekening' in df.columns:
                     tegen = _normaliseer_iban(str(row.get('Tegenrekening', '')))
@@ -1842,6 +1908,15 @@ def _detecteer_vast_inkomen(df: pd.DataFrame) -> pd.DataFrame:
             tegen_norm = _normaliseer_iban(key_str)
             if tegen_norm in gevonden_ibans:
                 continue
+
+        # V3: party_type gating — hele groep blokkeren als verboden type
+        groep_party_types = set(groep['party_type'].dropna().unique()) if 'party_type' in groep.columns else set()
+        if groep_party_types & _VERBODEN_SALARY_PARTY_TYPES:
+            n_geblokkeerd_party_type += len(groep[groep['bedrag'] > 0])
+            logger.info(
+                f"SALARY-BLOKKADE: {key_str[:40]} geblokkeerd — party_type={groep_party_types & _VERBODEN_SALARY_PARTY_TYPES}"
+            )
+            continue
 
         omschr_alle = ' '.join(groep['Omschrijving'].astype(str).str.upper())
         tekst_check = key_str + ' ' + omschr_alle
@@ -1887,9 +1962,11 @@ def _detecteer_vast_inkomen(df: pd.DataFrame) -> pd.DataFrame:
 
         if is_dga and not heeft_salaris_kw:
             categorie = 'DGA-loon/Managementfee'
+            source_fam = 'management_fee'
             confidence = 0.90
         else:
             categorie = 'Netto salaris'
+            source_fam = 'salary_employment'
             confidence = 0.88
 
         mask_match = df.index.isin(groep_pos.index)
@@ -1897,6 +1974,7 @@ def _detecteer_vast_inkomen(df: pd.DataFrame) -> pd.DataFrame:
         df.loc[mask_match, 'regel_categorie'] = categorie
         df.loc[mask_match, 'regel_confidence'] = confidence
         df.loc[mask_match, 'classificatie_bron'] = 'rule'
+        df.loc[mask_match, 'source_family'] = source_fam
 
         totaal = bedragen.sum()
         if categorie == 'DGA-loon/Managementfee':
@@ -1926,6 +2004,17 @@ def _detecteer_vast_inkomen(df: pd.DataFrame) -> pd.DataFrame:
             if len(groep_pos) < 6:
                 continue
 
+            # V3: party_type gating
+            groep_pts = set(groep_pos['party_type'].dropna().unique()) if 'party_type' in groep_pos.columns else set()
+            if groep_pts & _VERBODEN_SALARY_PARTY_TYPES:
+                naam = groep_pos.iloc[0]['Omschrijving'] if len(groep_pos) > 0 else '?'
+                n_geblokkeerd_party_type += len(groep_pos)
+                logger.info(
+                    f"SALARY-PATROON-BLOKKADE: {tegen_rek} ({str(naam)[:30]}) — "
+                    f"party_type={groep_pts & _VERBODEN_SALARY_PARTY_TYPES}, {len(groep_pos)} tx geblokkeerd"
+                )
+                continue
+
             omschr_check = ' '.join(groep_pos['Omschrijving'].astype(str).str.upper().head(5))
             if any(m in omschr_check for m in bekende_merchants):
                 continue
@@ -1943,6 +2032,7 @@ def _detecteer_vast_inkomen(df: pd.DataFrame) -> pd.DataFrame:
                 df.loc[mask_match, 'regel_categorie'] = 'Netto salaris'
                 df.loc[mask_match, 'regel_confidence'] = 0.80
                 df.loc[mask_match, 'classificatie_bron'] = 'rule'
+                df.loc[mask_match, 'source_family'] = 'salary_employment'
                 n_salaris += len(groep_pos)
                 naam = groep_pos.iloc[0]['Omschrijving']
                 logger.info(
@@ -1955,6 +2045,11 @@ def _detecteer_vast_inkomen(df: pd.DataFrame) -> pd.DataFrame:
         logger.info(f"VAST INKOMEN: {totaal_gevonden} tx — {n_keyword} keyword, {n_dga} DGA, {n_salaris} salaris")
     else:
         logger.info("VAST INKOMEN: geen vast inkomen gedetecteerd")
+    if n_geblokkeerd_party_type > 0:
+        logger.info(
+            f"V3-GATING: {n_geblokkeerd_party_type} transacties geblokkeerd als salary "
+            f"vanwege verboden party_type (household/own_account)"
+        )
 
     return df
 
@@ -2871,6 +2966,150 @@ def extract_naam(omschr: str) -> str:
     return omschr[:60]
 
 
+# ---------------------------------------------------------------------------
+# V3: POST-CLASSIFICATIE RECONCILIATIE
+# ---------------------------------------------------------------------------
+
+def _post_classificatie_reconciliatie(df: pd.DataFrame, feiten: dict) -> dict:
+    """V3 Reconciliation-First: controleer dat ALLE transacties verantwoord zijn.
+
+    Controleert per rekening, per maand:
+    1. SUM(alle transacties in die maand) = netto mutaties uit feiten
+    2. Geen transactie zonder sectie-toewijzing (na AI)
+    3. Begin saldo + mutaties = eind saldo
+
+    Returns dict met:
+    - status: 'GREEN' / 'ORANGE' / 'RED'
+    - checks: lijst van individuele checks
+    - onvolledige_maanden: set van maanden met <15 transacties
+    """
+    checks = []
+    status = 'GREEN'
+    onvolledige_maanden = set()
+
+    # Bepaal volle maanden (minimaal 15 transacties per maand over alle rekeningen)
+    if 'maand' in df.columns:
+        tx_per_maand = df.groupby('maand').size()
+        for maand, count in tx_per_maand.items():
+            if count < 15:
+                onvolledige_maanden.add(str(maand))
+                checks.append({
+                    'type': 'ONVOLLEDIGE_MAAND',
+                    'maand': str(maand),
+                    'transacties': int(count),
+                    'status': 'ORANGE',
+                    'detail': f'Maand {maand} heeft slechts {count} transacties — telt niet mee in 12m'
+                })
+
+    # Per rekening: saldo-check
+    for rek, rek_feiten in feiten.items():
+        saldo = rek_feiten.get('saldo', {})
+        if not saldo.get('klopt', True):
+            verschil = abs(saldo.get('berekend_eind', 0) - saldo.get('eindsaldo', 0))
+            checks.append({
+                'type': 'SALDO_MISMATCH',
+                'rekening': rek,
+                'verschil': verschil,
+                'status': 'RED',
+                'detail': f'Rekening {rek}: berekend eind {saldo.get("berekend_eind")} != werkelijk {saldo.get("eindsaldo")}'
+            })
+            status = 'RED'
+
+    # Check: alle niet-interne transacties moeten een sectie hebben
+    df_extern = df[~df.get('is_intern', False)]
+    n_zonder_sectie = len(df_extern[df_extern['regel_sectie'].isna()])
+    if n_zonder_sectie > 0:
+        pct = n_zonder_sectie / len(df_extern) * 100 if len(df_extern) > 0 else 0
+        check_status = 'ORANGE' if pct < 20 else 'RED'
+        checks.append({
+            'type': 'ONGECLASS_TRANSACTIES',
+            'aantal': n_zonder_sectie,
+            'percentage': round(pct, 1),
+            'status': check_status,
+            'detail': f'{n_zonder_sectie} transacties ({pct:.1f}%) zonder classificatie (gaan naar AI)'
+        })
+        if check_status == 'RED':
+            status = 'RED'
+        elif status == 'GREEN':
+            status = 'ORANGE'
+
+    # Household/salary contamination check
+    if 'party_type' in df.columns and 'regel_categorie' in df.columns:
+        hh_salary = df[
+            (df['party_type'] == 'household_related_party') &
+            (df['regel_categorie'].isin(['Netto salaris', 'DGA-loon/Managementfee']))
+        ]
+        if len(hh_salary) > 0:
+            bedrag = abs(hh_salary['bedrag'].sum())
+            checks.append({
+                'type': 'HOUSEHOLD_ALS_SALARY',
+                'aantal': len(hh_salary),
+                'bedrag': round(bedrag, 2),
+                'status': 'RED',
+                'detail': f'{len(hh_salary)} household-transacties foutief als salary (EUR {bedrag:,.0f})'
+            })
+            status = 'RED'
+
+    # Grocery/merchant in income check
+    merchant_in_income = df[
+        (df['party_type'] == 'merchant') &
+        (df['regel_sectie'] == 'inkomsten') &
+        (df['bedrag'] > 0)
+    ] if 'party_type' in df.columns else pd.DataFrame()
+    if len(merchant_in_income) > 0:
+        checks.append({
+            'type': 'MERCHANT_ALS_INKOMEN',
+            'aantal': len(merchant_in_income),
+            'status': 'ORANGE',
+            'detail': f'{len(merchant_in_income)} merchant-transacties in inkomsten-sectie'
+        })
+        if status == 'GREEN':
+            status = 'ORANGE'
+
+    logger.info(
+        f"V3-RECONCILIATIE: status={status}, {len(checks)} checks, "
+        f"{len(onvolledige_maanden)} onvolledige maanden: {onvolledige_maanden}"
+    )
+    for c in checks:
+        logger.info(f"  [{c['status']}] {c['type']}: {c['detail']}")
+
+    return {
+        'status': status,
+        'checks': checks,
+        'onvolledige_maanden': onvolledige_maanden,
+    }
+
+
+def _bepaal_rapportperiode(df: pd.DataFrame, reconciliatie: dict) -> dict:
+    """V3: Bepaal welke maanden meetellen voor 12m totalen/gemiddelden.
+
+    Onvolledige maanden (< 15 tx) worden uitgesloten uit 12m berekeningen
+    maar zijn wel zichtbaar in de Excel output.
+    """
+    if 'maand' not in df.columns:
+        return {'volle_maanden': [], 'onvolledige_maanden': [], 'n_mnd': 0}
+
+    alle_maanden = sorted(df['maand'].dropna().unique().astype(str))
+    onvolledig = reconciliatie.get('onvolledige_maanden', set())
+
+    volle_maanden = [m for m in alle_maanden if m not in onvolledig]
+    # Beperk tot max 12 meest recente volle maanden
+    if len(volle_maanden) > 12:
+        volle_maanden = volle_maanden[-12:]
+
+    logger.info(
+        f"V3-PERIODE: {len(volle_maanden)} volle maanden voor 12m "
+        f"(van {volle_maanden[0] if volle_maanden else '?'} t/m {volle_maanden[-1] if volle_maanden else '?'}), "
+        f"{len(onvolledig)} onvolledige uitgesloten: {onvolledig}"
+    )
+
+    return {
+        'volle_maanden': volle_maanden,
+        'onvolledige_maanden': list(onvolledig),
+        'n_mnd': len(volle_maanden),
+    }
+
+
 def bereken_top(df: pd.DataFrame, n: int = 15) -> dict:
     resultaat = {}
     for rekening in sorted(df['Rekeningnummer'].unique()):
@@ -3433,8 +3672,11 @@ def _bereken_rule_based_totalen(df: pd.DataFrame) -> dict:
     if 'classificatie_bron' not in df.columns:
         return result
 
+    # V3: onderling_neutraal meenemen in rule-based totalen (niet meer uitgefilterd)
     df_regel = df[(df['classificatie_bron'] == 'rule') & (~df.get('is_intern', False))].copy()
     df_regel = df_regel[df_regel['regel_sectie'] != 'intern']
+    # Household transacties die als onderling_neutraal zijn gemarkeerd zijn NIET is_intern
+    # en worden dus correct meegenomen
 
     if len(df_regel) == 0:
         logger.info("RULE-TOTALEN: geen rule-based transacties")
@@ -4914,7 +5156,18 @@ def _run_rapport_pipeline(job_id: str, bestanden: list, email: str):
         update('Bedragen berekenen en controleren...', 27)
         feiten = bereken_feiten(df)
         top = bereken_top(df)
-        update(f'Feiten berekend voor {len(feiten)} rekening(en)', 30)
+        update(f'Feiten berekend voor {len(feiten)} rekening(en)', 28)
+
+        # 2b. V3: Post-classificatie reconciliatie (pre-AI check)
+        update('Reconciliatie controleren...', 29)
+        reconciliatie = _post_classificatie_reconciliatie(df, feiten)
+        rapportperiode = _bepaal_rapportperiode(df, reconciliatie)
+        if reconciliatie['status'] == 'RED':
+            red_checks = [c for c in reconciliatie['checks'] if c['status'] == 'RED']
+            red_details = '; '.join(c['detail'] for c in red_checks[:3])
+            logger.warning(f"[{job_id}] V3-RECONCILIATIE RED: {red_details}")
+            # Nog niet blokkeren (no-send gate komt in Sprint 3), maar wel loggen
+        update(f"Reconciliatie: {reconciliatie['status']}, {rapportperiode['n_mnd']} volle maanden", 30)
 
         # 3. AI categoriseren + analyseren (langste stap: 30s-300s)
         provider = os.environ.get('AI_PROVIDER', 'claude').lower()
@@ -4955,6 +5208,8 @@ def _run_rapport_pipeline(job_id: str, bestanden: list, email: str):
             'maandoverzicht': claude_result['data'].get('maandoverzicht', {}),
             'jaartotalen': claude_result['data'].get('jaartotalen', {}),
             'analyse': claude_result['data'].get('analyse', {}),
+            'reconciliatie': reconciliatie,       # V3
+            'rapportperiode': rapportperiode,     # V3
         }
 
         # 5. PDF genereren

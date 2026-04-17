@@ -1674,15 +1674,26 @@ def _detecteer_huurinkomsten(df: pd.DataFrame) -> pd.DataFrame:
         if pct_negatief > 0.15:
             continue  # Te veel geld terug = waarschijnlijk geen huur
 
-        # Check: (semi-)vast bedrag (25% tolerantie)
+        # Check: (semi-)vast bedrag — robuust met median + IQR
+        # Reden: mean/std is gevoelig voor outliers (bijv. eenmalige borg-verhoging
+        # of correctiebetaling die de std disproportioneel opdrijft).
+        # Median + IQR is robuuster en pakt patronen als "9x €2500 + 1x €100 + 3x €2600".
         bedragen = groep['bedrag'].astype(float)
-        gemiddeld = bedragen.mean()
-        if gemiddeld < 300:
-            continue  # Minder dan €300 gemiddeld is waarschijnlijk geen huur
+        mediaan = bedragen.median()
+        if mediaan < 300:
+            continue  # Minder dan €300 mediaan is waarschijnlijk geen huur
 
-        std = bedragen.std()
-        variatie = (std / gemiddeld) if gemiddeld > 0 else 1.0
-        if variatie < 0.25:
+        # Filter outliers: verwijder bedragen < 25% van mediaan (bijv. eenmalige kleine correctie)
+        kern_bedragen = bedragen[bedragen >= mediaan * 0.25]
+        if len(kern_bedragen) < 4:
+            continue  # Na outlier-filter niet genoeg transacties over
+
+        # IQR-gebaseerde variatie (robuust tegen outliers)
+        q1 = kern_bedragen.quantile(0.25)
+        q3 = kern_bedragen.quantile(0.75)
+        iqr = q3 - q1
+        variatie = (iqr / mediaan) if mediaan > 0 else 1.0
+        if variatie < 0.30:  # IQR-variatie is natuurlijk lager, dus iets ruimere threshold
             # Vast bedrag, regelmatig, overwegend één richting = huurinkomsten
             mask_huur = df.index.isin(groep.index)
             df.loc[mask_huur, 'regel_sectie'] = 'inkomsten'
@@ -1695,8 +1706,8 @@ def _detecteer_huurinkomsten(df: pd.DataFrame) -> pd.DataFrame:
             naam = groep.iloc[0]['Omschrijving']
             logger.info(
                 f"HUURINKOMSTEN GEDETECTEERD: {groep_key[:40]} ({str(naam)[:30]}) — "
-                f"{len(groep)} betalingen, gemiddeld EUR {gemiddeld:,.0f}, "
-                f"totaal EUR {totaal:,.0f}, {variatie*100:.0f}% variatie, "
+                f"{len(groep)} betalingen, mediaan EUR {mediaan:,.0f}, "
+                f"totaal EUR {totaal:,.0f}, IQR-variatie {variatie*100:.0f}%, "
                 f"{pct_negatief*100:.0f}% negatief"
             )
 

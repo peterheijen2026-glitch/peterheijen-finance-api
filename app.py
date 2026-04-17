@@ -1978,8 +1978,11 @@ ABSOLUUT VERPLICHT:
 - [REGEL:variabele_kosten:Benzine/Diesel/Laden] → zet in variabele_kosten als "Benzine/Diesel/Laden", ZELFS als het bedrag positief is (dat is een terugbetaling/refund).
 - [REGEL:vaste_lasten:Energie] → zet in vaste_lasten als "Energie", ZELFS als het bedrag positief is.
 - [REGEL:inkomsten:Netto salaris] → zet in inkomsten als "Netto salaris".
+- [REGEL:inkomsten:Huurinkomsten] → zet in inkomsten als "Huurinkomsten" (NIET als Netto salaris!).
+- [REGEL:inkomsten:DGA-loon/Managementfee] → zet in inkomsten als "DGA-loon/Managementfee" (NIET als Netto salaris!).
 - Een positief bedrag bij een niet-inkomsten-categorie is een TERUGBETALING, geen inkomen. Zet het in de sectie die de [REGEL:] tag aangeeft.
 - Je mag [REGEL:...] transacties NIET verplaatsen naar een andere sectie of categorie.
+- SUBCATEGORIE IS BELANGRIJK: "Huurinkomsten" ≠ "Netto salaris" ≠ "DGA-loon". Houd ze apart!
 - Categoriseer alleen de transacties ZONDER [REGEL:...] tag.
 
 ## REGELS
@@ -2183,6 +2186,52 @@ Antwoord ALLEEN in valid JSON:
 }}"""
 
 
+def _log_classificatie_kwaliteit(df: pd.DataFrame) -> dict:
+    """Log een samenvatting van classificatie-kwaliteit.
+
+    Retourneert een dict met kwaliteitsmetrieken die in het rapport kunnen worden opgenomen.
+    """
+    totaal = len(df[~df.get('is_intern', False)])
+    n_rule = len(df[df['classificatie_bron'] == 'rule'])
+    n_ai = totaal - n_rule
+    pct_rule = (n_rule / totaal * 100) if totaal > 0 else 0
+
+    # Confidence verdeling voor rule-based
+    if 'regel_confidence' in df.columns:
+        df_conf = df[df['regel_confidence'].notna()]
+        n_high = len(df_conf[df_conf['regel_confidence'] >= 0.90])
+        n_med = len(df_conf[(df_conf['regel_confidence'] >= 0.80) & (df_conf['regel_confidence'] < 0.90)])
+        n_low = len(df_conf[df_conf['regel_confidence'] < 0.80])
+    else:
+        n_high = n_med = n_low = 0
+
+    # Bedragen
+    bedrag_rule = abs(df[df['classificatie_bron'] == 'rule']['bedrag'].sum()) if n_rule > 0 else 0
+    bedrag_totaal = abs(df[~df.get('is_intern', False)]['bedrag'].sum()) if totaal > 0 else 0
+    pct_bedrag_rule = (bedrag_rule / bedrag_totaal * 100) if bedrag_totaal > 0 else 0
+
+    logger.info(
+        f"CLASSIFICATIE-KWALITEIT: {n_rule}/{totaal} ({pct_rule:.0f}%) transacties rule-based, "
+        f"{n_ai} naar AI. Bedrag: {pct_bedrag_rule:.0f}% rule-based."
+    )
+    logger.info(
+        f"  Confidence: {n_high} hoog (≥0.90), {n_med} medium (0.80-0.89), {n_low} laag (<0.80)"
+    )
+
+    return {
+        'totaal_transacties': totaal,
+        'rule_based': n_rule,
+        'ai_geclassificeerd': n_ai,
+        'pct_rule_based': round(pct_rule, 1),
+        'pct_bedrag_rule_based': round(pct_bedrag_rule, 1),
+        'confidence': {
+            'hoog': n_high,
+            'medium': n_med,
+            'laag': n_low,
+        }
+    }
+
+
 def _rapport_kwaliteitscheck(data: dict, df: pd.DataFrame, eigen_rekeningen: set):
     """Blokkeer rapport als er grove classificatiefouten in zitten.
 
@@ -2367,10 +2416,27 @@ def _forceer_rule_classificaties(ai_data: dict, df: pd.DataFrame) -> dict:
         correcties_maand[rek][maand][sectie][cat]['bedrag'] += bedrag
         correcties_maand[rek][maand][sectie][cat]['aantal'] += 1
 
-    # Nu: verwijder deze bedragen uit de VERKEERDE AI-secties en zet ze in de JUISTE
+    # STRATEGIE: Voor elke rule-based categorie berekenen we het CORRECTE totaal
+    # uit het DataFrame, en OVERSCHRIJVEN de AI-output. We verwijderen het bedrag
+    # ook uit andere AI-categorieën waar de AI het mogelijk fout heeft gezet.
+    #
+    # Probleem dat dit oplost: als de rule-engine "Huurinkomsten" zegt maar de AI
+    # het als "Netto salaris" classificeert, werd het bedrag dubbel geteld. Nu
+    # trekken we het af van ALLE AI-categorieën in dezelfde sectie (niet alleen
+    # de exacte categorie-naam) en zetten het in de juiste categorie.
+
     jaartotalen = ai_data.get('jaartotalen', {})
     maandoverzicht = ai_data.get('maandoverzicht', {})
 
+    # === STAP 1: Bereken totaal rule-based bedrag per rekening ===
+    # Dit is wat we uit de AI-inkomsten/uitgaven moeten verwijderen
+    rule_totaal_per_rek = {}  # {rek: {sectie: totaal_bedrag}}
+    for rek, secties in correcties.items():
+        rule_totaal_per_rek[rek] = {}
+        for sectie, cats in secties.items():
+            rule_totaal_per_rek[rek][sectie] = sum(cats.values())
+
+    # === STAP 2: Jaartotalen corrigeren ===
     for rek, secties in correcties.items():
         if rek not in jaartotalen:
             jaartotalen[rek] = {}
@@ -2379,32 +2445,38 @@ def _forceer_rule_classificaties(ai_data: dict, df: pd.DataFrame) -> dict:
             if sectie not in jaartotalen[rek]:
                 jaartotalen[rek][sectie] = {}
 
+            rule_bedrag_in_sectie = round(sum(cats.values()), 2)
+
+            # Stap 2a: Trek het rule-bedrag af van de AI-categorie waar het
+            # waarschijnlijk fout staat. We zoeken in DEZELFDE sectie naar de
+            # grootste categorie die het bedrag zou kunnen bevatten.
+            if isinstance(jaartotalen[rek].get(sectie), dict):
+                for ai_cat, ai_bedrag in list(jaartotalen[rek][sectie].items()):
+                    if ai_cat in cats:
+                        # AI heeft dezelfde categorie — verwijder, wordt overschreven
+                        del jaartotalen[rek][sectie][ai_cat]
+
+            # Stap 2b: Zoek ook in ANDERE AI-categorieën waar de AI het fout
+            # kan hebben gezet (bv. "Netto salaris" ipv "Huurinkomsten")
+            for andere_sectie in ['inkomsten', 'vaste_lasten', 'variabele_kosten', 'sparen_beleggen']:
+                ai_sect = jaartotalen[rek].get(andere_sectie, {})
+                if not isinstance(ai_sect, dict):
+                    continue
+
+                for ai_cat in list(ai_sect.keys()):
+                    if ai_cat in cats:
+                        # Exacte match — verwijder
+                        del ai_sect[ai_cat]
+                        logger.info(f"POST-PROCESSING: '{ai_cat}' verwijderd uit AI-{andere_sectie} voor {rek}")
+
+            # Stap 2c: Zet de CORRECTE bedragen (alleen overschrijven, nooit optellen)
             for cat, bedrag in cats.items():
                 bedrag_rounded = round(bedrag, 2)
+                if isinstance(jaartotalen[rek].get(sectie), dict):
+                    jaartotalen[rek][sectie][cat] = bedrag_rounded
+                    logger.info(f"POST-PROCESSING: '{cat}' = EUR {bedrag_rounded:,.2f} in {sectie} voor {rek}")
 
-                # Stap 1: Verwijder dit bedrag uit ANDERE secties waar de AI het misschien heeft gezet
-                for andere_sectie in ['inkomsten', 'vaste_lasten', 'variabele_kosten', 'sparen_beleggen']:
-                    if andere_sectie == sectie:
-                        continue
-                    ai_secties = jaartotalen[rek].get(andere_sectie, {})
-                    if isinstance(ai_secties, dict) and cat in ai_secties:
-                        ai_bedrag = float(ai_secties[cat]) if isinstance(ai_secties[cat], (int, float)) else 0
-                        # Verwijder het rule-bedrag uit de verkeerde sectie
-                        rest = round(ai_bedrag - bedrag_rounded, 2)
-                        if abs(rest) < 0.01:
-                            del ai_secties[cat]
-                            logger.info(f"POST-PROCESSING: '{cat}' (EUR {bedrag_rounded:,.2f}) verwijderd uit {andere_sectie} voor {rek}")
-                        else:
-                            ai_secties[cat] = rest
-                            logger.info(f"POST-PROCESSING: '{cat}' deels gecorrigeerd in {andere_sectie} voor {rek}: EUR {ai_bedrag:,.2f} → EUR {rest:,.2f}")
-
-                # Stap 2: Zet het bedrag in de JUISTE sectie
-                huidige = float(jaartotalen[rek][sectie].get(cat, 0)) if isinstance(jaartotalen[rek][sectie], dict) else 0
-                if isinstance(jaartotalen[rek][sectie], dict):
-                    jaartotalen[rek][sectie][cat] = round(huidige + bedrag_rounded, 2) if huidige == 0 else round(bedrag_rounded, 2)
-                    logger.info(f"POST-PROCESSING: '{cat}' (EUR {bedrag_rounded:,.2f}) gezet in {sectie} voor {rek}")
-
-    # Maandoverzicht corrigeren (zelfde logica maar per maand)
+    # === STAP 3: Maandoverzicht corrigeren (zelfde logica per maand) ===
     for rek, maanden in correcties_maand.items():
         if rek not in maandoverzicht:
             maandoverzicht[rek] = {}
@@ -2414,20 +2486,20 @@ def _forceer_rule_classificaties(ai_data: dict, df: pd.DataFrame) -> dict:
             for sectie, cats in secties.items():
                 if sectie not in maandoverzicht[rek][maand]:
                     maandoverzicht[rek][maand][sectie] = {}
+
+                # Verwijder exacte categorie-matches uit alle secties
+                for andere_sectie in ['inkomsten', 'vaste_lasten', 'variabele_kosten', 'sparen_beleggen']:
+                    ai_maand_sect = maandoverzicht[rek][maand].get(andere_sectie, {})
+                    if isinstance(ai_maand_sect, dict):
+                        for ai_cat in list(ai_maand_sect.keys()):
+                            if ai_cat in cats:
+                                del ai_maand_sect[ai_cat]
+
+                # Zet correcte bedragen
                 for cat, data in cats.items():
                     bedrag_rounded = round(data['bedrag'], 2)
                     aantal = data['aantal']
-
-                    # Verwijder uit verkeerde secties
-                    for andere_sectie in ['inkomsten', 'vaste_lasten', 'variabele_kosten', 'sparen_beleggen']:
-                        if andere_sectie == sectie:
-                            continue
-                        ai_maand_sectie = maandoverzicht[rek][maand].get(andere_sectie, {})
-                        if isinstance(ai_maand_sectie, dict) and cat in ai_maand_sectie:
-                            del ai_maand_sectie[cat]
-
-                    # Zet in juiste sectie
-                    if isinstance(maandoverzicht[rek][maand][sectie], dict):
+                    if isinstance(maandoverzicht[rek][maand].get(sectie), dict):
                         maandoverzicht[rek][maand][sectie][cat] = {
                             'bedrag': bedrag_rounded,
                             'aantal': aantal
@@ -3583,6 +3655,10 @@ def _run_rapport_pipeline(job_id: str, bestanden: list, email: str):
         n_consistentie = n_regel_final - n_regel_na
         if n_consistentie > 0:
             update(f'{n_consistentie} extra transacties via IBAN-consistentie', 26)
+
+        # 1f. Classificatie-kwaliteit loggen
+        kwaliteit = _log_classificatie_kwaliteit(df)
+        update(f'{kwaliteit["pct_rule_based"]:.0f}% rule-based geclassificeerd', 27)
 
         # 2. Deterministisch rekenen
         update('Bedragen berekenen en controleren...', 27)

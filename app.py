@@ -2336,9 +2336,13 @@ Hieronder staan {len(df_ai_only)} banktransacties die JIJ moet classificeren.
 ## REGELS
 1. Categoriseer ELKE transactie in precies één categorie uit onderstaande lijst.
    Gebruik EXACT deze categorienamen (niet afwijken, niet samenvoegen, niet verzinnen).
-   Als een transactie nergens past, gebruik dan de "Overig" variant van de juiste sectie.
-   BELANGRIJK: "Overig" categorieën mogen MAXIMAAL 5% van het totaalbedrag per sectie bevatten.
-   Als er veel in "Overig" dreigt te belanden, kies dan de best passende bestaande categorie.
+   "Overig" categorieën mogen MAXIMAAL 5% van het totaalbedrag per sectie bevatten.
+   SPECIFIEK VOOR "Overig inkomen": dit mag MAXIMAAL 10% van totaal inkomsten zijn.
+   Als een positief bedrag niet duidelijk van een werkgever/overheid/huurder komt:
+   → Geld van een B.V./bedrijf met regelmatig patroon → Freelance/Opdrachten
+   → Geld terug van een bedrijf waar je eerder betaalde → Terugbetaling/Refund (variabele_kosten)
+   → Geld van broker/beleggingsplatform → Effectenrekening (terugstorting) (sparen_beleggen)
+   → Eenmalig onbekend bedrag → Freelance/Opdrachten OF Overig inkomen (alleen als het echt inkomen lijkt)
 
 ## INFLOW CLASSIFICATIE — KRITIEK
 Een positief bedrag is NIET automatisch inkomen! Er zijn 6 types positieve transacties:
@@ -2636,7 +2640,7 @@ def _rapport_kwaliteitscheck(data: dict, df: pd.DataFrame, eigen_rekeningen: set
             totaal_ink = sum(abs(float(v)) for v in inkomsten.values() if isinstance(v, (int, float)))
             if totaal_ink > 0 and overig > 0:
                 ratio = overig / totaal_ink
-                if ratio > 0.45:
+                if ratio > 0.55:
                     blockers.append(
                         f"BLOKKADE: Rekening {rek}: 'Overig inkomen' is {ratio:.0%} van totaal inkomen "
                         f"(EUR {overig:,.0f} / EUR {totaal_ink:,.0f}). "

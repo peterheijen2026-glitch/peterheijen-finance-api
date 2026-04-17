@@ -715,6 +715,225 @@ def _verrijk_transactie_velden(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+# ---------------------------------------------------------------------------
+# NTROPY ENRICHMENT — externe transactie-verrijking
+# ---------------------------------------------------------------------------
+NTROPY_API_KEY = os.getenv('NTROPY_API_KEY', '')
+NTROPY_BASE = 'https://api.ntropy.com/v3'
+
+# Mapping van Ntropy consumer categorieën naar onze sectie + categorie
+_NTROPY_TO_ONZE_MAPPING = {
+    # --- INKOMSTEN (incoming) ---
+    'paycheck': ('inkomsten', 'Salaris'),
+    'freelance income': ('inkomsten', 'Freelance inkomen'),
+    'property rental income': ('inkomsten', 'Huurinkomsten'),
+    'interest earned': ('inkomsten', 'Rente-inkomsten'),
+    'stock dividend': ('inkomsten', 'Dividend'),
+    'benefits': ('inkomsten', 'Uitkering/toeslagen'),
+    'tax refund': ('inkomsten', 'Belastingteruggave'),
+    'insurance payout': ('inkomsten', 'Verzekeringsuitkering'),
+    'cashback': ('inkomsten', 'Cashback'),
+    'grant or stipend': ('inkomsten', 'Studiefinanciering'),
+    'refund': ('inkomsten', 'Restitutie'),
+    # --- VASTE LASTEN (outgoing) ---
+    'rent': ('vaste_lasten', 'Huur/Hypotheek'),
+    'mortgage repayment': ('vaste_lasten', 'Huur/Hypotheek'),
+    'utilities': ('vaste_lasten', 'Energie'),
+    'insurance premium': ('vaste_lasten', 'Verzekeringen'),
+    'education': ('vaste_lasten', 'Onderwijs'),
+    'childcare': ('vaste_lasten', 'Kinderopvang'),
+    'loan repayment': ('vaste_lasten', 'Lening'),
+    'student loan repayment': ('vaste_lasten', 'Studieschuld'),
+    'auto loan repayment': ('vaste_lasten', 'Autolening'),
+    'credit card bill': ('vaste_lasten', 'Creditcard'),
+    'interest payment': ('vaste_lasten', 'Rente betaald'),
+    'taxes': ('vaste_lasten', 'Belastingen'),
+    'government': ('vaste_lasten', 'Overheid'),
+    'contribution to reserve fund': ('vaste_lasten', 'VvE/Reservefonds'),
+    'retirement contribution': ('sparen_beleggen', 'Pensioen'),
+    # --- VARIABELE KOSTEN (outgoing) ---
+    'groceries': ('variabele_kosten', 'Boodschappen'),
+    'restaurant': ('variabele_kosten', 'Uit eten'),
+    'fast food': ('variabele_kosten', 'Uit eten'),
+    'food delivery': ('variabele_kosten', 'Bezorging'),
+    'coffee shop': ('variabele_kosten', 'Horeca'),
+    'bars and nightclubs': ('variabele_kosten', 'Horeca'),
+    'fuel': ('variabele_kosten', 'Brandstof'),
+    'ev charging': ('variabele_kosten', 'Brandstof'),
+    'vehicle maintenance': ('variabele_kosten', 'Autokosten'),
+    'auto lease payment': ('variabele_kosten', 'Autolease'),
+    'rideshare or taxi transport': ('variabele_kosten', 'Vervoer'),
+    'public transport': ('variabele_kosten', 'OV'),
+    'other transport': ('variabele_kosten', 'Vervoer'),
+    'airfare': ('variabele_kosten', 'Reizen'),
+    'hotel or lodging': ('variabele_kosten', 'Reizen'),
+    'toll charge': ('variabele_kosten', 'Vervoer'),
+    'clothing': ('variabele_kosten', 'Kleding'),
+    'self care': ('variabele_kosten', 'Persoonlijke verzorging'),
+    'drugstore or pharmacy': ('variabele_kosten', 'Drogist/Apotheek'),
+    'medical bill': ('variabele_kosten', 'Zorgkosten'),
+    'entertainment': ('variabele_kosten', 'Entertainment'),
+    'digital content and streaming': ('variabele_kosten', 'Abonnementen'),
+    'sport and fitness': ('variabele_kosten', 'Sport'),
+    'pets': ('variabele_kosten', 'Huisdieren'),
+    'home maintenance': ('variabele_kosten', 'Woning onderhoud'),
+    'electronics': ('variabele_kosten', 'Elektronica'),
+    'e-commerce purchase': ('variabele_kosten', 'Online shopping'),
+    'department or discount store': ('variabele_kosten', 'Winkel'),
+    'convenience store': ('variabele_kosten', 'Winkel'),
+    'recreational goods': ('variabele_kosten', 'Vrije tijd'),
+    'books, newsletters, newspapers': ('variabele_kosten', 'Media'),
+    'saas tools': ('variabele_kosten', 'Software'),
+    'laundry': ('variabele_kosten', 'Wasserij'),
+    'donation': ('variabele_kosten', 'Donaties'),
+    'gambling spend': ('variabele_kosten', 'Gokken'),
+    # --- SPAREN/BELEGGEN ---
+    'transfer to investment app': ('sparen_beleggen', 'Belegging'),
+    'transfer to stock broker': ('sparen_beleggen', 'Belegging'),
+    'transfer to crypto broker': ('sparen_beleggen', 'Crypto'),
+    'transfer from investment app': ('sparen_beleggen', 'Belegging retour'),
+    'transfer from stock broker': ('sparen_beleggen', 'Belegging retour'),
+    'transfer from crypto broker': ('sparen_beleggen', 'Crypto retour'),
+    # --- NEUTRAAL / INTERN ---
+    'intra account transfer': ('onderling_neutraal', 'Interne overboeking'),
+    'inter account transfer': ('onderling_neutraal', 'Interne overboeking'),
+    'peer to peer transfer': ('onderling_neutraal', 'Onderlinge overboeking'),
+    'ATM withdrawal': ('onderling_neutraal', 'Cash opname'),
+    'ATM deposit': ('onderling_neutraal', 'Cash storting'),
+    'teller withdrawal': ('onderling_neutraal', 'Cash opname'),
+    'teller deposit': ('onderling_neutraal', 'Cash storting'),
+}
+
+
+def _ntropy_enrich_batch(df: pd.DataFrame) -> pd.DataFrame:
+    """Verrijk transacties via Ntropy API. Voegt kolommen toe:
+    - ntropy_entity: schone merchant naam
+    - ntropy_category: Ntropy categorie (bv. 'groceries')
+    - ntropy_sectie: onze sectie-mapping (bv. 'vaste_lasten')
+    - ntropy_categorie: onze categorie-mapping (bv. 'Energie')
+    - ntropy_website: merchant website
+
+    Faalt graceful: als API niet beschikbaar, gaat pipeline gewoon door
+    zonder Ntropy-data.
+    """
+    if not NTROPY_API_KEY:
+        logger.info("NTROPY: geen API key geconfigureerd, skip enrichment")
+        df['ntropy_entity'] = ''
+        df['ntropy_category'] = ''
+        df['ntropy_sectie'] = ''
+        df['ntropy_categorie'] = ''
+        df['ntropy_website'] = ''
+        return df
+
+    import requests as req
+
+    headers = {
+        'X-API-KEY': NTROPY_API_KEY,
+        'Content-Type': 'application/json',
+        'Accept': 'application/json'
+    }
+
+    # Maak unieke account holder per job (of hergebruik bestaande)
+    ah_id = f"ph-{uuid.uuid4().hex[:8]}"
+    try:
+        ah_resp = req.post(f"{NTROPY_BASE}/account_holders", headers=headers, json={
+            'id': ah_id, 'type': 'consumer', 'name': 'PH Klant'
+        }, timeout=10)
+        if ah_resp.status_code != 200:
+            logger.warning(f"NTROPY: account_holder aanmaken mislukt: {ah_resp.status_code}")
+            df['ntropy_entity'] = ''
+            df['ntropy_category'] = ''
+            df['ntropy_sectie'] = ''
+            df['ntropy_categorie'] = ''
+            df['ntropy_website'] = ''
+            return df
+    except Exception as e:
+        logger.warning(f"NTROPY: verbinding mislukt: {e}")
+        df['ntropy_entity'] = ''
+        df['ntropy_category'] = ''
+        df['ntropy_sectie'] = ''
+        df['ntropy_categorie'] = ''
+        df['ntropy_website'] = ''
+        return df
+
+    # Initialiseer kolommen
+    df['ntropy_entity'] = ''
+    df['ntropy_category'] = ''
+    df['ntropy_sectie'] = ''
+    df['ntropy_categorie'] = ''
+    df['ntropy_website'] = ''
+
+    n_success = 0
+    n_mapped = 0
+    n_errors = 0
+
+    for idx, row in df.iterrows():
+        # Skip interne overboekingen (als al gemarkeerd)
+        if row.get('is_intern', False):
+            continue
+
+        bedrag = abs(float(row.get('Transactiebedrag', 0)))
+        entry_type = 'incoming' if float(row.get('Transactiebedrag', 0)) > 0 else 'outgoing'
+
+        # Datum van YYYYMMDD naar YYYY-MM-DD
+        raw_datum = str(row.get('Transactiedatum', '20250101'))
+        if len(raw_datum) == 8 and raw_datum.isdigit():
+            api_datum = f"{raw_datum[:4]}-{raw_datum[4:6]}-{raw_datum[6:8]}"
+        else:
+            api_datum = raw_datum
+
+        omschrijving = str(row.get('Omschrijving', ''))[:200]
+
+        tx_payload = {
+            'id': f"ph-{idx}-{uuid.uuid4().hex[:6]}",
+            'description': omschrijving,
+            'date': api_datum,
+            'amount': bedrag,
+            'entry_type': entry_type,
+            'currency': 'EUR',
+            'account_holder_id': ah_id,
+            'location': {'country': 'NL'}
+        }
+
+        try:
+            resp = req.post(f"{NTROPY_BASE}/transactions", headers=headers,
+                           json=tx_payload, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                n_success += 1
+
+                # Entity (merchant naam)
+                cp = data.get('entities', {}).get('counterparty') or {}
+                entity_name = cp.get('name', '')
+                website = cp.get('website', '')
+                category = data.get('categories', {}).get('general', '')
+
+                df.at[idx, 'ntropy_entity'] = entity_name or ''
+                df.at[idx, 'ntropy_category'] = category or ''
+                df.at[idx, 'ntropy_website'] = website or ''
+
+                # Map naar onze categorieën
+                if category and category in _NTROPY_TO_ONZE_MAPPING:
+                    sectie, cat = _NTROPY_TO_ONZE_MAPPING[category]
+                    df.at[idx, 'ntropy_sectie'] = sectie
+                    df.at[idx, 'ntropy_categorie'] = cat
+                    n_mapped += 1
+            else:
+                n_errors += 1
+                if n_errors <= 3:
+                    logger.warning(f"NTROPY tx error {resp.status_code}: {resp.text[:100]}")
+        except Exception as e:
+            n_errors += 1
+            if n_errors <= 3:
+                logger.warning(f"NTROPY tx exception: {e}")
+            if n_errors > 20:
+                logger.error("NTROPY: >20 fouten, stop enrichment voor rest van batch")
+                break
+
+    logger.info(f"NTROPY: {n_success}/{len(df)} verrijkt, {n_mapped} gemapped naar onze categorieën, {n_errors} fouten")
+    return df
+
+
 def _markeer_interne_transfers(df: pd.DataFrame, eigen_rekeningen: set) -> pd.DataFrame:
     """Markeer transacties tussen eigen rekeningen als interne transfer.
 
@@ -1796,6 +2015,37 @@ def _classificeer_rule_based(df: pd.DataFrame) -> pd.DataFrame:
                     df.at[idx, 'source_family'] = _CAT_TO_SOURCE_FAMILY.get(categorie)
                     n_geclassificeerd += 1
                     break
+
+    # Ntropy fallback: voor transacties die MERCHANT_MAPPING niet pakt,
+    # gebruik Ntropy-hint als die beschikbaar is (confidence 0.70)
+    n_ntropy_used = 0
+    for idx, row in df.iterrows():
+        if row.get('classificatie_bron') is not None:
+            continue  # Al geclassificeerd door rule of als intern
+        if row.get('is_intern', False):
+            continue
+        ntropy_sectie = row.get('ntropy_sectie', '')
+        ntropy_cat = row.get('ntropy_categorie', '')
+        if ntropy_sectie and ntropy_cat:
+            df.at[idx, 'regel_sectie'] = ntropy_sectie
+            df.at[idx, 'regel_categorie'] = ntropy_cat
+            df.at[idx, 'regel_confidence'] = 0.70  # Ntropy-hint, lager dan onze eigen rules
+            df.at[idx, 'classificatie_bron'] = 'rule'  # Telt als rule-based (niet AI)
+            # source_family voor Ntropy-geclassificeerde inkomsten
+            if ntropy_sectie == 'inkomsten':
+                sf_map = {
+                    'Salaris': 'salary_employment', 'Freelance inkomen': 'salary_employment',
+                    'Huurinkomsten': 'rental_income', 'Rente-inkomsten': 'interest_dividend',
+                    'Dividend': 'interest_dividend', 'Uitkering/toeslagen': 'benefits_uwv',
+                    'Belastingteruggave': 'tax_refund', 'Verzekeringsuitkering': 'tax_refund',
+                    'Studiefinanciering': 'benefits_uwv',
+                }
+                df.at[idx, 'source_family'] = sf_map.get(ntropy_cat, 'uncertain_positive_inflow')
+            n_ntropy_used += 1
+            n_geclassificeerd += 1
+
+    if n_ntropy_used > 0:
+        logger.info(f"NTROPY-FALLBACK: {n_ntropy_used} extra transacties geclassificeerd via Ntropy-hint")
 
     # Statistieken
     n_totaal = len(df[~df.get('is_intern', False)])
@@ -5819,6 +6069,18 @@ def _run_rapport_pipeline(job_id: str, bestanden: list, email: str):
         # 1a2. Transactie-verrijking: naam-extractie + IBAN-extractie uit omschrijvingen
         update('Transacties verrijken...', 16)
         df = _verrijk_transactie_velden(df)
+
+        # 1a3. Ntropy enrichment: externe merchant-herkenning + categorie-hint
+        if NTROPY_API_KEY:
+            update('Ntropy enrichment...', 16)
+            df = _ntropy_enrich_batch(df)
+            n_ntropy = (df['ntropy_category'] != '').sum()
+            n_mapped = (df['ntropy_sectie'] != '').sum()
+            update(f'Ntropy: {n_ntropy} verrijkt, {n_mapped} gemapped', 17)
+        else:
+            # Initialiseer lege kolommen zodat rest van pipeline werkt
+            for col in ['ntropy_entity', 'ntropy_category', 'ntropy_sectie', 'ntropy_categorie', 'ntropy_website']:
+                df[col] = ''
 
         # 1b. Huishoudregister & interne-overboekingen detectie
         update('Eigen rekeningen herkennen...', 17)

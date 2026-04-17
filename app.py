@@ -3754,10 +3754,12 @@ class RapportPDF(FPDF):
         self.cell(0, 10, 'Dit rapport is gegenereerd door PeterHeijen.com  |  Vertrouwelijk', 0, 0, 'C')
 
     def cover_page(self, feiten: dict, rapport_datum: str, jaartotalen: dict = None, maandoverzicht: dict = None):
-        """Pagina 1: Executive summary op huishoudniveau — premium uitstraling.
+        """Pagina 1: Executive summary — economische lens voor vermogende particulieren.
 
-        Toont niet per rekening, maar het totaalbeeld:
-        structureel inkomen, vaste lasten, vrij besteedbaar, vermogensopbouw.
+        Sprint 2: ombouw van huishoudboekje-logica naar executive buckets.
+        6 blokken: structureel inkomen, belastingdruk, woonlasten,
+        levensstijl, vermogensopbouw, onzekere posten.
+        "Vrij besteedbaar" is BEWUST verwijderd als headline metric.
         """
         # Donkere header
         self.set_fill_color(*INK)
@@ -3778,7 +3780,7 @@ class RapportPDF(FPDF):
         self.set_font(self.BODY, '', 12)
         self.set_text_color(200, 200, 210)
         self.set_xy(15, 38)
-        self.cell(0, 7, 'Uw persoonlijke financiele situatie in een oogopslag', 0, 1, 'L')
+        self.cell(0, 7, 'Uw financiele structuur in een oogopslag', 0, 1, 'L')
 
         # Datum + scope
         self.set_font(self.DATA, '', 9)
@@ -3793,8 +3795,7 @@ class RapportPDF(FPDF):
         tot = max(periodes) if periodes else ''
         self.cell(0, 6, f'{len(feiten)} rekening(en) geanalyseerd  |  {van} t/m {tot}', 0, 1, 'L')
 
-        # --- Executive metrics: gecombineerde cijfers ---
-        # Bereken totalen over alle rekeningen (excl. interne verschuivingen)
+        # --- Executive Buckets: economische lens ---
         n_maanden = 1
         if maandoverzicht:
             all_months = set()
@@ -3802,15 +3803,8 @@ class RapportPDF(FPDF):
                 all_months.update(rek_m.keys())
             n_maanden = max(len(all_months), 1)
 
-        totaal_inkomen = 0
-        totaal_vaste = 0
-        totaal_variabel = 0
-        totaal_sparen = 0
-        totaal_uncertain = 0
-
-        # PAGE-1 WHITELIST: ALLEEN deze categorieën tellen als structureel inkomen
-        # Dit is een whitelist, geen blacklist. Alles wat niet expliciet op de lijst
-        # staat, telt NIET mee — ook niet als het in de 'inkomsten' sectie staat.
+        # === BUCKET MAPPING ===
+        # Structureel inkomen: PAGE-1 WHITELIST (ongewijzigd)
         _PAGE1_WHITELIST = {
             'Netto salaris', 'DGA-loon/Managementfee', 'Huurinkomsten',
             'UWV/Uitkeringen', 'Kinderbijslag/Kindregelingen', 'Toeslagen',
@@ -3818,46 +3812,83 @@ class RapportPDF(FPDF):
             'Overheid overig',
         }
 
+        # Belastingdruk: belasting-categorieën uit vaste_lasten + inkomsten
+        _BELASTING_CATS = {
+            'Inkomstenbelasting/Voorlopige aanslag',
+            'BTW/Omzetbelasting',
+            'Overige belastingen',
+            'Gemeentebelasting/OZB/Waterschapsbelasting',
+        }
+
+        # Woonlasten: woon-gerelateerde categorieën uit vaste_lasten
+        _WOONLASTEN_CATS = {
+            'Hypotheek/Huur',
+            'Energie',
+            'Water',
+        }
+
+        totaal_inkomen = 0
+        totaal_belasting = 0
+        totaal_woonlasten = 0
+        totaal_levensstijl = 0
+        totaal_vermogen = 0
+        totaal_onzeker = 0
+
         if jaartotalen:
             for rek, totalen in jaartotalen.items():
+                # Inkomsten → structureel of onzeker
                 for cat, bedrag in totalen.get('inkomsten', {}).items():
                     if cat in _PAGE1_WHITELIST:
                         totaal_inkomen += abs(bedrag or 0)
                     else:
-                        totaal_uncertain += abs(bedrag or 0)  # Track voor apart vermelding
+                        totaal_onzeker += abs(bedrag or 0)
+
+                # Vaste lasten → belasting, woonlasten, of levensstijl
                 for cat, bedrag in totalen.get('vaste_lasten', {}).items():
-                    totaal_vaste += abs(bedrag or 0)
+                    b = abs(bedrag or 0)
+                    if cat in _BELASTING_CATS:
+                        totaal_belasting += b
+                    elif cat in _WOONLASTEN_CATS:
+                        totaal_woonlasten += b
+                    else:
+                        totaal_levensstijl += b  # overige vaste = levensstijl
+
+                # Variabele kosten → levensstijl
                 for cat, bedrag in totalen.get('variabele_kosten', {}).items():
-                    totaal_variabel += abs(bedrag or 0)
+                    totaal_levensstijl += abs(bedrag or 0)
+
+                # Sparen/beleggen → vermogensopbouw
                 for cat, bedrag in totalen.get('sparen_beleggen', {}).items():
-                    totaal_sparen += abs(bedrag or 0)
+                    totaal_vermogen += abs(bedrag or 0)
 
         pm_inkomen = totaal_inkomen / n_maanden
-        pm_vaste = totaal_vaste / n_maanden
-        pm_variabel = totaal_variabel / n_maanden
-        pm_sparen = totaal_sparen / n_maanden
-        pm_vrij = pm_inkomen - pm_vaste - pm_variabel - pm_sparen
+        pm_belasting = totaal_belasting / n_maanden
+        pm_woonlasten = totaal_woonlasten / n_maanden
+        pm_levensstijl = totaal_levensstijl / n_maanden
+        pm_vermogen = totaal_vermogen / n_maanden
+        pm_onzeker = totaal_onzeker / n_maanden
 
-        # Metrics grid — 5 blokken
-        self.set_y(90)
+        # Metrics grid — 6 blokken (3 rijen x 2 kolommen)
         metrics = [
-            ('Structureel inkomen', pm_inkomen, '/mnd', ACCENT),
-            ('Vaste lasten', pm_vaste, '/mnd', (139, 69, 19)),
-            ('Variabele kosten', pm_variabel, '/mnd', (74, 85, 104)),
-            ('Vermogensopbouw', pm_sparen, '/mnd', (26, 107, 60)),
-            ('Vrij besteedbaar', pm_vrij, '/mnd', GREEN if pm_vrij >= 0 else RED),
+            ('Structureel inkomen',   pm_inkomen,     '/mnd', ACCENT),
+            ('Belastingdruk',         pm_belasting,   '/mnd', (139, 69, 19)),
+            ('Woonlasten',            pm_woonlasten,  '/mnd', (74, 85, 104)),
+            ('Levensstijl',           pm_levensstijl, '/mnd', (74, 85, 104)),
+            ('Vermogensopbouw',       pm_vermogen,    '/mnd', (26, 107, 60)),
+            ('Onzeker (buiten beeld)', pm_onzeker,    '/mnd', (140, 140, 155)),
         ]
 
         box_w = 85
         box_h = 28
         gap = 10
         start_x = 15
+        start_y = 90
 
         for i, (label, value, suffix, color) in enumerate(metrics):
             col = i % 2
             row = i // 2
             x = start_x + col * (box_w + gap)
-            y = 90 + row * (box_h + 6)
+            y = start_y + row * (box_h + 6)
 
             # Achtergrond
             self.set_fill_color(*SURFACE)
@@ -3876,12 +3907,8 @@ class RapportPDF(FPDF):
             self.set_xy(x + 8, y + 13)
             self.cell(box_w - 16, 7, eur(value) + suffix, 0, 0, 'L')
 
-        # Laatste blok (Vrij besteedbaar) centraal als het oneven is
-        if len(metrics) % 2 == 1:
-            pass  # Al correct geplaatst door grid logica
-
-        # --- Cashflow-reconciliatie uitleg ---
-        self.set_y(90 + 3 * (box_h + 6) + 4)
+        # --- Uitleg onder metrics ---
+        self.set_y(start_y + 3 * (box_h + 6) + 4)
         self.set_draw_color(*GOLD)
         self.set_line_width(0.4)
         self.line(15, self.get_y(), 195, self.get_y())
@@ -3892,8 +3919,8 @@ class RapportPDF(FPDF):
         uitleg = (
             f'Dit overzicht toont uw gemiddelde maandelijkse geldstromen over {n_maanden} maanden, '
             f'berekend op basis van {len(feiten)} rekening(en). '
-            f'Interne overboekingen tussen uw eigen rekeningen zijn hierin niet meegerekend — '
-            f'zij verschuiven geld maar veranderen uw financiele positie niet.'
+            f'Interne overboekingen tussen eigen rekeningen zijn uitgesloten. '
+            f'Onzekere posten (niet-geverifieerde inflows) zijn apart vermeld en tellen niet mee in de kerngetallen.'
         )
         self.multi_cell(180, 4.5, uitleg, 0, 'L')
 

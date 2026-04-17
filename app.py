@@ -2480,6 +2480,17 @@ _UNCERTAIN_CATS = {
     'Onzeker positief (verzekeraar)',
     'Onzeker positief (bidirectioneel)',
     'Onzeker positief (financiële instelling)',
+    'Onzeker positief (bedrijf/organisatie)',
+    'Onzeker positief (bedrijf, klein bedrag)',
+    'Onzeker positief (privépersoon, groot bedrag)',
+    'Onderlinge betaling (privépersoon)',
+    'Onderlinge betaling (klein bedrag)',
+    'Overige bijschrijving (klein)',
+    'Overige bijschrijving',
+    'Terugbetaling/Tikkie',
+    'Verkoop (tweedehands)',
+    'Cashback/Spaarprogramma',
+    'Notaris/Woningtransactie',
 }
 
 # Rechtsvorm-markers voor employer detection
@@ -2665,24 +2676,83 @@ def _refund_matcher(row, negatieve_bedragen_per_iban, negatieve_bedragen_per_naa
 def _uncertainty_gate(row, bidi_ibans):
     """Subcategoriseer uncertain positive inflows.
 
-    Returns: subcategorie string
+    Geeft een specifieke subcategorie terug die de gebruiker vertelt
+    WAT het waarschijnlijk is, zodat ze het kunnen verifiëren.
+    Hoe specifieker de subcategorie, hoe minder "onzeker" het aanvoelt.
+
+    Returns: (subcategorie_string, inflow_type_hint)
     """
     omschr = str(row.get('Omschrijving', '')).upper()
     naam = str(row.get('tegenpartij_naam', '')).upper() if 'tegenpartij_naam' in row.index else ''
     tekst = omschr + ' ' + naam
+    bedrag = float(row.get('bedrag', 0))
     iban = _normaliseer_iban(str(row.get('Tegenrekening', ''))) if 'Tegenrekening' in row.index else ''
+    party_type = str(row.get('party_type', '')) if 'party_type' in row.index else ''
 
-    # Verzekeraar zonder uitkering-keyword
+    # === SPECIFIEKE HERKENNING (van meest naar minst zeker) ===
+
+    # 1. Verzekeraar zonder uitkering-keyword → waarschijnlijk schade-uitkering
     if any(v in tekst for v in VERZEKERAAR_NAMEN):
         return 'Onzeker positief (verzekeraar)'
 
-    # Financiële instelling niet in eigen domein
+    # 2. Financiële instelling niet in eigen domein
     if any(kw in tekst for kw in FINANCIELE_INSTELLINGEN_KEYWORDS):
         return 'Onzeker positief (financiële instelling)'
 
-    # Bidirectioneel IBAN
+    # 3. Tikkie / betaalverzoek / iDEAL terugbetaling
+    tikkie_kw = ['TIKKIE', 'BETAALVERZOEK', 'BETAAL VERZOEK', 'IDEAL',
+                 'BUNQ.ME', 'PAYREQ', 'BETAALLINK']
+    if any(kw in tekst for kw in tikkie_kw):
+        return 'Terugbetaling/Tikkie'
+
+    # 4. Marktplaats / tweedehands verkoop
+    verkoop_kw = ['MARKTPLAATS', 'VINTED', 'WALLAPOP', 'TWEEDEHANDS',
+                  'VERKOOP', 'SOLD', '2DEHANDS', 'EBAY', 'BOL.COM VERKOOP']
+    if any(kw in tekst for kw in verkoop_kw):
+        return 'Verkoop (tweedehands)'
+
+    # 5. Cashback / spaarprogramma
+    cashback_kw = ['CASHBACK', 'LOYALTY', 'SPAARPUNTEN', 'REWARD',
+                   'RAKUTEN', 'SHOPBUDDIES', 'SCOUPY']
+    if any(kw in tekst for kw in cashback_kw):
+        return 'Cashback/Spaarprogramma'
+
+    # 6. Notaris / makelaar (grote eenmalige bedragen, woningtransactie)
+    notaris_kw = ['NOTARIS', 'MAKELAAR', 'MAKELAARDIJ', 'KADASTER',
+                  'HYPOTHEEK', 'WAARBORGSOM', 'BORG']
+    if any(kw in tekst for kw in notaris_kw):
+        return 'Notaris/Woningtransactie'
+
+    # 7. Rechtsvorm zonder salary/mgmt match → bedrijfsinkomen
+    rechtsvorm_kw = ['B.V.', ' BV ', ' BV,', 'B.V ', ' B.V', ' BV.',
+                     'N.V.', ' NV ', 'HOLDING', 'HLDG', 'STICHTING',
+                     'VERENIGING', 'MAATSCHAP', 'V.O.F.', ' VOF ']
+    if any(kw in tekst for kw in rechtsvorm_kw):
+        if bedrag >= 500:
+            return 'Onzeker positief (bedrijf/organisatie)'
+        else:
+            return 'Onzeker positief (bedrijf, klein bedrag)'
+
+    # 8. Bidirectioneel IBAN → je stuurt ook geld naar deze partij
     if iban and iban in bidi_ibans:
+        if party_type == 'unresolved_private_counterparty':
+            return 'Onderlinge betaling (privépersoon)'
         return 'Onzeker positief (bidirectioneel)'
+
+    # 9. Privépersoon (geen rechtsvorm, geen bedrijf)
+    if party_type == 'unresolved_private_counterparty':
+        if bedrag < 100:
+            return 'Onderlinge betaling (klein bedrag)'
+        elif bedrag < 500:
+            return 'Onderlinge betaling (privépersoon)'
+        else:
+            return 'Onzeker positief (privépersoon, groot bedrag)'
+
+    # 10. Klein bedrag zonder verdere aanwijzingen
+    if bedrag < 50:
+        return 'Overige bijschrijving (klein)'
+    elif bedrag < 200:
+        return 'Overige bijschrijving'
 
     return 'Onzeker positief'
 
@@ -3185,15 +3255,36 @@ def _classify_positive_inflows(df: pd.DataFrame, eigen_fi_ibans: set = None,
     alle_handled = fase1_handled | refund_handled | rent_handled | salary_handled
     final_rest = mask & (~df.index.isin(alle_handled))
 
+    # Mapping van subcategorie → (sectie, inflow_type, confidence)
+    _UNCERTAINTY_SECTIE = {
+        'Terugbetaling/Tikkie': ('onderling_neutraal', 'tikkie_refund', 0.75),
+        'Verkoop (tweedehands)': ('inkomsten', 'marketplace_sale', 0.70),
+        'Cashback/Spaarprogramma': ('variabele_kosten', 'cashback', 0.75),
+        'Notaris/Woningtransactie': ('inkomsten', 'property_transaction', 0.60),
+        'Onderlinge betaling (privépersoon)': ('onderling_neutraal', 'private_transfer', 0.50),
+        'Onderlinge betaling (klein bedrag)': ('onderling_neutraal', 'private_transfer', 0.60),
+        'Overige bijschrijving (klein)': ('onderling_neutraal', 'misc_small', 0.50),
+        'Overige bijschrijving': ('onderling_neutraal', 'misc_inflow', 0.40),
+    }
+    n_reclassified = 0  # teller voor specifiek herkende subcategorieën
+
     for idx in df[final_rest].index:
         row = df.loc[idx]
         bedrag = float(row.get('bedrag', 0))
         subcategorie = _uncertainty_gate(row, bidi_ibans)
 
-        _apply(idx, 'uncertain', 'inkomsten', subcategorie, 0.30)
+        # Specifiek herkende categorieën krijgen betere sectie + confidence
+        if subcategorie in _UNCERTAINTY_SECTIE:
+            sectie, inflow_t, conf = _UNCERTAINTY_SECTIE[subcategorie]
+            _apply(idx, inflow_t, sectie, subcategorie, conf)
+            n_reclassified += 1
+        else:
+            # Echt onzeker → standaard uncertainty bucket
+            _apply(idx, 'uncertain', 'inkomsten', subcategorie, 0.30)
+
         stats['uncertain'] += 1
         uncertain_bedrag += bedrag
-        herclassificaties.append((idx, 'Uncertainty Gate', 'uncertain', subcategorie, 'Geen classifier kon dit plaatsen'))
+        herclassificaties.append((idx, 'Uncertainty Gate', 'uncertain', subcategorie, 'Subcategorie via uncertainty gate'))
 
     # === LOGGING ===
     totaal = sum(stats.values())
@@ -3602,20 +3693,57 @@ def _bouw_ground_truth_prompt_sectie(ground_truth: dict) -> str:
                 lines.append(f"    - {cat}: EUR {bedrag:,.2f}")
         lines.append("")
 
-    # Income sources (bronopbouw)
+    # Income sources (bronopbouw + vertrouwen)
     income_sources = ground_truth.get('income_sources', {})
     if income_sources:
         lines.append("### INKOMSTENBRONOPBOUW (source_family)")
         for sf, data in sorted(income_sources.items(), key=lambda x: abs(x[1].get('bedrag_12m', 0)), reverse=True):
             bedrag = data.get('bedrag_12m', 0)
             n_tx = data.get('transacties', 0)
-            lines.append(f"  - {sf}: EUR {bedrag:,.2f} ({n_tx} transacties)")
+            vertr = data.get('vertrouwen', '?')
+            vertr_icon = '✓' if vertr == 'hoog' else ('~' if vertr == 'medium' else '?')
+            lines.append(f"  - {sf}: EUR {bedrag:,.2f} ({n_tx} tx) [{vertr_icon} {vertr}]")
+        lines.append("")
+
+    # Vertrouwensindicatoren per sectie
+    vertrouwen = ground_truth.get('vertrouwen_per_sectie', {})
+    if vertrouwen:
+        lines.append("### VERTROUWENSINDICATOREN PER SECTIE")
+        for sectie, v in vertrouwen.items():
+            gem = v.get('gem_confidence', 0)
+            label = v.get('vertrouwen', '?')
+            lines.append(f"  - {sectie}: confidence {gem:.0%} ({label}), "
+                        f"{v.get('pct_hoog', 0):.0f}% hoog, {v.get('pct_laag', 0):.0f}% laag")
         lines.append("")
 
     # Netto mutaties
     netto = saldo.get('totaal_eind', 0) - saldo.get('totaal_begin', 0)
     lines.append(f"Netto vermogensmutatie over periode: EUR {netto:,.2f}")
     lines.append("")
+
+    # Strategische inzichten (deterministisch berekend)
+    strat = ground_truth.get('strategische_inzichten', {})
+    kengetallen = strat.get('kengetallen', {})
+    if kengetallen:
+        lines.append("### STRATEGISCHE KENGETALLEN (berekend, niet geschat)")
+        lines.append(f"  Spaarquote: {kengetallen.get('spaarquote', 0):.1f}%")
+        lines.append(f"  Netto cashflow per maand: EUR {kengetallen.get('netto_cashflow_pm', 0):,.0f}")
+        lines.append(f"  Vaste lasten ratio: {kengetallen.get('vaste_lasten_ratio', 0):.1f}%")
+        lines.append(f"  Vermogensopbouw per maand: EUR {kengetallen.get('vermogensopbouw_pm', 0):,.0f}")
+        lines.append(f"  Inkomstenbronnen: {kengetallen.get('n_inkomstenbronnen', 0)}")
+        lines.append(f"  Concentratie grootste bron: {kengetallen.get('concentratie_pct', 0):.0f}%")
+        stab = kengetallen.get('inkomen_stabiliteit')
+        if stab is not None:
+            lines.append(f"  Inkomensstabiliteit: {stab:.0f}%")
+        lines.append("")
+
+    signalen = strat.get('signalen', [])
+    if signalen:
+        lines.append("### STRATEGISCHE SIGNALEN (gebruik deze in je analyse)")
+        for s in signalen:
+            icon = '✓' if s['type'] == 'positief' else ('!' if s['type'] == 'aandacht' else '⚠' if s['type'] == 'waarschuwing' else '·')
+            lines.append(f"  {icon} {s['titel']}: {s['beschrijving']}")
+        lines.append("")
 
     return "\n".join(lines)
 
@@ -3950,6 +4078,193 @@ Antwoord ALLEEN in valid JSON:
 }}"""
 
 
+def _genereer_strategische_inzichten(ground_truth: dict, df: pd.DataFrame) -> dict:
+    """Genereer deterministische strategische inzichten uit de data.
+
+    GEEN AI-gok. Puur berekeningen die een financieel adviseur zou maken.
+    Elke inzicht is traceerbaar naar concrete data.
+
+    Returns dict met:
+    - kengetallen: spaarquote, vaste lasten ratio, etc.
+    - signalen: lijst van strategische observaties
+    - cashflow_trend: maandelijkse trend data
+    """
+    sectie_totalen = ground_truth.get('sectie_totalen_12m', {})
+    n_mnd = ground_truth.get('periode', {}).get('n_mnd', 12)
+    income_sources = ground_truth.get('income_sources', {})
+    maand_sectie = ground_truth.get('maand_sectie_totalen', {})
+
+    inkomsten = abs(sectie_totalen.get('inkomsten', 0))
+    vaste_lasten = abs(sectie_totalen.get('vaste_lasten', 0))
+    variabele = abs(sectie_totalen.get('variabele_kosten', 0))
+    sparen = abs(sectie_totalen.get('sparen_beleggen', 0))
+    totaal_uit = vaste_lasten + variabele
+
+    # === KENGETALLEN ===
+    kengetallen = {}
+
+    # Spaarquote: (inkomsten - uitgaven) / inkomsten
+    if inkomsten > 0:
+        netto_cashflow = inkomsten - totaal_uit
+        spaarquote = netto_cashflow / inkomsten
+        kengetallen['spaarquote'] = round(spaarquote * 100, 1)
+        kengetallen['netto_cashflow_pm'] = round(netto_cashflow / max(n_mnd, 1), 0)
+    else:
+        kengetallen['spaarquote'] = 0
+        kengetallen['netto_cashflow_pm'] = 0
+
+    # Vaste lasten ratio
+    if inkomsten > 0:
+        kengetallen['vaste_lasten_ratio'] = round(vaste_lasten / inkomsten * 100, 1)
+    else:
+        kengetallen['vaste_lasten_ratio'] = 0
+
+    # Vermogensopbouw indicator
+    kengetallen['vermogensopbouw_12m'] = round(sparen, 0)
+    kengetallen['vermogensopbouw_pm'] = round(sparen / max(n_mnd, 1), 0)
+
+    # Inkomstendiversificatie: hoeveel bronnen, concentratie
+    bronnen = {k: abs(v.get('bedrag_12m', 0)) for k, v in income_sources.items()
+               if abs(v.get('bedrag_12m', 0)) > 100}
+    kengetallen['n_inkomstenbronnen'] = len(bronnen)
+    if bronnen and inkomsten > 0:
+        grootste_bron = max(bronnen.values())
+        kengetallen['concentratie_pct'] = round(grootste_bron / inkomsten * 100, 1)
+    else:
+        kengetallen['concentratie_pct'] = 100
+
+    # Inkomenstabiliteit: standaardafwijking van maandelijks inkomen
+    maand_inkomsten = []
+    for maand, secties in maand_sectie.items():
+        ink = abs(secties.get('inkomsten', 0))
+        if ink > 0:
+            maand_inkomsten.append(ink)
+    if len(maand_inkomsten) >= 3:
+        import statistics
+        gem = statistics.mean(maand_inkomsten)
+        std = statistics.stdev(maand_inkomsten)
+        kengetallen['inkomen_stabiliteit'] = round((1 - min(std / gem, 1)) * 100, 1) if gem > 0 else 0
+    else:
+        kengetallen['inkomen_stabiliteit'] = None
+
+    # === STRATEGISCHE SIGNALEN ===
+    signalen = []
+
+    # 1. Spaarquote beoordeling
+    sq = kengetallen.get('spaarquote', 0)
+    if sq >= 30:
+        signalen.append({
+            'type': 'positief',
+            'titel': 'Sterke spaarquote',
+            'beschrijving': f'Spaarquote van {sq:.0f}% — ruim boven de 20% richtlijn voor vermogensopbouw.',
+        })
+    elif sq >= 10:
+        signalen.append({
+            'type': 'neutraal',
+            'titel': 'Gezonde spaarquote',
+            'beschrijving': f'Spaarquote van {sq:.0f}% — voldoende voor basisopbouw, maar er is ruimte voor meer.',
+        })
+    elif sq >= 0:
+        signalen.append({
+            'type': 'aandacht',
+            'titel': 'Lage spaarquote',
+            'beschrijving': f'Spaarquote van {sq:.0f}% — bijna alle inkomsten worden uitgegeven.',
+        })
+    else:
+        signalen.append({
+            'type': 'waarschuwing',
+            'titel': 'Negatieve cashflow',
+            'beschrijving': f'Er wordt maandelijks meer uitgegeven dan er binnenkomt (spaarquote {sq:.0f}%).',
+        })
+
+    # 2. Vaste lasten ratio
+    vl_ratio = kengetallen.get('vaste_lasten_ratio', 0)
+    if vl_ratio > 50:
+        signalen.append({
+            'type': 'aandacht',
+            'titel': 'Hoge vaste lasten',
+            'beschrijving': f'{vl_ratio:.0f}% van het inkomen gaat naar vaste lasten — beperkt flexibiliteit.',
+        })
+
+    # 3. Inkomensconcentratie
+    conc = kengetallen.get('concentratie_pct', 100)
+    n_bronnen = kengetallen.get('n_inkomstenbronnen', 0)
+    if conc > 80 and n_bronnen <= 1:
+        signalen.append({
+            'type': 'aandacht',
+            'titel': 'Eén inkomstenbron',
+            'beschrijving': f'{conc:.0f}% van het inkomen komt uit één bron — hoog concentratierisico.',
+        })
+    elif n_bronnen >= 3:
+        signalen.append({
+            'type': 'positief',
+            'titel': 'Gediversifieerd inkomen',
+            'beschrijving': f'{n_bronnen} inkomstenbronnen — goed gespreid risico.',
+        })
+
+    # 4. Vermogensopbouw signaal
+    vo_pm = kengetallen.get('vermogensopbouw_pm', 0)
+    if vo_pm > 1000:
+        signalen.append({
+            'type': 'positief',
+            'titel': 'Actieve vermogensopbouw',
+            'beschrijving': f'Gemiddeld €{vo_pm:,.0f}/mnd naar beleggingen en spaarrekeningen.',
+        })
+
+    # 5. Inkomensstabiliteit
+    stab = kengetallen.get('inkomen_stabiliteit')
+    if stab is not None:
+        if stab >= 85:
+            signalen.append({
+                'type': 'positief',
+                'titel': 'Stabiel inkomen',
+                'beschrijving': f'Inkomensstabiliteit van {stab:.0f}% — zeer voorspelbaar maandpatroon.',
+            })
+        elif stab < 60:
+            signalen.append({
+                'type': 'aandacht',
+                'titel': 'Variabel inkomen',
+                'beschrijving': f'Inkomensstabiliteit van {stab:.0f}% — overweeg een buffer van 3-6 maanden vaste lasten.',
+            })
+
+    # 6. DGA-specifiek: management fee vs salaris verhouding
+    mgmt_bedrag = abs(income_sources.get('management_fee', {}).get('bedrag_12m', 0))
+    salary_bedrag = abs(income_sources.get('salary_employment', {}).get('bedrag_12m', 0))
+    freelance_bedrag = abs(income_sources.get('freelance_business', {}).get('bedrag_12m', 0))
+    if mgmt_bedrag > 0 and salary_bedrag > 0:
+        signalen.append({
+            'type': 'neutraal',
+            'titel': 'Gemengd inkomen (DGA + loondienst)',
+            'beschrijving': f'DGA-inkomen €{mgmt_bedrag:,.0f}/jr naast salaris €{salary_bedrag:,.0f}/jr — '
+                           f'controleer of de DGA-beloning fiscaal optimaal is ingericht.',
+        })
+    elif mgmt_bedrag > 0 and freelance_bedrag > 0:
+        signalen.append({
+            'type': 'neutraal',
+            'titel': 'BV-inkomen + freelance',
+            'beschrijving': f'DGA-inkomen €{mgmt_bedrag:,.0f}/jr + freelance €{freelance_bedrag:,.0f}/jr — '
+                           f'controleer of alle inkomsten via de BV lopen voor fiscale efficiëntie.',
+        })
+
+    # 7. Cashflow trend (stijgend/dalend)
+    cashflow_trend = []
+    for maand in sorted(maand_sectie.keys()):
+        secties = maand_sectie[maand]
+        ink = abs(secties.get('inkomsten', 0))
+        uit = abs(secties.get('vaste_lasten', 0)) + abs(secties.get('variabele_kosten', 0))
+        netto = ink - uit
+        cashflow_trend.append({'maand': maand, 'inkomsten': round(ink, 0),
+                               'uitgaven': round(uit, 0), 'netto': round(netto, 0)})
+
+    logger.info(f"STRATEGISCHE INZICHTEN: {len(kengetallen)} kengetallen, {len(signalen)} signalen")
+
+    return {
+        'kengetallen': kengetallen,
+        'signalen': signalen,
+        'cashflow_trend': cashflow_trend,
+    }
+
+
 def _log_classificatie_kwaliteit(df: pd.DataFrame) -> dict:
     """Log een samenvatting van classificatie-kwaliteit.
 
@@ -3994,6 +4309,83 @@ def _log_classificatie_kwaliteit(df: pd.DataFrame) -> dict:
             'laag': n_low,
         }
     }
+
+
+def _verzamel_review_items(df: pd.DataFrame) -> list:
+    """Verzamel items die menselijke review nodig hebben.
+
+    Draait NA alle classificatie. Scant het DataFrame op:
+    1. Grote onzekere bedragen (>€1000 in uncertain bucket)
+    2. Lage confidence classificaties (<0.50 op bedragen >€200)
+    3. Inkomen op zakelijke rekening zonder keyword-match
+    4. Grote eenmalige transacties (>€5000, <3 keer)
+
+    Returns: lijst van review item dicts.
+    """
+    items = []
+
+    df_niet_intern = df[~df.get('is_intern', False)].copy()
+
+    # 1. Grote onzekere bedragen
+    if 'regel_categorie' in df.columns:
+        uncertain_mask = df_niet_intern['regel_categorie'].str.startswith('Onzeker positief', na=False)
+        df_uncertain = df_niet_intern[uncertain_mask & (df_niet_intern['bedrag'] > 1000)]
+        for _, row in df_uncertain.iterrows():
+            naam = str(row.get('tegenpartij_naam', row.get('Omschrijving', '')))[:40]
+            items.append({
+                'type': 'groot_onzeker_bedrag',
+                'ernst': 'hoog',
+                'beschrijving': f"€{float(row['bedrag']):,.0f} van {naam} — niet geclassificeerd als bewezen inkomen",
+                'categorie': str(row.get('regel_categorie', 'Onzeker')),
+                'bedrag': float(row['bedrag']),
+            })
+
+    # 2. Lage confidence op significante bedragen
+    if 'regel_confidence' in df.columns:
+        low_conf = df_niet_intern[
+            (df_niet_intern['regel_confidence'] < 0.50) &
+            (df_niet_intern['bedrag'].abs() > 200) &
+            (df_niet_intern['regel_confidence'].notna())
+        ]
+        for _, row in low_conf.head(10).iterrows():
+            naam = str(row.get('tegenpartij_naam', row.get('Omschrijving', '')))[:40]
+            items.append({
+                'type': 'lage_confidence',
+                'ernst': 'medium',
+                'beschrijving': f"€{abs(float(row['bedrag'])):,.0f} — {naam} — confidence {float(row['regel_confidence']):.0%}",
+                'categorie': str(row.get('regel_categorie', '?')),
+                'bedrag': abs(float(row['bedrag'])),
+            })
+
+    # 3. Grote eenmalige transacties (>€5000, komt <3x voor van zelfde bron)
+    if 'Tegenrekening' in df.columns:
+        grote = df_niet_intern[df_niet_intern['bedrag'] > 5000].copy()
+        if len(grote) > 0:
+            for iban in grote['Tegenrekening'].unique():
+                if pd.isna(iban):
+                    continue
+                n = len(df_niet_intern[df_niet_intern['Tegenrekening'] == iban])
+                if n < 3:
+                    sub = grote[grote['Tegenrekening'] == iban]
+                    naam = str(sub.iloc[0].get('tegenpartij_naam', sub.iloc[0].get('Omschrijving', '')))[:40]
+                    totaal = float(sub['bedrag'].sum())
+                    items.append({
+                        'type': 'groot_eenmalig',
+                        'ernst': 'medium',
+                        'beschrijving': f"€{totaal:,.0f} van {naam} — slechts {n}x, controleer herkomst",
+                        'categorie': str(sub.iloc[0].get('regel_categorie', '?')),
+                        'bedrag': totaal,
+                    })
+
+    # Sorteer op ernst (hoog eerst) dan bedrag (groot eerst)
+    ernst_order = {'hoog': 0, 'medium': 1, 'laag': 2}
+    items.sort(key=lambda x: (ernst_order.get(x['ernst'], 9), -x.get('bedrag', 0)))
+
+    logger.info(f"REVIEW ITEMS: {len(items)} items gevonden "
+                f"({sum(1 for i in items if i['ernst'] == 'hoog')} hoog, "
+                f"{sum(1 for i in items if i['ernst'] == 'medium')} medium)")
+
+    return items[:20]  # Max 20 items
 
 
 def _rapport_kwaliteitscheck(data: dict, df: pd.DataFrame, eigen_rekeningen: set):
@@ -5681,17 +6073,47 @@ def _bouw_ground_truth(merged_data: dict, feiten: dict, rapportperiode: dict,
     totaal_begin = sum(f['saldo']['beginsaldo'] for f in feiten.values())
     totaal_eind = sum(f['saldo']['eindsaldo'] for f in feiten.values())
 
-    # Income source breakdown (V3: expliciete bronopbouw)
+    # Income source breakdown (V3: expliciete bronopbouw + confidence)
     income_sources = {}
     if 'source_family' in df.columns:
         df_income = df[(df['regel_sectie'] == 'inkomsten') & (~df.get('is_intern', False))]
         for sf, groep in df_income.groupby('source_family'):
             if pd.notna(sf):
+                conf_vals = groep['regel_confidence'].dropna()
+                gem_conf = float(conf_vals.mean()) if len(conf_vals) > 0 else 0.0
+                # Vertrouwenslabel: groen ≥0.80, geel ≥0.50, rood <0.50
+                if gem_conf >= 0.80:
+                    vertrouwen = 'hoog'
+                elif gem_conf >= 0.50:
+                    vertrouwen = 'medium'
+                else:
+                    vertrouwen = 'laag'
                 income_sources[str(sf)] = {
                     'bedrag_12m': round(float(groep['bedrag'].sum()), 2),
                     'transacties': len(groep),
                     'categorieën': list(groep['regel_categorie'].dropna().unique()),
+                    'gem_confidence': round(gem_conf, 2),
+                    'vertrouwen': vertrouwen,
                 }
+
+    # Vertrouwensindicatoren per sectie
+    vertrouwen_per_sectie = {}
+    if 'regel_confidence' in df.columns:
+        df_niet_intern = df[~df.get('is_intern', False)]
+        for sectie in ['inkomsten', 'vaste_lasten', 'variabele_kosten', 'sparen_beleggen', 'onderling_neutraal']:
+            df_s = df_niet_intern[df_niet_intern['regel_sectie'] == sectie]
+            if len(df_s) == 0:
+                continue
+            conf_vals = df_s['regel_confidence'].dropna()
+            gem = float(conf_vals.mean()) if len(conf_vals) > 0 else 0.0
+            n_hoog = len(conf_vals[conf_vals >= 0.80])
+            n_laag = len(conf_vals[conf_vals < 0.50])
+            vertrouwen_per_sectie[sectie] = {
+                'gem_confidence': round(gem, 2),
+                'pct_hoog': round(n_hoog / len(df_s) * 100, 1) if len(df_s) > 0 else 0,
+                'pct_laag': round(n_laag / len(df_s) * 100, 1) if len(df_s) > 0 else 0,
+                'vertrouwen': 'hoog' if gem >= 0.80 else ('medium' if gem >= 0.50 else 'laag'),
+            }
 
     ground_truth = {
         'versie': 'V3',
@@ -5714,6 +6136,7 @@ def _bouw_ground_truth(merged_data: dict, feiten: dict, rapportperiode: dict,
         'maandoverzicht': combined_maand,
         'maand_sectie_totalen': maand_sectie_totalen,
         'income_sources': income_sources,
+        'vertrouwen_per_sectie': vertrouwen_per_sectie,
         'reconciliatie': reconciliatie,
     }
 
@@ -6161,7 +6584,8 @@ def _no_send_gate(ground_truth: dict, reconciliatie: dict, analyse: dict,
 
 
 def _bouw_audit_package(ground_truth: dict, gate_result: dict, kwaliteit: dict,
-                        reconciliatie: dict, rapport_data: dict) -> dict:
+                        reconciliatie: dict, rapport_data: dict,
+                        review_items: list = None) -> dict:
     """V3: Bouw audit package JSON voor ChatGPT review.
 
     Dit is het complete dossier dat ChatGPT CEO kan reviewen voordat
@@ -6185,7 +6609,7 @@ def _bouw_audit_package(ground_truth: dict, gate_result: dict, kwaliteit: dict,
         },
         'classificatie_kwaliteit': kwaliteit,
         'analyse_samenvatting': rapport_data.get('analyse', {}).get('samenvatting', ''),
-        'review_items': gate_result.get('redenen', []),
+        'review_items': review_items or gate_result.get('redenen', []),
     }
 
 
@@ -6292,6 +6716,11 @@ def _run_rapport_pipeline(job_id: str, bestanden: list, email: str):
         kwaliteit = _log_classificatie_kwaliteit(df)
         update(f'{kwaliteit["pct_rule_based"]:.0f}% rule-based geclassificeerd', 27)
 
+        # 1g. Review items verzamelen
+        review_items = _verzamel_review_items(df)
+        if review_items:
+            update(f'{len(review_items)} review items gevonden', 27)
+
         # 2. Deterministisch rekenen
         update('Bedragen berekenen en controleren...', 27)
         feiten = bereken_feiten(df)
@@ -6360,6 +6789,12 @@ def _run_rapport_pipeline(job_id: str, bestanden: list, email: str):
         )
         logger.info(f"[{job_id}] Ground truth V3 gebouwd: {len(ground_truth['periode']['volle_maanden'])} volle maanden")
 
+        # 4a2. Strategische inzichten genereren
+        update('Strategische inzichten berekenen...', 73)
+        strategische_inzichten = _genereer_strategische_inzichten(ground_truth, df)
+        ground_truth['strategische_inzichten'] = strategische_inzichten
+        logger.info(f"[{job_id}] Strategische inzichten: {len(strategische_inzichten.get('signalen', []))} signalen")
+
         # 4b. V3: Reconciliatie Excel genereren
         update('Reconciliatie Excel genereren...', 74)
         try:
@@ -6399,6 +6834,7 @@ def _run_rapport_pipeline(job_id: str, bestanden: list, email: str):
             kwaliteit=kwaliteit,
             reconciliatie=reconciliatie,
             rapport_data=rapport_data,
+            review_items=review_items,
         )
         logger.info(f"[{job_id}] Audit package gebouwd: {gate_result['besluit']} ({gate_result['kleur']})")
 

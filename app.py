@@ -5031,7 +5031,7 @@ MAAND_NAMEN = {
 def eur(n: float) -> str:
     """Format getal als Euro bedrag."""
     if abs(n) < 0.01:
-        return ''
+        return '\u20ac 0'
     return f"\u20ac {n:,.0f}".replace(',', '.')
 
 
@@ -5099,489 +5099,221 @@ class RapportPDF(FPDF):
 
     def cover_page(self, feiten: dict, rapport_datum: str, jaartotalen: dict = None, maandoverzicht: dict = None,
                    ground_truth: dict = None, gate: dict = None):
-        """Pagina 1: Executive summary — economische lens voor vermogende particulieren.
+        """Pagina 1: Inleiding + 7 belangrijkste bevindingen.
 
-        V3: Gebruikt ground_truth voor n_maanden en periode-info als beschikbaar.
-        Layout A: kerninkomen full-width, 2x2 grid, buiten kernbeeld onderaan.
+        Simpele, leesbare pagina met uitleg over de data en de key findings.
         """
         # Donkere header
         self.set_fill_color(*INK)
-        self.rect(0, 0, 210, 80, 'F')
+        self.rect(0, 0, 210, 55, 'F')
 
         # Gouden lijn
         self.set_draw_color(*GOLD)
         self.set_line_width(0.8)
-        self.line(15, 72, 55, 72)
+        self.line(15, 48, 55, 48)
 
         # Titel
-        self.set_font(self.HEADING, '', 28)
+        self.set_font(self.HEADING, '', 26)
         self.set_text_color(*WHITE)
-        self.set_xy(15, 22)
+        self.set_xy(15, 15)
         self.cell(0, 12, 'Financieel Overzicht', 0, 1, 'L')
 
         # Subtitel
-        self.set_font(self.BODY, '', 12)
+        self.set_font(self.BODY, '', 11)
         self.set_text_color(200, 200, 210)
-        self.set_xy(15, 38)
-        self.cell(0, 7, 'Uw financiele structuur in een oogopslag', 0, 1, 'L')
-
-        # Datum + scope
-        self.set_font(self.DATA, '', 9)
-        self.set_text_color(150, 150, 170)
-        self.set_xy(15, 52)
+        self.set_xy(15, 30)
         self.cell(0, 6, f'Gegenereerd op {rapport_datum}', 0, 1, 'L')
-        self.set_xy(15, 58)
-        if ground_truth and ground_truth.get('periode', {}).get('volle_maanden'):
-            vm = ground_truth['periode']['volle_maanden']
-            van = min(vm) if vm else ''
-            tot = max(vm) if vm else ''
-            n_mnd = ground_truth['periode'].get('n_mnd', len(vm))
-            self.cell(0, 6, f'{len(feiten)} rekening(en)  |  {van} t/m {tot}  |  {n_mnd} volle maanden', 0, 1, 'L')
-        else:
-            periodes = []
-            for f in feiten.values():
-                periodes.extend([f['periode']['van'], f['periode']['tot']])
-            van = min(periodes) if periodes else ''
-            tot = max(periodes) if periodes else ''
-            self.cell(0, 6, f'{len(feiten)} rekening(en) geanalyseerd  |  {van} t/m {tot}', 0, 1, 'L')
 
-        # =====================================================================
-        # EXECUTIVE BUCKETS v3 — 100% uit ground_truth
-        # Geen enkele bucket leest nog uit jaartotalen of maandoverzicht.
-        # =====================================================================
-        n_maanden = 1
-        if ground_truth and ground_truth.get('periode', {}).get('n_mnd'):
-            n_maanden = max(ground_truth['periode']['n_mnd'], 1)
-        elif maandoverzicht:
-            all_months = set()
-            for rek_m in maandoverzicht.values():
-                all_months.update(rek_m.keys())
-            n_maanden = max(len(all_months), 1)
+        # ===================================================================
+        # INLEIDING: rekeningen, periode, totalen
+        # ===================================================================
+        y = 62
+
+        # Verzamel data
+        n_rek = len(feiten)
+        vm = ground_truth.get('periode', {}).get('volle_maanden', []) if ground_truth else []
+        n_mnd = ground_truth.get('periode', {}).get('n_mnd', len(vm)) if ground_truth else 12
+        van_mnd = min(vm) if vm else ''
+        tot_mnd = max(vm) if vm else ''
+
+        # Maandnamen voor leesbare periode
+        _MND_NAMEN = {
+            '01': 'januari', '02': 'februari', '03': 'maart', '04': 'april',
+            '05': 'mei', '06': 'juni', '07': 'juli', '08': 'augustus',
+            '09': 'september', '10': 'oktober', '11': 'november', '12': 'december',
+        }
+        def _leesbare_maand(m):
+            try:
+                parts = m.split('-')
+                return f"{_MND_NAMEN.get(parts[1], parts[1])} {parts[0]}"
+            except Exception:
+                return m
+
+        # Rekening-beschrijvingen
+        rek_naar_persoon = ground_truth.get('_rek_naar_persoon', {}) if ground_truth else {}
+        rek_beschrijvingen = []
+        for rek in sorted(feiten.keys()):
+            houder = rek_naar_persoon.get(rek, '')
+            # Laatste 4 cijfers van IBAN
+            iban_kort = rek[-4:] if len(rek) >= 4 else rek
+            if houder:
+                rek_beschrijvingen.append(f"rekening ...{iban_kort} ({houder})")
+            else:
+                rek_beschrijvingen.append(f"rekening ...{iban_kort}")
+
+        # Totaal inkomsten en uitgaven
+        cat_totalen = ground_truth.get('categorie_totalen_12m', {}) if ground_truth else {}
+        totaal_in = sum(
+            sum(max(float(v), 0) for v in cats.values())
+            for cats in cat_totalen.values()
+        )
+        totaal_uit = sum(
+            sum(min(float(v), 0) for v in cats.values())
+            for cats in cat_totalen.values()
+        )
+        saldo_data = ground_truth.get('saldo', {}) if ground_truth else {}
+        begin_saldo = saldo_data.get('totaal_begin', 0)
+        eind_saldo = saldo_data.get('totaal_eind', 0)
+
+        # Schrijf inleiding als lopende tekst
+        self.set_font(self.BODY, '', 9.5)
+        self.set_text_color(*INK)
+        self.set_xy(15, y)
+
+        rek_tekst = ', '.join(rek_beschrijvingen[:-1]) + f" en {rek_beschrijvingen[-1]}" if len(rek_beschrijvingen) > 1 else rek_beschrijvingen[0] if rek_beschrijvingen else ''
+
+        inleiding = (
+            f"Het systeem heeft {n_rek} rekeningen herkend: {rek_tekst}. "
+            f"Het rapport kijkt naar een periode van {n_mnd} volle maanden, "
+            f"van {_leesbare_maand(van_mnd)} tot en met {_leesbare_maand(tot_mnd)}."
+        )
+        self.multi_cell(180, 5, inleiding, 0, 'L')
+        y = self.get_y() + 2
+
+        self.set_xy(15, y)
+        samenvatting = (
+            f"In deze periode is in totaal {eur(totaal_in)} binnengekomen en {eur(abs(totaal_uit))} uitgegeven. "
+            f"Het gecombineerde saldo veranderde van {eur(begin_saldo)} naar {eur(eind_saldo)} "
+            f"({'+' if eind_saldo >= begin_saldo else ''}{eur(eind_saldo - begin_saldo)})."
+        )
+        self.multi_cell(180, 5, samenvatting, 0, 'L')
+
+        # ===================================================================
+        # 7 BELANGRIJKSTE BEVINDINGEN
+        # ===================================================================
+        n_maanden = max(n_mnd, 1)
 
         # --- Bucket definities ---
-        _KERNINKOMEN = {
-            'Netto salaris', 'DGA-loon/Managementfee', 'Huurinkomsten',
-            'UWV/Uitkeringen', 'Pensioen/AOW',
-        }
-        _FREELANCE_CAT = 'Freelance/Opdrachten'
-        _AANVULLEND = {
-            'Kinderbijslag/Kindregelingen', 'Toeslagen',
-            'Studiefinanciering', 'Overheid overig',
-        }
-        _BELASTING_CATS = {
-            'Inkomstenbelasting/Voorlopige aanslag',
-            'BTW/Omzetbelasting',
-            'Overige belastingen',
-            'Gemeentebelasting/OZB/Waterschapsbelasting',
-        }
-        _WOONLASTEN_CATS = {
-            'Hypotheek/Huur', 'Energie', 'Water',
-        }
-        _NIET_KERN = {
-            'Belastingteruggave', 'Verzekeringsuitkering', 'Beleggingsinkomen',
-        }
+        # Bereken 7 bevindingen uit ground_truth
+        bevindingen = []
 
-        # --- Freelance recurring check (uit ground_truth maandoverzicht) ---
-        freelance_is_recurring = False
-        gt_maandoverzicht = ground_truth.get('maandoverzicht', {}) if ground_truth else {}
-        if gt_maandoverzicht:
-            freelance_months = set()
-            for maand, secties in gt_maandoverzicht.items():
-                if isinstance(secties, dict):
-                    inkomsten = secties.get('inkomsten', {})
-                    if isinstance(inkomsten, dict) and _FREELANCE_CAT in inkomsten:
-                        freelance_months.add(maand)
-            freelance_is_recurring = len(freelance_months) >= 3
-
-        # --- Bereken bucket-totalen (100% uit ground_truth) ---
-        totaal_kern = 0
-        totaal_aanvullend = 0
-        totaal_belasting = 0
-        totaal_woonlasten = 0
-        totaal_leef_vast = 0
-        totaal_leef_disc = 0
-        totaal_vermogen_netto = 0
-        totaal_niet_kern = 0
-        totaal_review = 0
-        totaal_overige_verz = 0
-        totaal_neutraal = 0
-
-        # V3: ground_truth['categorie_totalen_12m'] is al gecombineerd over alle rekeningen
-        cat_totalen = ground_truth.get('categorie_totalen_12m', {}) if ground_truth else {}
-
-        if cat_totalen:
-            # Inkomsten → kerninkomen, aanvullend, niet-kern, of review
-            for cat, bedrag in cat_totalen.get('inkomsten', {}).items():
-                b = abs(bedrag or 0)
-                if cat in _KERNINKOMEN:
-                    totaal_kern += b
-                elif cat == _FREELANCE_CAT:
-                    if freelance_is_recurring:
-                        totaal_kern += b
-                    else:
-                        totaal_aanvullend += b
-                elif cat in _AANVULLEND:
-                    totaal_aanvullend += b
-                elif cat in _NIET_KERN:
-                    totaal_niet_kern += b
-                else:
-                    totaal_review += b
-
-            # Vaste lasten → belasting, woonlasten, of vaste leefkosten
-            for cat, bedrag in cat_totalen.get('vaste_lasten', {}).items():
-                b = abs(bedrag or 0)
-                if cat in _BELASTING_CATS:
-                    totaal_belasting += b
-                elif cat in _WOONLASTEN_CATS:
-                    totaal_woonlasten += b
-                else:
-                    totaal_leef_vast += b
-                    if cat == 'Overige verzekeringen':
-                        totaal_overige_verz += b
-
-            # Variabele kosten → discretionaire leefkosten
-            for cat, bedrag in cat_totalen.get('variabele_kosten', {}).items():
-                totaal_leef_disc += abs(bedrag or 0)
-
-            # Sparen/beleggen → NETTO vermogensallocatie (algebraisch)
-            for cat, bedrag in cat_totalen.get('sparen_beleggen', {}).items():
-                totaal_vermogen_netto += (bedrag or 0)
-
-            # Onderling/neutraal → apart (huishoudtransfers, card settlements)
-            for cat, bedrag in cat_totalen.get('onderling_neutraal', {}).items():
-                totaal_neutraal += abs(bedrag or 0)
-
-        # Fallback: als geen ground_truth, gebruik jaartotalen (backward compatible)
-        elif jaartotalen:
-            for rek, totalen in jaartotalen.items():
-                for cat, bedrag in totalen.get('inkomsten', {}).items():
-                    b = abs(bedrag or 0)
-                    if cat in _KERNINKOMEN:
-                        totaal_kern += b
-                    elif cat == _FREELANCE_CAT:
-                        totaal_aanvullend += b
-                    elif cat in _AANVULLEND:
-                        totaal_aanvullend += b
-                    elif cat in _NIET_KERN:
-                        totaal_niet_kern += b
-                    else:
-                        totaal_review += b
-                for cat, bedrag in totalen.get('vaste_lasten', {}).items():
-                    b = abs(bedrag or 0)
-                    if cat in _BELASTING_CATS:
-                        totaal_belasting += b
-                    elif cat in _WOONLASTEN_CATS:
-                        totaal_woonlasten += b
-                    else:
-                        totaal_leef_vast += b
-                for cat, bedrag in totalen.get('variabele_kosten', {}).items():
-                    totaal_leef_disc += abs(bedrag or 0)
-                for cat, bedrag in totalen.get('sparen_beleggen', {}).items():
-                    totaal_vermogen_netto += (bedrag or 0)
-
-        # Per maand
-        pm_kern = totaal_kern / n_maanden
-        pm_aanvullend = totaal_aanvullend / n_maanden
-        pm_belasting = totaal_belasting / n_maanden
-        pm_woonlasten = totaal_woonlasten / n_maanden
-        pm_leef_vast = totaal_leef_vast / n_maanden
-        pm_leef_disc = totaal_leef_disc / n_maanden
-        pm_leef_totaal = pm_leef_vast + pm_leef_disc
-        pm_vermogen_netto = abs(totaal_vermogen_netto) / n_maanden
-        vermogen_richting = 'naar' if totaal_vermogen_netto <= 0 else 'uit'
-        pm_niet_kern = totaal_niet_kern / n_maanden
-        pm_review = totaal_review / n_maanden
-        pm_buiten_kern = pm_niet_kern + pm_review
-        pm_neutraal = totaal_neutraal / n_maanden
-
-        # V3: Income sources uit ground_truth
+        # 1. Inkomensbronnen
         income_sources = ground_truth.get('income_sources', {}) if ground_truth else {}
-        # V3: Vertrouwen per sectie uit ground_truth
-        vertrouwen = ground_truth.get('vertrouwen_per_sectie', {}) if ground_truth else {}
-        # V3: Saldo uit ground_truth
-        gt_saldo = ground_truth.get('saldo', {}) if ground_truth else {}
-
-        # =====================================================================
-        # LAYOUT A: kerninkomen breed → 2x2 grid → buiten kernbeeld
-        # =====================================================================
-        start_y = 88
-
-        # --- BLOK 1: Kerninkomen (full width) ---
-        kern_w = 180
-        kern_h = 32
-        x0 = 15
-        self.set_fill_color(*SURFACE)
-        self.set_draw_color(*BORDER)
-        self.rect(x0, start_y, kern_w, kern_h, 'FD')
-
-        # Label
-        self.set_font(self.DATA, '', 8)
-        self.set_text_color(*INK_SOFT)
-        self.set_xy(x0 + 10, start_y + 4)
-        self.cell(80, 4, 'Kerninkomen', 0, 0, 'L')
-
-        # Bedrag (groot)
-        self.set_font(self.DATA, 'B', 16)
-        self.set_text_color(*ACCENT)
-        self.set_xy(x0 + 10, start_y + 12)
-        self.cell(80, 8, eur(pm_kern) + '/mnd', 0, 0, 'L')
-
-        # Aanvullende instroom (rechts, kleiner)
-        if pm_aanvullend > 0:
-            self.set_font(self.DATA, '', 7.5)
-            self.set_text_color(*INK_SOFT)
-            self.set_xy(x0 + 100, start_y + 6)
-            self.cell(70, 4, '+ aanvullende instroom', 0, 0, 'L')
-            self.set_font(self.DATA, '', 9)
-            self.set_text_color(161, 137, 75)  # licht goud
-            self.set_xy(x0 + 100, start_y + 13)
-            self.cell(70, 5, eur(pm_aanvullend) + '/mnd', 0, 0, 'L')
-            # Detail
-            self.set_font(self.DATA, '', 6.5)
-            self.set_text_color(*INK_SOFT)
-            self.set_xy(x0 + 100, start_y + 21)
-            self.cell(70, 3, '(kinderbijslag, toeslagen, overheid)', 0, 0, 'L')
-
-        # V3: Income sources detail (onder kerninkomen blok)
-        # Compact overzicht: max 3 bronnen met vertrouwen-indicator
         if income_sources:
-            src_y = start_y + kern_h - 6
-            src_x = x0 + 10
-            _SRC_LABELS = {
-                'salary_employment': 'Salaris',
-                'dga_management_fee': 'DGA-loon',
-                'rent_income': 'Huurinkomsten',
-                'uwv_benefits': 'UWV/Uitkering',
-                'pension_aow': 'Pensioen',
-                'freelance_business': 'Freelance',
-                'tax_refund': 'Teruggave',
-                'government_benefits': 'Overheid',
-                'investment_income': 'Beleggingen',
+            top_bronnen = sorted(income_sources.items(), key=lambda x: -abs(x[1].get('bedrag_12m', 0)))[:3]
+            _SRC_NL = {
+                'salary_employment': 'salaris', 'freelance_business': 'freelance-inkomen',
+                'rent_income': 'huurinkomsten', 'uwv_benefits': 'UWV-uitkeringen',
+                'pension_aow': 'pensioen', 'dga_management_fee': 'DGA-loon',
+                'tax_refund': 'belastingteruggave', 'government_benefits': 'overheidstoeslagen',
+                'investment_income': 'beleggingsinkomsten',
             }
-            _VERTROUWEN_DOT = {
-                'hoog': (0, 128, 0),     # groen
-                'medium': (200, 160, 0),  # geel
-                'laag': (200, 0, 0),      # rood
-            }
-            shown = 0
-            for sf, data in sorted(income_sources.items(), key=lambda x: -abs(x[1].get('bedrag_12m', 0))):
-                if shown >= 3:
-                    break
-                bedrag_pm = abs(data.get('bedrag_12m', 0)) / n_maanden
-                if bedrag_pm < 10:
-                    continue
-                base_label = _SRC_LABELS.get(sf, sf.replace('_', ' ').title())
-                # Toon de ONTVANGER (van wie is het inkomen), niet de betaler
-                ontvanger = data.get('ontvanger', '')
-                tp = data.get('tegenpartij', '')
-                if ontvanger:
-                    persoon_short = ontvanger[:18].strip()
-                    label = f"{base_label} ({persoon_short})"
-                elif tp:
-                    tp_short = tp[:18].strip()
-                    label = f"{base_label} ({tp_short})"
+            bron_delen = []
+            for sf, data in top_bronnen:
+                label = _SRC_NL.get(sf, sf.replace('_', ' '))
+                ontv = data.get('ontvanger', '')
+                pm = abs(data.get('bedrag_12m', 0)) / n_maanden
+                if ontv:
+                    bron_delen.append(f"{label} ({ontv}): {eur(pm)}/mnd")
                 else:
-                    label = base_label
-                vtw = data.get('vertrouwen', 'medium')
-                dot_color = _VERTROUWEN_DOT.get(vtw, (128, 128, 128))
-                # Vertrouwen-stip
-                self.set_fill_color(*dot_color)
-                self.ellipse(src_x, src_y + 1, 2, 2, 'F')
-                # Label + bedrag
-                self.set_font(self.DATA, '', 5.5)
-                self.set_text_color(*INK_SOFT)
-                self.set_xy(src_x + 3, src_y)
-                self.cell(32, 3, label[:35], 0, 0, 'L')
-                self.set_xy(src_x + 35, src_y)
-                self.cell(16, 3, eur(bedrag_pm), 0, 0, 'R')
-                src_x += 55
-                shown += 1
+                    bron_delen.append(f"{label}: {eur(pm)}/mnd")
+            bevindingen.append(f"De belangrijkste inkomensbronnen zijn: {', '.join(bron_delen)}.")
 
-        # --- 2x2 GRID: belasting, woon, leefkosten, vermogen ---
-        grid_y = start_y + kern_h + 6
-        box_w = 85
-        box_h = 35
-        gap = 10
+        # 2. Grootste vaste last
+        vl = cat_totalen.get('vaste_lasten', {})
+        if vl:
+            top_vl = max(vl.items(), key=lambda x: abs(float(x[1])))
+            bevindingen.append(
+                f"De grootste vaste last is {top_vl[0]} met {eur(abs(float(top_vl[1])) / n_maanden)}/mnd "
+                f"({eur(abs(float(top_vl[1])))} per jaar)."
+            )
 
-        # Helper: vertrouwen-stip in bucket header
-        def _confidence_dot(bx_pos, by_pos, sectie_key):
-            vtw = vertrouwen.get(sectie_key, {}).get('vertrouwen', '')
-            if vtw:
-                dot_rgb = {'hoog': (0, 128, 0), 'medium': (200, 160, 0), 'laag': (200, 0, 0)}.get(vtw, (128, 128, 128))
-                self.set_fill_color(*dot_rgb)
-                self.ellipse(bx_pos + box_w - 14, by_pos + 6, 3, 3, 'F')
+        # 3. Woonquote
+        totaal_ink = sum(max(float(v), 0) for cats in cat_totalen.values() for v in cats.values())
+        pm_ink = totaal_ink / n_maanden if n_maanden > 0 else 1
+        woonlasten_cats = {'Hypotheek/Huur', 'Huur/Hypotheek', 'VvE',
+                           'Gemeentebelasting/OZB/Waterschapsbelasting',
+                           'Gemeentelijke heffingen', 'Water', 'Energie'}
+        pm_woon = sum(abs(float(vl.get(c, 0))) for c in woonlasten_cats) / n_maanden
+        woonquote = round(pm_woon / pm_ink * 100, 1) if pm_ink > 0 else 0
+        bevindingen.append(f"De woonquote bedraagt {woonquote}% van het bruto-inkomen ({eur(pm_woon)}/mnd aan woonlasten).")
 
-        # Blok 2: Belastingdruk (links boven)
-        bx, by = x0, grid_y
-        self.set_fill_color(*SURFACE)
-        self.set_draw_color(*BORDER)
-        self.rect(bx, by, box_w, box_h, 'FD')
-        self.set_font(self.DATA, '', 7.5)
-        self.set_text_color(*INK_SOFT)
-        self.set_xy(bx + 8, by + 5)
-        self.cell(box_w - 16, 4, 'Belastingdruk', 0, 0, 'L')
-        self.set_font(self.DATA, 'B', 13)
-        self.set_text_color(139, 69, 19)  # bruin
-        self.set_xy(bx + 8, by + 14)
-        self.cell(box_w - 16, 7, eur(pm_belasting) + '/mnd', 0, 0, 'L')
-        # Belasting-percentage t.o.v. kerninkomen
-        if pm_kern > 0 and pm_belasting > 0:
-            pct_bel = pm_belasting / pm_kern * 100
-            self.set_font(self.DATA, '', 6.5)
-            self.set_text_color(*INK_SOFT)
-            self.set_xy(bx + 8, by + 25)
-            self.cell(box_w - 16, 3, f'{pct_bel:.0f}% van kerninkomen', 0, 0, 'L')
+        # 4. Spaarquote
+        sp = cat_totalen.get('sparen_beleggen', {})
+        pm_sparen = abs(sum(float(v) for v in sp.values())) / n_maanden if sp else 0
+        spaarquote = round(pm_sparen / pm_ink * 100, 1) if pm_ink > 0 else 0
+        bevindingen.append(f"Er gaat {eur(pm_sparen)}/mnd naar sparen en beleggen ({spaarquote}% van het inkomen).")
 
-        # Blok 3: Woonlasten (rechts boven)
-        bx2 = x0 + box_w + gap
-        self.set_fill_color(*SURFACE)
-        self.set_draw_color(*BORDER)
-        self.rect(bx2, by, box_w, box_h, 'FD')
-        self.set_font(self.DATA, '', 7.5)
-        self.set_text_color(*INK_SOFT)
-        self.set_xy(bx2 + 8, by + 5)
-        self.cell(box_w - 16, 4, 'Woonlasten', 0, 0, 'L')
-        _confidence_dot(bx2, by, 'vaste_lasten')
-        self.set_font(self.DATA, 'B', 13)
-        self.set_text_color(74, 85, 104)  # slate
-        self.set_xy(bx2 + 8, by + 14)
-        self.cell(box_w - 16, 7, eur(pm_woonlasten) + '/mnd', 0, 0, 'L')
-        # Woonquote
-        if pm_kern > 0 and pm_woonlasten > 0:
-            woonquote = pm_woonlasten / pm_kern * 100
-            self.set_font(self.DATA, '', 6.5)
-            self.set_text_color(*INK_SOFT)
-            self.set_xy(bx2 + 8, by + 25)
-            self.cell(box_w - 16, 3, f'Woonquote: {woonquote:.0f}%', 0, 0, 'L')
+        # 5. Variabele kosten
+        vk = cat_totalen.get('variabele_kosten', {})
+        if vk:
+            top_vk = max(vk.items(), key=lambda x: abs(float(x[1])))
+            pm_vk_totaal = abs(sum(float(v) for v in vk.values())) / n_maanden
+            bevindingen.append(
+                f"De variabele kosten bedragen gemiddeld {eur(pm_vk_totaal)}/mnd. "
+                f"Grootste post: {top_vk[0]} ({eur(abs(float(top_vk[1])) / n_maanden)}/mnd)."
+            )
 
-        # Blok 4: Leefkosten (links onder) — met vast/discretionair split
-        by2 = grid_y + box_h + 6
-        self.set_fill_color(*SURFACE)
-        self.set_draw_color(*BORDER)
-        self.rect(bx, by2, box_w, box_h, 'FD')
-        self.set_font(self.DATA, '', 7.5)
-        self.set_text_color(*INK_SOFT)
-        self.set_xy(bx + 8, by2 + 4)
-        self.cell(box_w - 16, 4, 'Leefkosten', 0, 0, 'L')
-        _confidence_dot(bx, by2, 'variabele_kosten')
-        self.set_font(self.DATA, 'B', 13)
-        self.set_text_color(74, 85, 104)  # slate
-        self.set_xy(bx + 8, by2 + 12)
-        self.cell(box_w - 16, 7, eur(pm_leef_totaal) + '/mnd', 0, 0, 'L')
-        # Sub-split
-        self.set_font(self.DATA, '', 6.5)
-        self.set_text_color(*INK_SOFT)
-        self.set_xy(bx + 8, by2 + 22)
-        self.cell(box_w - 16, 3, f'vast: {eur(pm_leef_vast)}  |  discretionair: {eur(pm_leef_disc)}', 0, 0, 'L')
-        # Overige verzekeringen review-markering
-        if totaal_overige_verz > 2000:
-            self.set_font(self.DATA, '', 5.5)
-            self.set_text_color(160, 120, 50)
-            self.set_xy(bx + 8, by2 + 28)
-            self.cell(box_w - 16, 3, f'* incl. {eur(totaal_overige_verz / n_maanden)}/mnd overige verzekeringen', 0, 0, 'L')
-
-        # Blok 5: Netto vermogensallocatie (rechts onder) — positief gelabeld
-        self.set_fill_color(*SURFACE)
-        self.set_draw_color(*BORDER)
-        self.rect(bx2, by2, box_w, box_h, 'FD')
-        self.set_font(self.DATA, '', 7.5)
-        self.set_text_color(*INK_SOFT)
-        self.set_xy(bx2 + 8, by2 + 4)
-        self.cell(box_w - 16, 4, f'Netto {vermogen_richting} vermogen', 0, 0, 'L')
-        _confidence_dot(bx2, by2, 'sparen_beleggen')
-        self.set_font(self.DATA, 'B', 13)
-        vermogen_kleur = (26, 107, 60) if vermogen_richting == 'naar' else (200, 100, 0)
-        self.set_text_color(*vermogen_kleur)
-        self.set_xy(bx2 + 8, by2 + 12)
-        self.cell(box_w - 16, 7, eur(pm_vermogen_netto) + '/mnd', 0, 0, 'L')
-        # Toelichting
-        self.set_font(self.DATA, '', 6.5)
-        self.set_text_color(*INK_SOFT)
-        self.set_xy(bx2 + 8, by2 + 22)
-        self.cell(box_w - 16, 3, f'per saldo {"gestort" if vermogen_richting == "naar" else "onttrokken"}', 0, 0, 'L')
-
-        # --- BLOK 6: Buiten kernbeeld (full width, kleiner, onderaan) ---
-        buiten_y = by2 + box_h + 6
-        buiten_h = 28
-        self.set_fill_color(240, 240, 242)  # iets lichter grijs
-        self.set_draw_color(*BORDER)
-        self.rect(x0, buiten_y, kern_w, buiten_h, 'FD')
-
-        self.set_font(self.DATA, '', 7)
-        self.set_text_color(140, 140, 155)  # grijs
-        self.set_xy(x0 + 10, buiten_y + 3)
-        self.cell(60, 4, 'Buiten kernbeeld', 0, 0, 'L')
-
-        # Saldo verloop (rechts bovenin)
-        if gt_saldo:
-            self.set_font(self.DATA, '', 6.5)
-            self.set_text_color(100, 100, 120)
-            self.set_xy(x0 + 100, buiten_y + 3)
-            saldo_begin = gt_saldo.get('totaal_begin', 0)
-            saldo_eind = gt_saldo.get('totaal_eind', 0)
-            saldo_delta = saldo_eind - saldo_begin
-            delta_teken = '+' if saldo_delta >= 0 else ''
-            self.cell(70, 4, f'Saldo: {eur(saldo_begin)} > {eur(saldo_eind)} ({delta_teken}{eur(saldo_delta)})', 0, 0, 'R')
-
-        # Niet-kerninstroom (links)
-        self.set_font(self.DATA, '', 7)
-        self.set_text_color(*INK_SOFT)
-        self.set_xy(x0 + 10, buiten_y + 10)
-        niet_kern_label = f'Niet-kerninstroom: {eur(pm_niet_kern)}/mnd' if pm_niet_kern > 0 else 'Niet-kerninstroom: -'
-        self.cell(80, 4, niet_kern_label, 0, 0, 'L')
-
-        # Review/onzeker (rechts)
-        self.set_xy(x0 + 100, buiten_y + 10)
-        review_label = f'Review/onzeker: {eur(pm_review)}/mnd' if pm_review > 0 else 'Review/onzeker: -'
-        self.cell(70, 4, review_label, 0, 0, 'L')
-
-        # Onderling/neutraal (huishoud-transfers, card settlements)
-        self.set_font(self.DATA, '', 6.5)
-        self.set_text_color(140, 140, 155)
-        self.set_xy(x0 + 10, buiten_y + 17)
-        if pm_neutraal > 0:
-            self.cell(80, 4, f'Onderlinge transfers: {eur(pm_neutraal)}/mnd (huishoud, creditcard)', 0, 0, 'L')
+        # 6. Saldo-ontwikkeling
+        delta = eind_saldo - begin_saldo
+        if delta >= 0:
+            bevindingen.append(f"Het vermogen is in {n_maanden} maanden gegroeid met {eur(delta)}.")
         else:
-            self.cell(80, 4, 'Onderlinge transfers: -', 0, 0, 'L')
+            bevindingen.append(f"Het vermogen is in {n_maanden} maanden afgenomen met {eur(abs(delta))}.")
 
-        # --- Uitleg onder metrics ---
-        uitleg_y = buiten_y + buiten_h + 4
+        # 7. Belastingdruk
+        belasting_cats = {'Inkomstenbelasting/Voorlopige aanslag', 'Inkomstenbelasting'}
+        pm_belasting = sum(abs(float(vl.get(c, 0))) for c in belasting_cats) / n_maanden
+        belasting_pct = round(pm_belasting / pm_ink * 100, 1) if pm_ink > 0 else 0
+        bevindingen.append(f"De belastingdruk bedraagt {eur(pm_belasting)}/mnd ({belasting_pct}% van het inkomen).")
+
+        # Teken de bevindingen
+        y = self.get_y() + 6
+
         self.set_draw_color(*GOLD)
-        self.set_line_width(0.4)
-        self.line(15, uitleg_y, 195, uitleg_y)
-        self.set_y(uitleg_y + 3)
+        self.set_line_width(0.5)
+        self.line(15, y, 55, y)
+        y += 4
 
-        self.set_font(self.BODY, 'I', 8)
-        self.set_text_color(*INK_SOFT)
-        uitleg = (
-            f'Dit overzicht toont uw gemiddelde maandelijkse geldstromen over {n_maanden} volle maanden, '
-            f'berekend op basis van {len(feiten)} rekening(en). '
-            f'Interne overboekingen en huishoudtransfers zijn apart verantwoord. '
-            f'Gekleurde stippen geven het vertrouwensniveau aan (groen=hoog, geel=medium, rood=laag).'
-        )
-        self.multi_cell(180, 4, uitleg, 0, 'L')
+        self.set_font(self.HEADING, '', 14)
+        self.set_text_color(*INK)
+        self.set_xy(15, y)
+        self.cell(0, 7, 'Belangrijkste bevindingen', 0, 1, 'L')
+        y += 10
 
-        # V3: Kwaliteitsindicator
-        if gate:
-            kleur = gate.get('kleur', 'GREEN')
-            kleur_rgb = {'GREEN': (0, 128, 0), 'ORANGE': (200, 130, 0), 'RED': (200, 0, 0)}.get(kleur, (128, 128, 128))
-            kleur_label = {'GREEN': 'Gevalideerd', 'ORANGE': 'Aandachtspunten', 'RED': 'Review vereist'}.get(kleur, 'Onbekend')
-            self.set_y(250)
+        for i, bevinding in enumerate(bevindingen[:7]):
+            if y + 12 > 260:
+                break
+            # Nummer in goud-cirkel
+            self.set_fill_color(*GOLD)
+            self.ellipse(15, y, 6, 6, 'F')
             self.set_font(self.DATA, 'B', 7)
-            self.set_text_color(*kleur_rgb)
-            self.cell(180, 4, f'Kwaliteitscheck: {kleur_label}', 0, 1, 'C')
-            if gate.get('redenen'):
-                self.set_font(self.DATA, '', 6)
-                self.set_text_color(140, 140, 155)
-                for reden in gate['redenen'][:2]:
-                    self.cell(180, 3.5, reden[:100], 0, 1, 'C')
+            self.set_text_color(255, 255, 255)
+            self.set_xy(15, y + 0.8)
+            self.cell(6, 5, str(i + 1), 0, 0, 'C')
 
-        # Disclaimer onderaan cover
+            # Tekst
+            self.set_font(self.BODY, '', 8.5)
+            self.set_text_color(*INK)
+            self.set_xy(24, y + 0.5)
+            self.multi_cell(165, 4.5, bevinding, 0, 'L')
+            y = self.get_y() + 3
+        # Disclaimer onderaan cover (houd binnen pagina-margins)
         self.set_y(265)
         self.set_font(self.DATA, '', 6.5)
         self.set_text_color(*INK_SOFT)
         self.cell(180, 4, 'Dit rapport is uitsluitend bedoeld als financieel inzicht en vormt geen financieel advies.', 0, 1, 'C')
-        self.cell(180, 4, 'Raadpleeg altijd een erkend financieel adviseur voor persoonlijke beslissingen.', 0, 1, 'C')
+        self.cell(180, 4, 'Raadpleeg altijd een erkend financieel adviseur voor persoonlijke beslissingen.', 0, 0, 'C')
 
     def categorie_overzicht_page(self, ground_truth: dict):
         """Maandelijks cashflow-overzicht op landscape pagina(s).
@@ -5604,7 +5336,9 @@ class RapportPDF(FPDF):
         if not maandoverzicht:
             return
 
-        maanden = sorted(maandoverzicht.keys())
+        # Gebruik alleen volle maanden (geen onvolledige begin/eind-maanden)
+        volle_maanden = ground_truth.get('periode', {}).get('volle_maanden', [])
+        maanden = sorted(volle_maanden) if volle_maanden else sorted(maandoverzicht.keys())
         n_mnd = max(len(maanden), 1)
 
         # --- Consolidatielogica: < €500/jaar → overige, tenzij gem > €500/mnd ---
@@ -6292,44 +6026,7 @@ def genereer_pdf(rapport: dict) -> bytes:
     if ground_truth and ground_truth.get('categorie_totalen_12m'):
         pdf.categorie_overzicht_page(ground_truth)
 
-    # Pagina 2: Analyse & Inzichten
-    if analyse and analyse.get('samenvatting'):
-        pdf.analyse_page(analyse)
-
-    # --- BIJLAGE: Gedetailleerd overzicht ---
-    # Scheidingspagina
-    pdf.add_page()
-    pdf.set_fill_color(*INK)
-    pdf.rect(0, 0, 210, 297, 'F')
-    pdf.set_font(pdf.HEADING, '', 22)
-    pdf.set_text_color(*WHITE)
-    pdf.set_xy(15, 120)
-    pdf.cell(180, 12, 'Bijlage', 0, 1, 'C')
-    pdf.set_font(pdf.BODY, '', 11)
-    pdf.set_text_color(180, 180, 195)
-    pdf.set_xy(15, 138)
-    pdf.cell(180, 7, 'Gedetailleerd maand- en jaaroverzicht', 0, 1, 'C')
-    pdf.set_draw_color(*GOLD)
-    pdf.set_line_width(0.6)
-    pdf.line(85, 150, 125, 150)
-
-    # Gecombineerd overzicht (alle rekeningen samen)
-    if maandoverzicht and len(feiten) >= 1:
-        combi_maand = _combineer_maandoverzichten(maandoverzicht)
-        combi_feiten = {'TOTAAL': _combineer_feiten(feiten)}
-        pdf.maandoverzicht_page(combi_maand, combi_feiten)
-
-    if jaartotalen and len(feiten) >= 1:
-        combi_jaar = _combineer_jaartotalen(jaartotalen)
-        combi_maand_count = _combineer_maandoverzichten(maandoverzicht) if maandoverzicht else {}
-        pdf.jaartotalen_page(combi_jaar, combi_maand_count)
-
-    # Detail per rekening (alleen als er meerdere rekeningen zijn)
-    if len(feiten) > 1:
-        if maandoverzicht:
-            pdf.maandoverzicht_page(maandoverzicht, feiten)
-        if jaartotalen:
-            pdf.jaartotalen_page(jaartotalen, maandoverzicht)
+    # Rapport is nu exact 2 pagina's: cover + categorie-overzicht
 
     return pdf.output()
 
@@ -6825,6 +6522,7 @@ def _bouw_ground_truth(merged_data: dict, feiten: dict, rapportperiode: dict,
         'income_sources': income_sources,
         'vertrouwen_per_sectie': vertrouwen_per_sectie,
         'reconciliatie': reconciliatie,
+        '_rek_naar_persoon': rek_naar_persoon,
     }
 
     # Log de ground truth samenvatting

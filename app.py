@@ -5370,20 +5370,27 @@ class RapportPDF(FPDF):
                 bedrag_pm = abs(data.get('bedrag_12m', 0)) / n_maanden
                 if bedrag_pm < 10:
                     continue
-                label = _SRC_LABELS.get(sf, sf.replace('_', ' ').title())
+                base_label = _SRC_LABELS.get(sf, sf.replace('_', ' ').title())
+                tp = data.get('tegenpartij', '')
+                if tp:
+                    # Verkort tegenpartij: max 18 tekens
+                    tp_short = tp[:18].strip()
+                    label = f"{base_label} ({tp_short})"
+                else:
+                    label = base_label
                 vtw = data.get('vertrouwen', 'medium')
                 dot_color = _VERTROUWEN_DOT.get(vtw, (128, 128, 128))
                 # Vertrouwen-stip
                 self.set_fill_color(*dot_color)
                 self.ellipse(src_x, src_y + 1, 2, 2, 'F')
                 # Label + bedrag
-                self.set_font(self.DATA, '', 6)
+                self.set_font(self.DATA, '', 5.5)
                 self.set_text_color(*INK_SOFT)
                 self.set_xy(src_x + 3, src_y)
-                self.cell(25, 3, label, 0, 0, 'L')
-                self.set_xy(src_x + 28, src_y)
-                self.cell(20, 3, eur(bedrag_pm), 0, 0, 'R')
-                src_x += 52
+                self.cell(32, 3, label[:35], 0, 0, 'L')
+                self.set_xy(src_x + 35, src_y)
+                self.cell(16, 3, eur(bedrag_pm), 0, 0, 'R')
+                src_x += 55
                 shown += 1
 
         # --- 2x2 GRID: belasting, woon, leefkosten, vermogen ---
@@ -5573,143 +5580,265 @@ class RapportPDF(FPDF):
         self.cell(180, 4, 'Raadpleeg altijd een erkend financieel adviseur voor persoonlijke beslissingen.', 0, 1, 'C')
 
     def categorie_overzicht_page(self, ground_truth: dict):
-        """Pagina 2: Volledig categorie-overzicht — alle inkomsten en uitgaven per sectie."""
+        """Maandelijks cashflow-overzicht op landscape pagina(s).
+
+        Structuur per maand:
+        - Beginsaldo (alle rekeningen)
+        - Inkomsten (categorieën)
+        - Vaste lasten (categorieën)
+        - Variabele kosten (categorieën)
+        - Sparen & Beleggen (categorieën)
+        - Eindsaldo (= begin + netto)
+
+        Consolidatie: < €500/jaar → 'Overige [sectie]', tenzij gem > €500/mnd.
+        """
         if not ground_truth or not ground_truth.get('categorie_totalen_12m'):
             return
 
-        self.add_page()
-        self._section_title('Categorie-overzicht')
-
         cat_totalen = ground_truth['categorie_totalen_12m']
-        n_mnd = max(ground_truth.get('periode', {}).get('n_mnd', 12) or 12, 1)
+        maandoverzicht = ground_truth.get('maandoverzicht', {})
+        if not maandoverzicht:
+            return
 
-        # Sectie-volgorde en kleuren
+        maanden = sorted(maandoverzicht.keys())
+        n_mnd = max(len(maanden), 1)
+
+        # --- Consolidatielogica: < €500/jaar → overige, tenzij gem > €500/mnd ---
         _SECTIE_CONFIG = [
-            ('inkomsten',         'Inkomsten',              (26, 107, 60)),    # groen
-            ('vaste_lasten',      'Vaste lasten',           (74, 85, 104)),    # slate
-            ('variabele_kosten',  'Variabele kosten',       (100, 100, 120)),  # grijs-blauw
-            ('sparen_beleggen',   'Sparen & Beleggen',      (26, 90, 140)),    # blauw
-            ('onderling_neutraal','Onderling / Neutraal',   (140, 140, 155)),  # grijs
+            ('inkomsten',        'INKOMSTEN',          (26, 107, 60)),
+            ('vaste_lasten',     'VASTE LASTEN',       (74, 85, 104)),
+            ('variabele_kosten', 'VARIABELE KOSTEN',   (100, 100, 120)),
+            ('sparen_beleggen',  'SPAREN & BELEGGEN',  (26, 90, 140)),
         ]
 
-        x0 = 15
-        tabel_w = 180
-        col_cat = 100   # breedte categorie-kolom
-        col_12m = 40    # breedte 12m-kolom
-        col_pm = 40     # breedte p/m-kolom
-        rij_h = 5.5
+        def _consolideer(cats_dict, sectie_label):
+            """Consolideer kleine categorieën naar 'Overige'."""
+            groot = {}
+            overig_totaal = 0.0
+            for cat, bedrag in cats_dict.items():
+                b = abs(float(bedrag))
+                gem_pm = b / n_mnd
+                if b >= 500 or gem_pm > 500:
+                    groot[cat] = float(bedrag)
+                else:
+                    overig_totaal += float(bedrag)
+            # Sorteer op absoluut bedrag (groot → klein)
+            sorted_items = sorted(groot.items(), key=lambda x: -abs(x[1]))
+            if abs(overig_totaal) >= 1:
+                sorted_items.append((f'Overig', overig_totaal))
+            return sorted_items
 
-        # Tabel header
-        y = self.get_y() + 2
-        self.set_fill_color(26, 26, 46)
-        self.rect(x0, y, tabel_w, rij_h + 1, 'F')
-        self.set_font(self.DATA, 'B', 7)
-        self.set_text_color(255, 255, 255)
-        self.set_xy(x0 + 4, y + 1)
-        self.cell(col_cat - 4, rij_h, 'Categorie', 0, 0, 'L')
-        self.set_xy(x0 + col_cat, y + 1)
-        self.cell(col_12m, rij_h, 'Totaal 12m', 0, 0, 'R')
-        self.set_xy(x0 + col_cat + col_12m, y + 1)
-        self.cell(col_pm, rij_h, 'Gem. p/m', 0, 0, 'R')
-        y += rij_h + 1
+        # Bouw rijstructuur op
+        rows = []  # [(label, sectie_key_or_special, is_header, is_total)]
 
-        for sectie_key, sectie_label, sectie_kleur in _SECTIE_CONFIG:
+        rows.append(('Beginsaldo', '_beginsaldo', False, True))
+
+        for sectie_key, sectie_label, kleur in _SECTIE_CONFIG:
             cats = cat_totalen.get(sectie_key, {})
             if not cats:
                 continue
+            cons = _consolideer(cats, sectie_label)
+            rows.append((sectie_label, sectie_key, True, False))
+            for cat_name, _ in cons:
+                rows.append((cat_name, sectie_key, False, False))
 
-            # Sectie-totaal berekenen
-            sectie_totaal = sum(float(v) for v in cats.values())
+        rows.append(('Eindsaldo', '_eindsaldo', False, True))
 
-            # Paginagrens check: sectie-header + minstens 2 rijen + totaal
-            needed = rij_h * (min(len(cats), 8) + 2) + 4
-            if y + needed > 270:
-                self.add_page()
-                self._section_title('Categorie-overzicht (vervolg)')
-                y = self.get_y() + 2
+        # --- Maanddata per categorie opbouwen ---
+        # maand_cat_data[maand][sectie][cat] = bedrag
+        maand_cat_data = {}
+        for maand in maanden:
+            maand_cat_data[maand] = {}
+            for sectie_key, _, _ in _SECTIE_CONFIG:
+                maand_cat_data[maand][sectie_key] = maandoverzicht.get(maand, {}).get(sectie_key, {})
 
-            # Sectie-header
-            self.set_fill_color(*sectie_kleur)
-            self.rect(x0, y, tabel_w, rij_h + 0.5, 'F')
-            self.set_font(self.DATA, 'B', 7.5)
-            self.set_text_color(255, 255, 255)
-            self.set_xy(x0 + 4, y + 0.5)
-            self.cell(col_cat - 4, rij_h, sectie_label, 0, 0, 'L')
-            self.set_xy(x0 + col_cat, y + 0.5)
-            self.cell(col_12m, rij_h, eur(sectie_totaal), 0, 0, 'R')
-            self.set_xy(x0 + col_cat + col_12m, y + 0.5)
-            self.cell(col_pm, rij_h, eur(sectie_totaal / n_mnd), 0, 0, 'R')
-            y += rij_h + 0.5
+        # Consolideer ook op maandniveau
+        def _get_cat_month(maand, sectie_key, cat_name, cons_cats_for_sectie):
+            """Haal maandwaarde op, rekening houdend met consolidatie."""
+            if cat_name == 'Overig':
+                # Tel alle categorieën die NIET in de grote lijst staan
+                alle_cats = maand_cat_data.get(maand, {}).get(sectie_key, {})
+                grote_namen = {c for c, _ in cons_cats_for_sectie if c != 'Overig'}
+                return sum(float(v) for k, v in alle_cats.items() if k not in grote_namen)
+            return float(maand_cat_data.get(maand, {}).get(sectie_key, {}).get(cat_name, 0))
 
-            # Categorieën (gesorteerd op absoluut bedrag, groot → klein)
-            sorted_cats = sorted(cats.items(), key=lambda x: -abs(float(x[1])))
-            even = True
-            for cat, bedrag in sorted_cats:
-                bedrag_f = float(bedrag)
-                if abs(bedrag_f) < 1:
-                    continue
+        # Bewaar geconsolideerde cats per sectie voor lookup
+        cons_per_sectie = {}
+        for sectie_key, _, _ in _SECTIE_CONFIG:
+            cats = cat_totalen.get(sectie_key, {})
+            if cats:
+                cons_per_sectie[sectie_key] = _consolideer(cats, sectie_key)
 
-                if y + rij_h > 270:
-                    self.add_page()
-                    self._section_title('Categorie-overzicht (vervolg)')
-                    y = self.get_y() + 2
+        # --- Bereken saldo per maand ---
+        saldo_data = ground_truth.get('saldo', {})
+        totaal_begin = saldo_data.get('totaal_begin', 0)
+        totaal_eind = saldo_data.get('totaal_eind', 0)
 
-                # Alternerende achtergrond
-                if even:
-                    self.set_fill_color(247, 246, 242)
-                    self.rect(x0, y, tabel_w, rij_h, 'F')
-                even = not even
+        # Bereken cumulatief saldo per maand
+        maand_netto = {}
+        for maand in maanden:
+            netto = 0
+            for sectie_key, _, _ in _SECTIE_CONFIG:
+                cats = maandoverzicht.get(maand, {}).get(sectie_key, {})
+                netto += sum(float(v) for v in cats.values())
+            # onderling_neutraal ook meenemen
+            neutraal_cats = maandoverzicht.get(maand, {}).get('onderling_neutraal', {})
+            netto += sum(float(v) for v in neutraal_cats.values())
+            maand_netto[maand] = round(netto, 2)
+
+        # Beginsaldo per maand: cumulatief
+        maand_beginsaldo = {}
+        running = totaal_begin
+        for maand in maanden:
+            maand_beginsaldo[maand] = round(running, 2)
+            running += maand_netto[maand]
+        maand_eindsaldo = {m: round(maand_beginsaldo[m] + maand_netto[m], 2) for m in maanden}
+
+        # --- LAYOUT: landscape pagina ---
+        # Bewaar huidige orientatie en stel landscape in
+        self.add_page(orientation='L')
+
+        # Dimensies landscape A4: 297 x 210
+        page_w = 297
+        page_h = 210
+        margin_l = 8
+        margin_r = 5
+        margin_t = 12
+        usable_w = page_w - margin_l - margin_r  # ~284
+
+        # Kolom-breedtes
+        col_label = 48  # categorienaam
+        n_months = len(maanden)
+        col_month = (usable_w - col_label) / n_months if n_months > 0 else 18
+        rij_h = 3.3
+
+        # Titel
+        self.set_font(self.HEADING, '', 10)
+        self.set_text_color(*INK)
+        self.set_xy(margin_l, margin_t)
+        self.cell(0, 5, 'Maandelijks Cashflow Overzicht', 0, 0, 'L')
+        self.set_draw_color(*GOLD)
+        self.set_line_width(0.5)
+        self.line(margin_l, margin_t + 5.5, margin_l + 80, margin_t + 5.5)
+
+        y = margin_t + 8
+
+        # Korte euro-formatter voor tabel (compact)
+        def _eur_k(val):
+            v = float(val)
+            if abs(v) < 1:
+                return '-'
+            if abs(v) >= 10000:
+                return f"{v/1000:,.1f}k".replace(',', '.')
+            return f"{v:,.0f}".replace(',', '.')
+
+        # --- KOLOMKOPPEN: maandlabels ---
+        self.set_fill_color(26, 26, 46)
+        self.rect(margin_l, y, usable_w, rij_h + 1, 'F')
+        self.set_font(self.DATA, 'B', 5)
+        self.set_text_color(255, 255, 255)
+        self.set_xy(margin_l + 2, y + 0.5)
+        self.cell(col_label - 2, rij_h, '', 0, 0, 'L')
+        for i, maand in enumerate(maanden):
+            # Maandnaam kort: "apr'25"
+            try:
+                parts = maand.split('-')
+                maand_namen = ['jan','feb','mrt','apr','mei','jun','jul','aug','sep','okt','nov','dec']
+                label = f"{maand_namen[int(parts[1])-1]}'{parts[0][2:]}"
+            except Exception:
+                label = maand[-5:]
+            x = margin_l + col_label + i * col_month
+            self.set_xy(x, y + 0.5)
+            self.cell(col_month, rij_h, label, 0, 0, 'R')
+        y += rij_h + 1
+
+        # --- RIJEN TEKENEN ---
+        cur_sectie_key = None
+        row_idx = 0
+
+        for row_label, row_key, is_header, is_total in rows:
+            # Paginagrens check
+            if y + rij_h > page_h - 10:
+                self.add_page(orientation='L')
+                y = margin_t + 4
+
+            if is_total:
+                # Beginsaldo / Eindsaldo regel
+                self.set_fill_color(240, 238, 232)
+                self.rect(margin_l, y, usable_w, rij_h, 'F')
+                self.set_font(self.DATA, 'B', 5)
+                self.set_text_color(26, 26, 46)
+                self.set_xy(margin_l + 2, y + 0.3)
+                self.cell(col_label - 2, rij_h, row_label, 0, 0, 'L')
+
+                for i, maand in enumerate(maanden):
+                    if row_key == '_beginsaldo':
+                        val = maand_beginsaldo.get(maand, 0)
+                    else:
+                        val = maand_eindsaldo.get(maand, 0)
+                    x = margin_l + col_label + i * col_month
+                    self.set_xy(x, y + 0.3)
+                    self.set_text_color(26, 26, 46)
+                    self.cell(col_month, rij_h, _eur_k(val), 0, 0, 'R')
+                y += rij_h + 0.5
+
+            elif is_header:
+                # Sectie-header
+                cur_sectie_key = row_key
+                kleur = next((k for sk, _, k in _SECTIE_CONFIG if sk == row_key), (100, 100, 100))
+                self.set_fill_color(*kleur)
+                self.rect(margin_l, y, usable_w, rij_h, 'F')
+                self.set_font(self.DATA, 'B', 5)
+                self.set_text_color(255, 255, 255)
+                self.set_xy(margin_l + 2, y + 0.3)
+                self.cell(col_label - 2, rij_h, row_label, 0, 0, 'L')
+
+                # Sectie-totalen per maand
+                for i, maand in enumerate(maanden):
+                    cats = maandoverzicht.get(maand, {}).get(row_key, {})
+                    totaal = sum(float(v) for v in cats.values())
+                    x = margin_l + col_label + i * col_month
+                    self.set_xy(x, y + 0.3)
+                    self.cell(col_month, rij_h, _eur_k(totaal), 0, 0, 'R')
+                y += rij_h
+                row_idx = 0
+
+            else:
+                # Categorie-rij
+                if row_idx % 2 == 0:
+                    self.set_fill_color(250, 249, 246)
+                    self.rect(margin_l, y, usable_w, rij_h, 'F')
 
                 # Dunne lijn
-                self.set_draw_color(230, 228, 220)
-                self.line(x0, y + rij_h, x0 + tabel_w, y + rij_h)
+                self.set_draw_color(235, 233, 228)
+                self.line(margin_l, y + rij_h, margin_l + usable_w, y + rij_h)
 
-                # Categorie naam
-                self.set_font(self.DATA, '', 7)
-                self.set_text_color(60, 60, 80)
-                self.set_xy(x0 + 8, y + 0.5)
-                self.cell(col_cat - 8, rij_h, cat[:45], 0, 0, 'L')
+                self.set_font(self.DATA, '', 4.5)
+                self.set_text_color(80, 80, 100)
+                self.set_xy(margin_l + 4, y + 0.3)
+                self.cell(col_label - 4, rij_h, row_label[:30], 0, 0, 'L')
 
-                # 12m bedrag
-                self.set_font(self.DATA, '', 7)
-                bedrag_kleur = (26, 107, 60) if bedrag_f > 0 else (60, 60, 80)
-                self.set_text_color(*bedrag_kleur)
-                self.set_xy(x0 + col_cat, y + 0.5)
-                self.cell(col_12m, rij_h, eur(bedrag_f), 0, 0, 'R')
-
-                # P/m bedrag
-                self.set_xy(x0 + col_cat + col_12m, y + 0.5)
-                self.cell(col_pm, rij_h, eur(bedrag_f / n_mnd), 0, 0, 'R')
+                cons = cons_per_sectie.get(cur_sectie_key, [])
+                for i, maand in enumerate(maanden):
+                    val = _get_cat_month(maand, cur_sectie_key, row_label, cons)
+                    x = margin_l + col_label + i * col_month
+                    self.set_xy(x, y + 0.3)
+                    if val > 0:
+                        self.set_text_color(26, 107, 60)
+                    elif val < 0:
+                        self.set_text_color(80, 80, 100)
+                    else:
+                        self.set_text_color(180, 180, 180)
+                    self.cell(col_month, rij_h, _eur_k(val), 0, 0, 'R')
 
                 y += rij_h
+                row_idx += 1
 
-            y += 2  # ruimte tussen secties
-
-        # Netto-regel onderaan
-        if y + rij_h + 4 > 270:
-            self.add_page()
-            y = self.get_y() + 2
-
-        netto = sum(
-            sum(float(v) for v in cats.values())
-            for cats in cat_totalen.values()
-        )
-        self.set_draw_color(*GOLD)
-        self.set_line_width(0.6)
-        self.line(x0, y, x0 + tabel_w, y)
-        y += 2
-        self.set_fill_color(247, 246, 242)
-        self.rect(x0, y, tabel_w, rij_h + 1, 'F')
-        self.set_font(self.DATA, 'B', 8)
-        self.set_text_color(26, 26, 46)
-        self.set_xy(x0 + 4, y + 0.5)
-        self.cell(col_cat - 4, rij_h, 'Netto cashflow', 0, 0, 'L')
-        netto_kleur = (26, 107, 60) if netto >= 0 else (200, 0, 0)
-        self.set_text_color(*netto_kleur)
-        self.set_xy(x0 + col_cat, y + 0.5)
-        self.cell(col_12m, rij_h, eur(netto), 0, 0, 'R')
-        self.set_xy(x0 + col_cat + col_12m, y + 0.5)
-        self.cell(col_pm, rij_h, eur(netto / n_mnd), 0, 0, 'R')
+        # Gouden lijn voor eindsaldo
+        if rows and rows[-1][1] == '_eindsaldo':
+            self.set_draw_color(*GOLD)
+            self.set_line_width(0.4)
+            self.line(margin_l, y - rij_h - 0.5, margin_l + usable_w, y - rij_h - 0.5)
 
     def analyse_page(self, analyse: dict):
         """Pagina met AI-analyse: samenvatting, sterke punten, etc."""
@@ -6585,12 +6714,20 @@ def _bouw_ground_truth(merged_data: dict, feiten: dict, rapportperiode: dict,
                     vertrouwen = 'medium'
                 else:
                     vertrouwen = 'laag'
+                # Bepaal hoofdtegenpartij (wie betaalt dit inkomen)
+                hoofd_tegenpartij = ''
+                if 'tegenpartij_naam' in groep.columns:
+                    namen = groep['tegenpartij_naam'].dropna()
+                    namen = namen[namen.str.strip() != '']
+                    if len(namen) > 0:
+                        hoofd_tegenpartij = namen.value_counts().index[0]
                 income_sources[str(sf)] = {
                     'bedrag_12m': round(float(groep['bedrag'].sum()), 2),
                     'transacties': len(groep),
                     'categorieën': list(groep['regel_categorie'].dropna().unique()),
                     'gem_confidence': round(gem_conf, 2),
                     'vertrouwen': vertrouwen,
+                    'tegenpartij': hoofd_tegenpartij,
                 }
 
     # Vertrouwensindicatoren per sectie

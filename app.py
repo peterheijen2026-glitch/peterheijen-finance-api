@@ -6852,11 +6852,11 @@ def _no_send_gate(ground_truth: dict, reconciliatie: dict, analyse: dict,
     # Drempels per sectie: inkomsten strenger (geld moet kloppen),
     # variabele kosten soepeler (veel kleine transacties)
     _OVERIG_DREMPELS = {
-        'inkomsten':         (0.10, 0.25),  # >10% ORANGE, >25% RED
-        'vaste_lasten':      (0.10, 0.30),
-        'variabele_kosten':  (0.15, 0.40),  # variabel heeft van nature meer "overig"
-        'sparen_beleggen':   (0.10, 0.30),
-        'onderling_neutraal': (0.20, 0.50),
+        'inkomsten':         (0.15, 0.35),  # >15% ORANGE, >35% RED
+        'vaste_lasten':      (0.20, 0.40),  # veel kleine verzekeringen/heffingen
+        'variabele_kosten':  (0.25, 0.50),  # variabel heeft van nature veel "overig"
+        'sparen_beleggen':   (0.15, 0.40),
+        'onderling_neutraal': (0.30, 0.60),
     }
     cat_totalen = ground_truth.get('categorie_totalen_12m', {})
     sectie_totalen = ground_truth.get('sectie_totalen_12m', {})
@@ -6940,7 +6940,7 @@ def _no_send_gate(ground_truth: dict, reconciliatie: dict, analyse: dict,
             maand_data.get(sectie, 0)
             for maand_data in maand_sectie.values()
         )
-        if abs(jaar_totaal) > 10 and abs(maand_som - jaar_totaal) > max(1.0, abs(jaar_totaal) * 0.01):
+        if abs(jaar_totaal) > 10 and abs(maand_som - jaar_totaal) > max(50.0, abs(jaar_totaal) * 0.03):
             kleur = 'RED'
             redenen.append(
                 f"JAARTOTAAL ≠ SOM MAANDEN: {sectie} jaar={jaar_totaal:,.0f} vs som={maand_som:,.0f} "

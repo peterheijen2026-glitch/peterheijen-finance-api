@@ -4715,6 +4715,257 @@ def _genereer_strategische_inzichten(ground_truth: dict, df: pd.DataFrame) -> di
     }
 
 
+def _bereken_premium_inzichten(ground_truth: dict, df: pd.DataFrame) -> dict:
+    """Bereken 5 premium strategische inzichten uit ground_truth data.
+
+    Puur deterministisch. Elke inzicht heeft:
+    - id: unieke key
+    - titel: korte naam
+    - beschrijving: 1-2 zinnen conclusie
+    - waarde: numerieke kernwaarde (of None als niet berekend)
+    - detail: extra context
+    - relevantie: 'hoog' / 'medium' / 'laag' / None (niet van toepassing)
+    """
+    inzichten = []
+    sectie_totalen = ground_truth.get('sectie_totalen_12m', {})
+    cat_totalen = ground_truth.get('categorie_totalen_12m', {})
+    maand_sectie = ground_truth.get('maand_sectie_totalen', {})
+    income_sources = ground_truth.get('income_sources', {})
+    saldo = ground_truth.get('saldo', {})
+    n_mnd = ground_truth.get('periode', {}).get('n_mnd', 12) or 12
+
+    inkomsten = abs(sectie_totalen.get('inkomsten', 0))
+    vaste_lasten = abs(sectie_totalen.get('vaste_lasten', 0))
+    variabele = abs(sectie_totalen.get('variabele_kosten', 0))
+    totaal_uit = vaste_lasten + variabele
+
+    # ── 1. CASH DRAG / "LUI GELD" RADAR ──
+    # Gemiddeld banksaldo vs hoogste maanduitgave → hoeveel maanden buffer
+    gemiddeld_saldo = None
+    maand_uitgaven = []
+    for maand, secties in maand_sectie.items():
+        uit = abs(secties.get('vaste_lasten', 0)) + abs(secties.get('variabele_kosten', 0))
+        if uit > 0:
+            maand_uitgaven.append(uit)
+
+    begin_saldo = saldo.get('totaal_begin', 0)
+    eind_saldo = saldo.get('totaal_eind', 0)
+    if begin_saldo and eind_saldo:
+        gemiddeld_saldo = (begin_saldo + eind_saldo) / 2
+
+    gem_maand_uitgave = sum(maand_uitgaven) / max(len(maand_uitgaven), 1) if maand_uitgaven else 0
+
+    if gemiddeld_saldo is not None and gem_maand_uitgave > 0:
+        buffer_maanden = gemiddeld_saldo / gem_maand_uitgave
+        if buffer_maanden > 6:
+            relevantie = 'hoog'
+            beschrijving = (
+                f'Gemiddeld banksaldo van \u20ac{gemiddeld_saldo:,.0f} dekt {buffer_maanden:.1f} maanden uitgaven. '
+                f'Boven 6 maanden buffer is het saldo mogelijk niet optimaal ingezet \u2014 '
+                f'overweeg of een deel naar een hogere rendementsklasse kan.'
+            )
+        elif buffer_maanden > 3:
+            relevantie = 'medium'
+            beschrijving = (
+                f'Gemiddeld banksaldo van \u20ac{gemiddeld_saldo:,.0f} dekt {buffer_maanden:.1f} maanden uitgaven. '
+                f'Een gezonde buffer. Geen directe actie nodig.'
+            )
+        else:
+            relevantie = 'laag'
+            beschrijving = (
+                f'Gemiddeld banksaldo van \u20ac{gemiddeld_saldo:,.0f} dekt {buffer_maanden:.1f} maanden uitgaven. '
+                f'Relatief krap \u2014 overweeg een aparte liquiditeitsreserve.'
+            )
+        inzichten.append({
+            'id': 'cash_drag',
+            'titel': 'Liquiditeitsradar',
+            'beschrijving': beschrijving,
+            'waarde': round(buffer_maanden, 1),
+            'detail': f'\u20ac{gemiddeld_saldo:,.0f} gem. saldo / \u20ac{gem_maand_uitgave:,.0f} gem. uitgaven p/m',
+            'relevantie': relevantie,
+        })
+
+    # ── 2. ZAKELIJK VS PRIV\u00c9 LEKKAGE (DGA-specifiek) ──
+    # Kijk of er DGA/management fee inkomen is + zakelijke kosten op priv\u00e9rekening
+    mgmt_fee = abs(income_sources.get('management_fee', {}).get('bedrag_12m', 0))
+    dga_loon = 0
+    for src_key, src_data in income_sources.items():
+        if 'dga' in src_key.lower() or 'management' in src_key.lower():
+            dga_loon += abs(src_data.get('bedrag_12m', 0))
+    if mgmt_fee > 0:
+        dga_loon = max(dga_loon, mgmt_fee)
+
+    # Zoek zakelijk-gerelateerde uitgaven op priv\u00e9rekening
+    zakelijke_cats_op_prive = 0
+    zakelijke_labels = ['accountant', 'boekhouder', 'kvk', 'notaris', 'zakelijk', 'kantoor']
+    for sectie_key in ['vaste_lasten', 'variabele_kosten']:
+        cats = cat_totalen.get(sectie_key, {})
+        for cat_naam, bedrag in cats.items():
+            for label in zakelijke_labels:
+                if label in cat_naam.lower():
+                    zakelijke_cats_op_prive += abs(float(bedrag))
+
+    if dga_loon > 0:
+        if zakelijke_cats_op_prive > 500:
+            relevantie = 'hoog'
+            beschrijving = (
+                f'Er gaat \u20ac{zakelijke_cats_op_prive:,.0f}/jaar aan mogelijk zakelijke kosten via de priv\u00e9rekening. '
+                f'Bij een DGA-inkomen van \u20ac{dga_loon:,.0f}/jaar is dit een fiscaal aandachtspunt \u2014 '
+                f'deze kosten zijn mogelijk aftrekbaar via de BV.'
+            )
+        else:
+            relevantie = 'laag'
+            beschrijving = (
+                f'DGA-inkomen van \u20ac{dga_loon:,.0f}/jaar. Geen significante zakelijke kosten op de priv\u00e9rekening gedetecteerd. '
+                f'De scheiding zakelijk/priv\u00e9 lijkt goed ingericht.'
+            )
+        inzichten.append({
+            'id': 'zakelijk_prive',
+            'titel': 'Zakelijk/Priv\u00e9 scheiding',
+            'beschrijving': beschrijving,
+            'waarde': round(zakelijke_cats_op_prive, 0),
+            'detail': f'DGA-inkomen: \u20ac{dga_loon:,.0f}/jr | Zakelijk op priv\u00e9: \u20ac{zakelijke_cats_op_prive:,.0f}/jr',
+            'relevantie': relevantie,
+        })
+
+    # ── 3. VASTGOED RENDEMENT ──
+    # Huurinkomsten vs woonkosten (hypotheek/huur, onderhoud)
+    huur_inkomen = 0
+    for src_key, src_data in income_sources.items():
+        if 'huur' in src_key.lower() or 'rent' in src_key.lower():
+            huur_inkomen += abs(src_data.get('bedrag_12m', 0))
+
+    woonkosten = 0
+    woon_labels = ['hypotheek', 'huur', 'onderhoud', 'vve', 'opstal', 'woning']
+    for sectie_key in ['vaste_lasten']:
+        cats = cat_totalen.get(sectie_key, {})
+        for cat_naam, bedrag in cats.items():
+            for label in woon_labels:
+                if label in cat_naam.lower():
+                    woonkosten += abs(float(bedrag))
+
+    if huur_inkomen > 1000:
+        netto_vastgoed = huur_inkomen - woonkosten
+        rendement_pct = (netto_vastgoed / huur_inkomen * 100) if huur_inkomen > 0 else 0
+        if rendement_pct > 50:
+            relevantie = 'hoog'
+        elif rendement_pct > 20:
+            relevantie = 'medium'
+        else:
+            relevantie = 'laag'
+        beschrijving = (
+            f'Huurinkomsten van \u20ac{huur_inkomen:,.0f}/jaar met \u20ac{woonkosten:,.0f} aan woonkosten. '
+            f'Netto vastgoedresultaat: \u20ac{netto_vastgoed:,.0f}/jaar ({rendement_pct:.0f}% netto marge). '
+        )
+        if netto_vastgoed < 0:
+            beschrijving += 'De woonkosten overtreffen de huurinkomsten \u2014 controleer of alle kosten correct zijn toegewezen.'
+        inzichten.append({
+            'id': 'vastgoed_rendement',
+            'titel': 'Vastgoedrendement',
+            'beschrijving': beschrijving,
+            'waarde': round(rendement_pct, 1),
+            'detail': f'Huur: \u20ac{huur_inkomen:,.0f} | Kosten: \u20ac{woonkosten:,.0f} | Netto: \u20ac{netto_vastgoed:,.0f}',
+            'relevantie': relevantie,
+        })
+
+    # ── 4. FAIR SHARE CHECK ──
+    # Inkomensbronnen verdeling — hoeveel % komt van grootste bron
+    bronnen = {}
+    for src_key, src_data in income_sources.items():
+        bedrag = abs(src_data.get('bedrag_12m', 0))
+        if bedrag > 100:
+            bronnen[src_key] = bedrag
+
+    if len(bronnen) >= 2 and inkomsten > 0:
+        gesorteerd = sorted(bronnen.items(), key=lambda x: -x[1])
+        grootste_naam, grootste_bedrag = gesorteerd[0]
+        concentratie = grootste_bedrag / inkomsten * 100
+        tweede_naam, tweede_bedrag = gesorteerd[1]
+
+        if concentratie > 80:
+            relevantie = 'hoog'
+            beschrijving = (
+                f'{concentratie:.0f}% van het inkomen komt uit \u00e9\u00e9n bron (\u20ac{grootste_bedrag:,.0f}/jaar). '
+                f'Dit is een hoog concentratierisico. De tweede bron levert slechts \u20ac{tweede_bedrag:,.0f}/jaar.'
+            )
+        elif concentratie > 60:
+            relevantie = 'medium'
+            beschrijving = (
+                f'Het inkomen is verdeeld over {len(bronnen)} bronnen, met {concentratie:.0f}% uit de grootste. '
+                f'Redelijke spreiding, maar nog afhankelijk van \u00e9\u00e9n primaire bron.'
+            )
+        else:
+            relevantie = 'laag'
+            beschrijving = (
+                f'Het inkomen is goed gespreid over {len(bronnen)} bronnen. '
+                f'De grootste bron levert {concentratie:.0f}% \u2014 laag concentratierisico.'
+            )
+        inzichten.append({
+            'id': 'fair_share',
+            'titel': 'Inkomensconcentratie',
+            'beschrijving': beschrijving,
+            'waarde': round(concentratie, 1),
+            'detail': ' | '.join(f'{k}: \u20ac{v:,.0f}' for k, v in gesorteerd[:3]),
+            'relevantie': relevantie,
+        })
+
+    # ── 5. LIFESTYLE INFLATIE DETECTIE ──
+    # Abonnementen + subscriptions als % van inkomen + trend
+    abo_totaal = 0
+    abo_cats = []
+    abo_labels = ['abonnement', 'streaming', 'spotify', 'netflix', 'disney', 'lidmaatschap',
+                  'contributie', 'apple', 'icloud', 'youtube', 'digitaal']
+    for sectie_key in ['vaste_lasten', 'variabele_kosten']:
+        cats = cat_totalen.get(sectie_key, {})
+        for cat_naam, bedrag in cats.items():
+            for label in abo_labels:
+                if label in cat_naam.lower():
+                    abo_totaal += abs(float(bedrag))
+                    abo_cats.append((cat_naam, abs(float(bedrag))))
+                    break
+
+    abo_pm = abo_totaal / n_mnd
+    if abo_totaal > 0 and inkomsten > 0:
+        abo_pct = abo_totaal / inkomsten * 100
+        if abo_pct > 5:
+            relevantie = 'hoog'
+            beschrijving = (
+                f'Abonnementen en lidmaatschappen kosten \u20ac{abo_pm:,.0f}/maand '
+                f'({abo_pct:.1f}% van inkomen). Bij vermogende huishoudens sluipen abonnementen erin \u2014 '
+                f'een jaarlijkse review kan \u20ac{abo_totaal * 0.2:,.0f} besparen.'
+            )
+        elif abo_pct > 2:
+            relevantie = 'medium'
+            beschrijving = (
+                f'Abonnementen en lidmaatschappen: \u20ac{abo_pm:,.0f}/maand ({abo_pct:.1f}% van inkomen). '
+                f'Gemiddeld niveau. Overweeg jaarlijks een subscription audit.'
+            )
+        else:
+            relevantie = 'laag'
+            beschrijving = (
+                f'Abonnementen en lidmaatschappen: \u20ac{abo_pm:,.0f}/maand ({abo_pct:.1f}% van inkomen). '
+                f'Beperkte impact op de totale cashflow.'
+            )
+        inzichten.append({
+            'id': 'lifestyle_inflatie',
+            'titel': 'Abonnementencheck',
+            'beschrijving': beschrijving,
+            'waarde': round(abo_pm, 0),
+            'detail': ', '.join(f'{c}: \u20ac{b:,.0f}' for c, b in sorted(abo_cats, key=lambda x: -x[1])[:5]),
+            'relevantie': relevantie,
+        })
+
+    # Sorteer op relevantie (hoog eerst)
+    rel_order = {'hoog': 0, 'medium': 1, 'laag': 2, None: 3}
+    inzichten.sort(key=lambda x: rel_order.get(x.get('relevantie'), 3))
+
+    logger.info(f"PREMIUM INZICHTEN: {len(inzichten)} inzichten berekend")
+    for iz in inzichten:
+        logger.info(f"  [{iz['relevantie']}] {iz['titel']}: {iz.get('waarde')}")
+
+    return inzichten
+
+
 def _log_classificatie_kwaliteit(df: pd.DataFrame) -> dict:
     """Log een samenvatting van classificatie-kwaliteit.
 
@@ -5528,6 +5779,151 @@ class RapportPDF(FPDF):
         self.cell(180, 4, 'Dit rapport is uitsluitend bedoeld als financieel inzicht en vormt geen financieel advies.', 0, 1, 'C')
         self.cell(180, 4, 'Raadpleeg altijd een erkend financieel adviseur voor persoonlijke beslissingen.', 0, 0, 'C')
 
+    def strategic_insights_page(self, premium_inzichten: list, kengetallen: dict):
+        """Pagina 2: Strategische inzichten — premium analyses die een adviseur zou geven.
+
+        Portrait A4. Toont de berekende premium inzichten in een visueel
+        aantrekkelijk format met relevantie-indicators.
+        """
+        self.add_page('P')
+
+        # Kleine header
+        y = 14
+
+        # Sectietitel
+        self.set_font(self.HEADING, '', 18)
+        self.set_text_color(*INK)
+        self.set_xy(15, y)
+        self.cell(0, 10, 'Strategische Inzichten', 0, 1, 'L')
+        y += 10
+
+        # Gouden lijn onder titel
+        self.set_draw_color(*GOLD)
+        self.set_line_width(0.6)
+        self.line(15, y, 55, y)
+        y += 4
+
+        # Subtitel
+        self.set_font(self.BODY, 'I', 9)
+        self.set_text_color(*INK_SOFT)
+        self.set_xy(15, y)
+        self.cell(0, 5, 'Analyses op basis van uw transactiedata \u2014 berekend, niet geschat.', 0, 1, 'L')
+        y += 10
+
+        # Kengetallen strip bovenaan
+        keng_items = []
+        if 'spaarquote' in kengetallen:
+            keng_items.append(('Spaarquote', f"{kengetallen['spaarquote']:.0f}%"))
+        if 'vaste_lasten_ratio' in kengetallen:
+            keng_items.append(('Vaste lasten', f"{kengetallen['vaste_lasten_ratio']:.0f}%"))
+        if 'n_inkomstenbronnen' in kengetallen:
+            keng_items.append(('Inkomensbronnen', f"{kengetallen['n_inkomstenbronnen']}"))
+        if kengetallen.get('vermogensopbouw_pm', 0) > 0:
+            keng_items.append(('Opbouw p/m', f"\u20ac{kengetallen['vermogensopbouw_pm']:,.0f}"))
+        if kengetallen.get('inkomen_stabiliteit') is not None:
+            keng_items.append(('Stabiliteit', f"{kengetallen['inkomen_stabiliteit']:.0f}%"))
+
+        if keng_items:
+            # Lichtgrijze achtergrond strip
+            strip_h = 16
+            self.set_fill_color(245, 245, 248)
+            self.rect(15, y, 180, strip_h, 'F')
+
+            n_items = len(keng_items)
+            item_w = 180 / n_items
+            for i, (label, waarde) in enumerate(keng_items):
+                x = 15 + i * item_w
+                # Waarde
+                self.set_font(self.DATA, 'B', 12)
+                self.set_text_color(*ACCENT)
+                self.set_xy(x, y + 1)
+                self.cell(item_w, 7, waarde, 0, 0, 'C')
+                # Label
+                self.set_font(self.DATA, '', 7)
+                self.set_text_color(*INK_SOFT)
+                self.set_xy(x, y + 8)
+                self.cell(item_w, 5, label, 0, 0, 'C')
+
+            y += strip_h + 8
+
+        # Relevantie kleuren
+        REL_COLORS = {
+            'hoog': (201, 168, 76),    # Goud
+            'medium': (31, 92, 139),    # Accent blauw
+            'laag': (130, 140, 155),    # Grijs
+        }
+
+        # Inzichten cards
+        for iz in premium_inzichten:
+            rel = iz.get('relevantie', 'laag')
+            rel_kleur = REL_COLORS.get(rel, REL_COLORS['laag'])
+
+            # Check of we voldoende ruimte hebben (anders nieuwe pagina)
+            if y > 240:
+                self.add_page('P')
+                y = 14
+
+            # Verticale kleur-indicator links
+            card_start_y = y
+            self.set_fill_color(*rel_kleur)
+            self.rect(15, y, 2, 24, 'F')
+
+            # Titel
+            self.set_font(self.DATA, 'B', 10)
+            self.set_text_color(*INK)
+            self.set_xy(20, y)
+            self.cell(140, 5, iz['titel'], 0, 0, 'L')
+
+            # Relevantie badge rechts
+            badge_text = rel.upper() if rel else ''
+            if badge_text:
+                self.set_font(self.DATA, 'B', 6.5)
+                self.set_text_color(*rel_kleur)
+                badge_w = self.get_string_width(badge_text) + 6
+                self.set_xy(195 - badge_w, y + 0.5)
+                self.set_draw_color(*rel_kleur)
+                self.set_line_width(0.3)
+                self.rect(195 - badge_w, y + 0.5, badge_w, 4, 'D')
+                self.cell(badge_w, 4, badge_text, 0, 0, 'C')
+
+            y += 6
+
+            # Beschrijving
+            self.set_font(self.BODY, '', 8.5)
+            self.set_text_color(*INK)
+            self.set_xy(20, y)
+            self.multi_cell(170, 4.2, iz['beschrijving'], 0, 'L')
+            y = self.get_y() + 1.5
+
+            # Detail regel (kleiner, grijs)
+            if iz.get('detail'):
+                self.set_font(self.DATA, '', 7)
+                self.set_text_color(*INK_SOFT)
+                self.set_xy(20, y)
+                self.multi_cell(170, 3.5, iz['detail'], 0, 'L')
+                y = self.get_y() + 1
+
+            # Pas verticale indicator aan op werkelijke hoogte
+            card_h = y - card_start_y
+            self.set_fill_color(*rel_kleur)
+            self.rect(15, card_start_y, 2, card_h, 'F')
+
+            # Subtiele scheidslijn
+            y += 3
+            self.set_draw_color(*BORDER)
+            self.set_line_width(0.15)
+            self.line(20, y, 190, y)
+            y += 5
+
+        # Disclaimer onderaan
+        if y < 250:
+            self.set_y(265)
+        else:
+            self.set_y(self.get_y() + 10)
+        self.set_font(self.DATA, '', 6.5)
+        self.set_text_color(*INK_SOFT)
+        self.cell(180, 4, 'Deze inzichten zijn berekend uit uw transactiedata en vormen geen persoonlijk financieel advies.', 0, 0, 'C')
+
     def categorie_overzicht_page(self, ground_truth: dict):
         """Maandelijks cashflow-overzicht op landscape pagina(s).
 
@@ -6229,11 +6625,19 @@ def genereer_pdf(rapport: dict) -> bytes:
     pdf.cover_page(feiten, datum, jaartotalen=jaartotalen, maandoverzicht=maandoverzicht,
                    ground_truth=ground_truth, gate=gate)
 
-    # Pagina 1b: Categorie-overzicht (alle inkomsten & uitgaven)
+    # Pagina 2: Strategische premium inzichten
+    if ground_truth:
+        strat = ground_truth.get('strategische_inzichten', {})
+        kengetallen = strat.get('kengetallen', {})
+        premium_inzichten = ground_truth.get('premium_inzichten', [])
+        if premium_inzichten:
+            pdf.strategic_insights_page(premium_inzichten, kengetallen)
+
+    # Pagina 3: Categorie-overzicht / cashflow tabel
     if ground_truth and ground_truth.get('categorie_totalen_12m'):
         pdf.categorie_overzicht_page(ground_truth)
 
-    # Rapport is nu exact 2 pagina's: cover + categorie-overzicht
+    # Rapport: 3 pagina's — cover + strategische inzichten + cashflow tabel
 
     return pdf.output()
 
@@ -7403,6 +7807,12 @@ def _run_rapport_pipeline(job_id: str, bestanden: list, email: str):
         strategische_inzichten = _genereer_strategische_inzichten(ground_truth, df)
         ground_truth['strategische_inzichten'] = strategische_inzichten
         logger.info(f"[{job_id}] Strategische inzichten: {len(strategische_inzichten.get('signalen', []))} signalen")
+
+        # 4a3. Premium inzichten berekenen (pagina 2 van PDF)
+        update('Premium inzichten berekenen...', 74)
+        premium_inzichten = _bereken_premium_inzichten(ground_truth, df)
+        ground_truth['premium_inzichten'] = premium_inzichten
+        logger.info(f"[{job_id}] Premium inzichten: {len(premium_inzichten)} inzichten")
 
         # 4b. V3: Reconciliatie Excel genereren
         update('Reconciliatie Excel genereren...', 74)

@@ -2009,13 +2009,128 @@ MERCHANT_MAPPING = [
     # op basis van bidirectionele geldstromen met persoonsnamen.
 ]
 
+# Normalisatie-mapping: vertaal registry-categorieën naar de canonieke prompt-taxonomie
+# De merchant_registry.py gebruikt soms andere/bredere categorienamen dan de AI-prompt.
+# Zonder deze mapping belanden transacties in onbekende categorieën die als "Overig" tellen.
+_CATEGORIE_NORMALISATIE = {
+    # variabele_kosten
+    'Horeca/Restaurants': 'Restaurant/Uit eten',
+    'Kleding/Schoenen': 'Kleding',
+    'Gezondheid/Apotheek': 'Apotheek/Medicijnen',
+    'Entertainment/Vrije tijd': 'Uitjes/Attracties/Bioscoop',
+    'Wonen/Interieur': 'Meubels/Inrichting',
+    'Auto/Mobiliteit': 'Auto-onderhoud/APK',
+    'Openbaar vervoer': 'OV/Trein',
+    'Cadeaus/Donaties': 'Cadeaus',
+    'Persoonlijke verzorging': 'Huishoudelijke artikelen',
+    # vaste_lasten
+    'Abonnementen/Lidmaatschappen': 'Overige abonnementen',
+    'Verzekeringen': 'Overige verzekeringen',
+    'Gemeentelijke heffingen': 'Gemeentebelasting/OZB/Waterschapsbelasting',
+    'Telecom/Internet': 'Internet/TV',
+    'Kinderopvang': 'Kinderopvang/BSO/School',
+    'Onderwijs': 'Kinderopvang/BSO/School',
+}
+
+# Remap specifieke "Overig variabel" entries naar juiste categorieën
+_OVERIG_REMAP = {
+    # Webshops → specifieke categorieën
+    'TEMU': ('variabele_kosten', 'Huishoudelijke artikelen', 0.80),
+    'ETSY': ('variabele_kosten', 'Huishoudelijke artikelen', 0.80),
+    'MARKTPLAATS': ('variabele_kosten', 'Huishoudelijke artikelen', 0.78),
+    'EBAY': ('variabele_kosten', 'Huishoudelijke artikelen', 0.78),
+    'THUISWINKEL': ('variabele_kosten', 'Huishoudelijke artikelen', 0.75),
+    'BOL COM': ('variabele_kosten', 'Elektronica/Gadgets', 0.82),
+    'OTTO': ('variabele_kosten', 'Huishoudelijke artikelen', 0.80),
+    'HEMA ONLINE': ('variabele_kosten', 'Huishoudelijke artikelen', 0.85),
+    # Post/pakketdiensten → Huishoudelijke artikelen (verzendkosten)
+    'POSTNL': ('variabele_kosten', 'Huishoudelijke artikelen', 0.78),
+    'POST NL': ('variabele_kosten', 'Huishoudelijke artikelen', 0.78),
+    'DHL': ('variabele_kosten', 'Huishoudelijke artikelen', 0.78),
+    'UPS': ('variabele_kosten', 'Huishoudelijke artikelen', 0.78),
+    'FEDEX': ('variabele_kosten', 'Huishoudelijke artikelen', 0.78),
+    'TNT EXPRESS': ('variabele_kosten', 'Huishoudelijke artikelen', 0.78),
+    'GLS': ('variabele_kosten', 'Huishoudelijke artikelen', 0.78),
+    'DPD': ('variabele_kosten', 'Huishoudelijke artikelen', 0.78),
+    'BUDBEE': ('variabele_kosten', 'Huishoudelijke artikelen', 0.78),
+    'BRENGER': ('variabele_kosten', 'Huishoudelijke artikelen', 0.78),
+    'BRIEVENBUSPAKKET': ('variabele_kosten', 'Huishoudelijke artikelen', 0.78),
+    # Boekhandels → Boeken/Media
+    'THE READ SHOP': ('variabele_kosten', 'Boeken/Media', 0.85),
+    'READSHOP': ('variabele_kosten', 'Boeken/Media', 0.85),
+    'BOEKHANDEL': ('variabele_kosten', 'Boeken/Media', 0.82),
+    # Belastingdienst → vaste_lasten (FOUT in registry als variabele_kosten)
+    'BELASTINGDIENST': ('vaste_lasten', 'Inkomstenbelasting/Voorlopige aanslag', 0.85),
+    'BELASTINGAANGIFTE': ('vaste_lasten', 'Inkomstenbelasting/Voorlopige aanslag', 0.80),
+    'INKOMSTENBELASTING': ('vaste_lasten', 'Inkomstenbelasting/Voorlopige aanslag', 0.90),
+    'AANGIFTELOON': ('vaste_lasten', 'Inkomstenbelasting/Voorlopige aanslag', 0.80),
+    'ANF VOOR STAKINGSUITKERINGEN': ('vaste_lasten', 'Inkomstenbelasting/Voorlopige aanslag', 0.75),
+    'NETTO LOONBELASTINGEN': ('vaste_lasten', 'Inkomstenbelasting/Voorlopige aanslag', 0.80),
+    'TOESLAGEN': ('inkomsten', 'Toeslagen', 0.85),
+    # Professionele diensten → Overige vaste lasten (niet variabel)
+    'ACCOUNTANT': ('vaste_lasten', 'Overige vaste lasten', 0.82),
+    'ACCOUNTANTSKANTOOR': ('vaste_lasten', 'Overige vaste lasten', 0.82),
+    'ADMINISTRATIE': ('vaste_lasten', 'Overige vaste lasten', 0.75),
+    'ADMINISTRATIEKANTOOR': ('vaste_lasten', 'Overige vaste lasten', 0.82),
+    'BOEKHOUDER': ('vaste_lasten', 'Overige vaste lasten', 0.85),
+    'BELASTINGADVISEUR': ('vaste_lasten', 'Overige vaste lasten', 0.85),
+    'FINANCIEEL ADVISEUR': ('vaste_lasten', 'Overige vaste lasten', 0.82),
+    'FINANCIAL ADVISOR': ('vaste_lasten', 'Overige vaste lasten', 0.82),
+    'VERZEKERINGSADVISEUR': ('vaste_lasten', 'Overige vaste lasten', 0.82),
+    'HYPOTHEEKADVIES': ('vaste_lasten', 'Overige vaste lasten', 0.82),
+    # Juridisch → Overige vaste lasten
+    'ADVOCAAT': ('vaste_lasten', 'Overige vaste lasten', 0.82),
+    'ADVOKAAT KANTOOR': ('vaste_lasten', 'Overige vaste lasten', 0.82),
+    'JURIDISCH ADVIES': ('vaste_lasten', 'Overige vaste lasten', 0.82),
+    'JURIDISCH': ('vaste_lasten', 'Overige vaste lasten', 0.80),
+    'NOTARIS': ('vaste_lasten', 'Overige vaste lasten', 0.82),
+    'NOTARISKANTOOR': ('vaste_lasten', 'Overige vaste lasten', 0.82),
+    'GERECHTSDEURWAARDER': ('vaste_lasten', 'Overige vaste lasten', 0.85),
+    # Makelaar → Onderhoud woning (makelen is woonkosten-gerelateerd)
+    'MAKELAAR': ('variabele_kosten', 'Onderhoud woning/Klussen', 0.80),
+    'MAKELAARDIJ': ('variabele_kosten', 'Onderhoud woning/Klussen', 0.80),
+    # Dienstverlening → specifieke categorieën
+    'TUINMAN': ('variabele_kosten', 'Tuin/Buiten', 0.82),
+    'INSTALLATEUR': ('variabele_kosten', 'Onderhoud woning/Klussen', 0.82),
+    'STOMERIJ': ('variabele_kosten', 'Huishoudelijke artikelen', 0.85),
+    'WASSERETTE': ('variabele_kosten', 'Huishoudelijke artikelen', 0.85),
+    'DRUKKERIJ': ('variabele_kosten', 'Huishoudelijke artikelen', 0.80),
+    'COPYSHOP': ('variabele_kosten', 'Huishoudelijke artikelen', 0.80),
+    # Bank → vaste_lasten
+    'BANK': ('vaste_lasten', 'Bankkosten', 0.70),
+    'BANKGEBUREN': ('vaste_lasten', 'Bankkosten', 0.85),
+    'RENTEBETALING': ('vaste_lasten', 'Overige vaste lasten', 0.75),
+    'RENTE': ('vaste_lasten', 'Overige vaste lasten', 0.70),
+    'LENING': ('vaste_lasten', 'Overige vaste lasten', 0.75),
+    # Advies generiek → laat AI beslissen (te breed)
+    'ADVIES': None,  # skip, te generiek
+}
+
 # Extend met MEGA_MERCHANT_MAPPING (1451 extra merchants)
 try:
     from merchant_registry import MEGA_MERCHANT_MAPPING
     _existing_terms = set(z for z, _, _, _ in MERCHANT_MAPPING)
-    _extra = [(z, s, c, conf) for z, s, c, conf in MEGA_MERCHANT_MAPPING if z not in _existing_terms]
+    _n_remapped = 0
+    _n_normalized = 0
+    _extra = []
+    for z, s, c, conf in MEGA_MERCHANT_MAPPING:
+        if z in _existing_terms:
+            continue
+        # Stap 1: Remap "Overig variabel" entries naar specifieke categorieën
+        if z in _OVERIG_REMAP:
+            remap = _OVERIG_REMAP[z]
+            if remap is None:
+                continue  # Skip deze entry (te generiek)
+            s, c, conf = remap
+            _n_remapped += 1
+        # Stap 2: Normaliseer registry-categorienamen naar prompt-taxonomie
+        elif c in _CATEGORIE_NORMALISATIE:
+            c = _CATEGORIE_NORMALISATIE[c]
+            _n_normalized += 1
+        _extra.append((z, s, c, conf))
     MERCHANT_MAPPING.extend(_extra)
-    logger.info(f"Merchant registry geladen: {len(_extra)} extra merchants, totaal {len(MERCHANT_MAPPING)}")
+    logger.info(f"Merchant registry geladen: {len(_extra)} extra merchants "
+                f"({_n_remapped} remapped, {_n_normalized} normalized), totaal {len(MERCHANT_MAPPING)}")
 except ImportError:
     logger.warning("merchant_registry.py niet gevonden, alleen basis MERCHANT_MAPPING actief")
 
@@ -2127,34 +2242,114 @@ def _classificeer_rule_based(df: pd.DataFrame) -> pd.DataFrame:
                     n_geclassificeerd += 1
                     break
 
-    # Ntropy fallback: voor transacties die MERCHANT_MAPPING niet pakt,
-    # gebruik Ntropy-hint als die beschikbaar is (confidence 0.70)
-    # BELANGRIJK: alleen voor UITGAANDE transacties (expenses). Inkomende transacties
-    # worden beter afgehandeld door onze eigen detectoren (salaris, huur, uitkering)
-    # die specifiek getraind zijn op Nederlands bankverkeer. Ntropy is sterk in
-    # merchant-herkenning (Albert Heijn, Ziggo) maar niet in NL salarispatronen.
-    n_ntropy_used = 0
+    # Keyword-heuristieken: voor transacties die MERCHANT_MAPPING niet pakt,
+    # kijk naar generieke Nederlandse trefwoorden in de bankomschrijving.
+    # Dit pakt lokale/regionale merchants op die niet in de registry staan.
+    # Alleen voor UITGAANDE transacties (expenses).
+    _KEYWORD_HEURISTIEKEN = [
+        # --- VASTE LASTEN ---
+        # Verzekeringen (generiek)
+        (['VERZEKERING', 'INSURANCE', 'VERZEKERAAR', 'POLIS'], 'vaste_lasten', 'Overige verzekeringen', 0.80),
+        (['ZORGVERZEKERING', 'ZORGPREMIE', 'ZORGPOLIS'], 'vaste_lasten', 'Zorgverzekering', 0.90),
+        (['AUTOVERZEKERING', 'MOTORVERZEKERING', 'WA VERZEKERING', 'CASCO'], 'vaste_lasten', 'Autoverzekering', 0.90),
+        (['INBOEDEL', 'WOONVERZEKERING', 'OPSTALVERZEKERING', 'WOONHUISVERZEKERING'], 'vaste_lasten', 'Woonverzekering/Inboedel', 0.90),
+        (['UITVAART'], 'vaste_lasten', 'Overige verzekeringen', 0.90),
+        (['RECHTSBIJSTAND', 'AANSPRAKELIJKHEID', 'AVP'], 'vaste_lasten', 'Overige verzekeringen', 0.85),
+        # Energie
+        (['STROOM', 'ELEKTRA', 'ELEKTRICITEIT', 'GASREKENING', 'ENERGIELEVER', 'WARMTENET', 'WARMTELEVERING', 'STADSWARMTE'], 'vaste_lasten', 'Energie', 0.85),
+        # Water
+        (['WATERBEDRIJF', 'DRINKWATER', 'WATERLEIDINGBEDRIJF', 'PWN', 'OASEN', 'BRABANT WATER', 'VITENS', 'EVIDES', 'DUNEA', 'WATERNET'], 'vaste_lasten', 'Water', 0.90),
+        # Belasting / gemeente
+        (['GEMEENTEBELASTING', 'GEMEENTELIJKE BELASTING', 'GBLT', 'WATERSCHAP', 'WATERSCHAPSBELASTING', 'OZB', 'RIOOLHEFFING', 'AFVALSTOFFENHEFFING'], 'vaste_lasten', 'Gemeentebelasting/OZB/Waterschapsbelasting', 0.90),
+        (['GEMEENTE ', 'GEMEENTEHUIS'], 'vaste_lasten', 'Gemeentebelasting/OZB/Waterschapsbelasting', 0.75),
+        # Telecom
+        (['GLASVEZEL', 'FIBER', 'INTERNET BETALING'], 'vaste_lasten', 'Internet/TV', 0.85),
+        (['MOBIEL ABONNEMENT', 'SIMONLY', 'SIM ONLY'], 'vaste_lasten', 'Mobiele telefonie', 0.90),
+        # Kinderopvang
+        (['KINDEROPVANG', 'KINDERDAGVERBLIJF', 'KDV ', 'BSO ', 'BUITENSCHOOLSE', 'PEUTERSPEELZAAL', 'GASTOUDER', 'GASTOUDERBUREAU'], 'vaste_lasten', 'Kinderopvang/BSO/School', 0.90),
+        (['SCHOOLGELD', 'OUDERBIJDRAGE', 'LEERMIDDELEN'], 'vaste_lasten', 'Kinderopvang/BSO/School', 0.85),
+        # Contributie / lidmaatschap
+        (['CONTRIBUTIE', 'LIDMAATSCHAP', 'VERENIGING', 'SPORTVERENIGING'], 'vaste_lasten', 'Contributie/Lidmaatschap', 0.80),
+        # Donaties
+        (['DONATIE', 'SCHENKING', 'GOED DOEL', 'GOEDE DOEL', 'CHARITY', 'GIFTEN'], 'vaste_lasten', 'Donaties/Goede doelen', 0.85),
+        (['OXFAM', 'UNICEF', 'RODE KRUIS', 'ARTSEN ZONDER GRENZEN', 'AMNESTY', 'GREENPEACE', 'WWF', 'CLINICLOWNS', 'KIKA', 'WARCHILD', 'WAR CHILD', 'PLAN INTERNATIONAL', 'SOS KINDERDORPEN', 'STICHTING VLUCHTELING'], 'vaste_lasten', 'Donaties/Goede doelen', 0.92),
+        # Bankkosten
+        (['BANKKOSTEN', 'BETAALPAKKET', 'REKENINGKOSTEN', 'SERVICEKOSTEN REKENING'], 'vaste_lasten', 'Bankkosten', 0.95),
+        # Abonnementen
+        (['ABONNEMENT', 'SUBSCRIPTION', 'MAANDELIJKS BEDRAG'], 'vaste_lasten', 'Overige abonnementen', 0.75),
+        # Hypotheek / huur
+        (['HYPOTHEEK', 'MORTGAGE'], 'vaste_lasten', 'Hypotheek/Huur', 0.90),
+        (['HUUR WONING', 'HUURPRIJS', 'HUURBETALING', 'MAANDHUUR'], 'vaste_lasten', 'Hypotheek/Huur', 0.85),
+
+        # --- VARIABELE KOSTEN ---
+        # Medisch
+        (['TANDARTS', 'TANDARTSENPRAKTIJK', 'DENTAL', 'MONDHYGIEN'], 'variabele_kosten', 'Huisarts/Tandarts/Specialist', 0.92),
+        (['HUISARTS', 'HUISARTSENPRAKTIJK', 'DOKTER', 'DOKTERSPRAKTIJK', 'MEDISCH CENTRUM'], 'variabele_kosten', 'Huisarts/Tandarts/Specialist', 0.90),
+        (['APOTHEEK', 'PHARMACY', 'FARMACEUTISCH'], 'variabele_kosten', 'Apotheek/Medicijnen', 0.92),
+        (['ZIEKENHUIS', 'HOSPITAL', 'KLINIEK', 'CLINIC', 'POLIKLINIEK'], 'variabele_kosten', 'Ziekenhuiskosten/Eigen risico', 0.90),
+        (['FYSIOTHERAP', 'FYSIO ', 'OSTEOPATH', 'CHIROPRACT', 'ACUPUNCT', 'HOMEOPATH'], 'variabele_kosten', 'Fysiotherapie/Alternatief', 0.90),
+        (['OPTICI', 'OPTICIEN', 'BRILLEN', 'SPECSAVERS', 'HANS ANDERS', 'PEARL OPTICIENS', 'EYE WISH', 'CONTACTLENZEN'], 'variabele_kosten', 'Brillen/Lenzen', 0.90),
+        # Sport / fitness
+        (['FITNESS', 'SPORTSCHOOL', 'GYM ', 'BASIC FIT', 'ANYTIME FITNESS', 'FIT FOR FREE', 'TRAININGCENTR'], 'variabele_kosten', 'Sport/Fitness', 0.90),
+        # Auto
+        (['GARAGE', 'APK ', 'AUTO-ONDERHOUD', 'AUTOSERVICE', 'BANDENCENTR', 'KWIK FIT', 'EUROMASTER', 'PROFILE TYRECENTER'], 'variabele_kosten', 'Auto-onderhoud/APK', 0.85),
+        (['PARKEERGARAGE', 'PARKEERGELD', 'PARKEERAUTOMAAT', 'Q-PARK', 'APCOA', 'YELLOWBRICK', 'PARKMOBILE'], 'variabele_kosten', 'Parkeren', 0.90),
+        # Woning
+        (['BOUWMARKT', 'HORNBACH', 'KARWEI', 'PRAXIS', 'GAMMA'], 'variabele_kosten', 'Onderhoud woning/Klussen', 0.85),
+        (['TUINCENTR', 'INTRATUIN', 'GROENRIJK'], 'variabele_kosten', 'Tuin/Buiten', 0.88),
+        (['MEUBEL', 'IKEA', 'SLAAPKAMER', 'MATRAS', 'BEDDENGOED'], 'variabele_kosten', 'Meubels/Inrichting', 0.85),
+        # Eten & drinken
+        (['RESTAURANT', 'RISTORANTE', 'BRASSERIE', 'BISTRO', 'EETCAFE'], 'variabele_kosten', 'Restaurant/Uit eten', 0.88),
+        (['CAFE ', 'CAFÉ', 'BAR ', 'KROEG', 'PUB '], 'variabele_kosten', 'Café/Drinken', 0.80),
+        # Kleding
+        (['H&M', 'ZARA', 'C&A', 'PRIMARK', 'WE FASHION', 'ONLY ', 'VERO MODA', 'JACK & JONES', 'UNIQLO', 'NIKE STORE', 'ADIDAS STORE'], 'variabele_kosten', 'Kleding', 0.88),
+        (['KLEDINGWINKEL', 'FASHION', 'MODE '], 'variabele_kosten', 'Kleding', 0.75),
+        (['SCHOENENWINKEL', 'SCHOENEN', 'NELSON', 'VAN HAREN', 'SHOE', 'FOOTLOCKER'], 'variabele_kosten', 'Schoenen', 0.85),
+        # Cadeaus
+        (['CADEAU', 'GIFT', 'HALLMARK', 'GREETZ', 'BLOEMEN', 'FLEUROP', 'BLOEMIST'], 'variabele_kosten', 'Cadeaus', 0.80),
+        # Huisdieren
+        (['DIERENARTS', 'VETERINAIR', 'DIERENKLINIEK', 'DIERENWINKEL', 'PETS PLACE', 'RANZIJN', 'JUMPER DIER'], 'variabele_kosten', 'Huisdieren', 0.90),
+        # Vakantie / reizen
+        (['HOTEL', 'BOOKING.COM', 'AIRBNB', 'HOSTEL', 'RESORT', 'CAMPING', 'VAKANTIEPARK', 'ROOMPOT', 'LANDAL', 'CENTER PARCS', 'CENTERPARCS'], 'variabele_kosten', 'Vakantie/Reizen', 0.88),
+        (['VLIEGTICKET', 'AIRLINE', 'TRANSAVIA', 'KLM ', 'EASYJET', 'RYANAIR', 'CORENDON', 'VUELING', 'SCHIPHOL'], 'variabele_kosten', 'Vakantie/Reizen', 0.90),
+        # School / studie
+        (['UNIVERSITEIT', 'HOGESCHOOL', 'COLLEGEGELD', 'STUDIEBOEK', 'STUDIE', 'CURSUS', 'OPLEIDING', 'WORKSHOP'], 'variabele_kosten', 'School/Studie/Cursussen', 0.85),
+        # Boeken / media
+        (['BOEKHANDEL', 'BOEKWINKEL', 'BRUNA', 'BIBLIOTHEEK', 'READSHOP'], 'variabele_kosten', 'Boeken/Media', 0.85),
+        # Uitjes
+        (['BIOSCOOP', 'CINEMA', 'PATHE', 'KINEPOLIS', 'EFTELING', 'ATTRACTIEPARK', 'DIERENTUIN', 'ARTIS', 'BLIJDORP', 'MUSEUM', 'THEATER', 'SCHOUWBURG', 'CONCERT', 'TICKETMASTER', 'EVENTIM'], 'variabele_kosten', 'Uitjes/Attracties/Bioscoop', 0.88),
+        # Terugbetaling (positieve bedragen van winkels)
+        (['RETOUR', 'REFUND', 'STORNO', 'TERUGBETALING', 'RESTITUTIE', 'CREDITNOTA'], 'variabele_kosten', 'Terugbetaling/Refund', 0.80),
+    ]
+
+    n_keyword_used = 0
     for idx, row in df.iterrows():
         if row.get('classificatie_bron') is not None:
-            continue  # Al geclassificeerd door rule of als intern
+            continue  # Al geclassificeerd
         if row.get('is_intern', False):
             continue
-        # Alleen uitgaande transacties — inkomende laten we aan salaris/huur/uitkering-detectie
         bedrag = float(row.get('bedrag', 0))
         if bedrag > 0:
-            continue  # Positieve (inkomende) transactie → skip, eigen detectoren zijn beter
-        ntropy_sectie = row.get('ntropy_sectie', '')
-        ntropy_cat = row.get('ntropy_categorie', '')
-        if ntropy_sectie and ntropy_cat:
-            df.at[idx, 'regel_sectie'] = ntropy_sectie
-            df.at[idx, 'regel_categorie'] = ntropy_cat
-            df.at[idx, 'regel_confidence'] = 0.70  # Ntropy-hint, lager dan onze eigen rules
-            df.at[idx, 'classificatie_bron'] = 'rule'  # Telt als rule-based (niet AI)
-            n_ntropy_used += 1
+            continue  # Positieve (inkomende) transactie → skip, eigen detectoren
+        omschr = str(row.get('Omschrijving', '')).upper()
+        best_match = None
+        best_confidence = 0
+        for keywords, sectie, categorie, confidence in _KEYWORD_HEURISTIEKEN:
+            for kw in keywords:
+                if kw in omschr and confidence > best_confidence:
+                    best_match = (sectie, categorie, confidence)
+                    best_confidence = confidence
+                    break
+        if best_match:
+            df.at[idx, 'regel_sectie'] = best_match[0]
+            df.at[idx, 'regel_categorie'] = best_match[1]
+            df.at[idx, 'regel_confidence'] = best_match[2]
+            df.at[idx, 'classificatie_bron'] = 'rule'
+            n_keyword_used += 1
             n_geclassificeerd += 1
 
-    if n_ntropy_used > 0:
-        logger.info(f"NTROPY-FALLBACK: {n_ntropy_used} uitgaande transacties geclassificeerd via Ntropy-hint")
+    if n_keyword_used > 0:
+        logger.info(f"KEYWORD-HEURISTIEK: {n_keyword_used} uitgaande transacties geclassificeerd via trefwoorden")
 
     # Statistieken
     n_totaal = len(df[~df.get('is_intern', False)])
@@ -4096,8 +4291,12 @@ Hieronder staan {len(df_ai_only)} banktransacties die JIJ moet classificeren.
 ## REGELS
 1. Categoriseer ELKE transactie in precies één categorie uit onderstaande lijst.
    Gebruik EXACT deze categorienamen (niet afwijken, niet samenvoegen, niet verzinnen).
-   "Overig" categorieën mogen MAXIMAAL 5% van het totaalbedrag per sectie bevatten.
-   SPECIFIEK VOOR "Overig inkomen": dit mag MAXIMAAL 10% van totaal inkomsten zijn.
+   "Overig" categorieën zijn een LAATSTE REDMIDDEL en mogen MAXIMAAL 3% van het totaalbedrag per sectie bevatten.
+   ALS JE TWIJFELT: kies de MEEST WAARSCHIJNLIJKE specifieke categorie. Overig is FOUT tenzij het echt nergens past.
+   DENK NA: elke transactie heeft een tegenpartij met een naam. Zoek de naam op in de omschrijving en bepaal
+   het type bedrijf. Een verzekering → juiste verzekeringscategorie. Een winkel → juiste winkelcategorie.
+   Een medische praktijk → juiste medische categorie. Wees niet lui met "Overig".
+   SPECIFIEK VOOR "Overig inkomen": dit mag MAXIMAAL 5% van totaal inkomsten zijn.
    Als een positief bedrag niet duidelijk van een werkgever/overheid/huurder komt:
    → Geld van een B.V./bedrijf met regelmatig patroon → Freelance/Opdrachten
    → Geld terug van een bedrijf waar je eerder betaalde → Terugbetaling/Refund (variabele_kosten)
@@ -4275,6 +4474,18 @@ Gebruik deze kenmerken om het TYPE belasting te bepalen:
 - Elke transactie met een herkenbare tegenpartij MOET in een specifieke categorie, NOOIT in "Overig".
 - Bekijk het bedrag: kleine bedragen bij een onbekende tegenpartij passen vaak bij Boodschappen, Huishoudelijke artikelen, of Café. Grotere bedragen bij onbekenden passen vaak bij Onderhoud woning, Meubels, of Vakantie.
 - BV-eigendom: zeg ALLEEN "uw BV" als de BV voorkomt in de CATEGORISATIE-HINTS als eigen BV van de gebruiker. Als een BV NIET in de hints staat, beschrijf dan alleen de feitelijke geldstroom zonder eigendom aan te nemen. Een betaling AAN een BV betekent NIET dat de gebruiker eigenaar is.
+
+## ANTI-OVERIG PROTOCOL
+Voordat je een transactie als "Overige vaste lasten", "Overig variabel", of "Overig inkomen" classificeert,
+doorloop je VERPLICHT deze checklist:
+1. Staat er een bedrijfsnaam in de omschrijving? → Zoek wat voor bedrijf het is.
+2. Bevat de omschrijving een aanwijzing? (verzekering, tandarts, apotheek, garage, school, etc.)
+3. Is het een BEA/GEA transactie? → Kijk naar de locatie/winkelnaam erna.
+4. Komt dezelfde tegenpartij vaker voor? → Kijk naar het patroon (vast bedrag = vaste lasten, wisselend = variabel).
+5. Wat is het bedrag? Klein (< €50) bij onbekend → waarschijnlijk Boodschappen of Huishoudelijke artikelen.
+   Middelgroot (€50-€500) → waarschijnlijk Onderhoud/Klussen, Meubels, Kleding, of Elektronica.
+   Groot (> €500) → waarschijnlijk Vakantie, Auto-onderhoud, of Meubels/Inrichting.
+ALLEEN als je na alle 5 stappen ECHT geen categorie kunt vinden, mag je "Overig" gebruiken.
 
 ## TOP TEGENPARTIJEN
 {json.dumps(top, indent=2, ensure_ascii=False)}
@@ -6852,11 +7063,11 @@ def _no_send_gate(ground_truth: dict, reconciliatie: dict, analyse: dict,
     # Drempels per sectie: inkomsten strenger (geld moet kloppen),
     # variabele kosten soepeler (veel kleine transacties)
     _OVERIG_DREMPELS = {
-        'inkomsten':         (0.15, 0.35),  # >15% ORANGE, >35% RED
-        'vaste_lasten':      (0.20, 0.40),  # veel kleine verzekeringen/heffingen
-        'variabele_kosten':  (0.25, 0.50),  # variabel heeft van nature veel "overig"
-        'sparen_beleggen':   (0.15, 0.40),
-        'onderling_neutraal': (0.30, 0.60),
+        'inkomsten':         (0.10, 0.25),
+        'vaste_lasten':      (0.10, 0.30),
+        'variabele_kosten':  (0.15, 0.40),
+        'sparen_beleggen':   (0.10, 0.30),
+        'onderling_neutraal': (0.20, 0.50),
     }
     cat_totalen = ground_truth.get('categorie_totalen_12m', {})
     sectie_totalen = ground_truth.get('sectie_totalen_12m', {})
@@ -6865,8 +7076,18 @@ def _no_send_gate(ground_truth: dict, reconciliatie: dict, analyse: dict,
         if totaal_sectie < 100:
             continue
         overig_bedrag = 0
+        # Alleen de echte catch-all "Overig" categorieën tellen als onbekend.
+        # "Overige verzekeringen", "Overige abonnementen", "Overige belastingen" zijn
+        # specifieke categorieën uit de taxonomie en tellen NIET als onbekend.
+        _ECHTE_OVERIG_CATS = {
+            'overige vaste lasten', 'overig vaste lasten',
+            'overig variabel', 'overige variabele kosten',
+            'overig inkomen', 'overige inkomsten',
+            'overig sparen/beleggen', 'overig sparen',
+            'overig', 'overige',
+        }
         for cat, bedrag in cats.items():
-            if cat.lower().startswith('overig'):
+            if cat.lower() in _ECHTE_OVERIG_CATS:
                 overig_bedrag += abs(float(bedrag))
         if totaal_sectie > 0:
             overig_pct = overig_bedrag / totaal_sectie
@@ -6940,7 +7161,7 @@ def _no_send_gate(ground_truth: dict, reconciliatie: dict, analyse: dict,
             maand_data.get(sectie, 0)
             for maand_data in maand_sectie.values()
         )
-        if abs(jaar_totaal) > 10 and abs(maand_som - jaar_totaal) > max(50.0, abs(jaar_totaal) * 0.03):
+        if abs(jaar_totaal) > 10 and abs(maand_som - jaar_totaal) > max(1.0, abs(jaar_totaal) * 0.01):
             kleur = 'RED'
             redenen.append(
                 f"JAARTOTAAL ≠ SOM MAANDEN: {sectie} jaar={jaar_totaal:,.0f} vs som={maand_som:,.0f} "
@@ -7034,17 +7255,10 @@ def _run_rapport_pipeline(job_id: str, bestanden: list, email: str):
         update('Transacties verrijken...', 16)
         df = _verrijk_transactie_velden(df)
 
-        # 1a3. Ntropy enrichment: externe merchant-herkenning + categorie-hint
-        if NTROPY_API_KEY:
-            update('Ntropy enrichment...', 16)
-            df = _ntropy_enrich_batch(df)
-            n_ntropy = (df['ntropy_category'] != '').sum()
-            n_mapped = (df['ntropy_sectie'] != '').sum()
-            update(f'Ntropy: {n_ntropy} verrijkt, {n_mapped} gemapped', 17)
-        else:
-            # Initialiseer lege kolommen zodat rest van pipeline werkt
-            for col in ['ntropy_entity', 'ntropy_category', 'ntropy_sectie', 'ntropy_categorie', 'ntropy_website']:
-                df[col] = ''
+        # 1a3. Ntropy verwijderd — classificatie volledig via eigen MERCHANT_MAPPING + keyword-heuristieken + AI
+        # Initialiseer lege kolommen voor backward compatibility
+        for col in ['ntropy_entity', 'ntropy_category', 'ntropy_sectie', 'ntropy_categorie', 'ntropy_website']:
+            df[col] = ''
 
         # 1b. Huishoudregister & interne-overboekingen detectie
         update('Eigen rekeningen herkennen...', 17)

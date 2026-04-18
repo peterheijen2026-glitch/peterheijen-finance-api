@@ -5572,6 +5572,145 @@ class RapportPDF(FPDF):
         self.cell(180, 4, 'Dit rapport is uitsluitend bedoeld als financieel inzicht en vormt geen financieel advies.', 0, 1, 'C')
         self.cell(180, 4, 'Raadpleeg altijd een erkend financieel adviseur voor persoonlijke beslissingen.', 0, 1, 'C')
 
+    def categorie_overzicht_page(self, ground_truth: dict):
+        """Pagina 2: Volledig categorie-overzicht — alle inkomsten en uitgaven per sectie."""
+        if not ground_truth or not ground_truth.get('categorie_totalen_12m'):
+            return
+
+        self.add_page()
+        self._section_title('Categorie-overzicht')
+
+        cat_totalen = ground_truth['categorie_totalen_12m']
+        n_mnd = max(ground_truth.get('periode', {}).get('n_mnd', 12) or 12, 1)
+
+        # Sectie-volgorde en kleuren
+        _SECTIE_CONFIG = [
+            ('inkomsten',         'Inkomsten',              (26, 107, 60)),    # groen
+            ('vaste_lasten',      'Vaste lasten',           (74, 85, 104)),    # slate
+            ('variabele_kosten',  'Variabele kosten',       (100, 100, 120)),  # grijs-blauw
+            ('sparen_beleggen',   'Sparen & Beleggen',      (26, 90, 140)),    # blauw
+            ('onderling_neutraal','Onderling / Neutraal',   (140, 140, 155)),  # grijs
+        ]
+
+        x0 = 15
+        tabel_w = 180
+        col_cat = 100   # breedte categorie-kolom
+        col_12m = 40    # breedte 12m-kolom
+        col_pm = 40     # breedte p/m-kolom
+        rij_h = 5.5
+
+        # Tabel header
+        y = self.get_y() + 2
+        self.set_fill_color(26, 26, 46)
+        self.rect(x0, y, tabel_w, rij_h + 1, 'F')
+        self.set_font(self.DATA, 'B', 7)
+        self.set_text_color(255, 255, 255)
+        self.set_xy(x0 + 4, y + 1)
+        self.cell(col_cat - 4, rij_h, 'Categorie', 0, 0, 'L')
+        self.set_xy(x0 + col_cat, y + 1)
+        self.cell(col_12m, rij_h, 'Totaal 12m', 0, 0, 'R')
+        self.set_xy(x0 + col_cat + col_12m, y + 1)
+        self.cell(col_pm, rij_h, 'Gem. p/m', 0, 0, 'R')
+        y += rij_h + 1
+
+        for sectie_key, sectie_label, sectie_kleur in _SECTIE_CONFIG:
+            cats = cat_totalen.get(sectie_key, {})
+            if not cats:
+                continue
+
+            # Sectie-totaal berekenen
+            sectie_totaal = sum(float(v) for v in cats.values())
+
+            # Paginagrens check: sectie-header + minstens 2 rijen + totaal
+            needed = rij_h * (min(len(cats), 8) + 2) + 4
+            if y + needed > 270:
+                self.add_page()
+                self._section_title('Categorie-overzicht (vervolg)')
+                y = self.get_y() + 2
+
+            # Sectie-header
+            self.set_fill_color(*sectie_kleur)
+            self.rect(x0, y, tabel_w, rij_h + 0.5, 'F')
+            self.set_font(self.DATA, 'B', 7.5)
+            self.set_text_color(255, 255, 255)
+            self.set_xy(x0 + 4, y + 0.5)
+            self.cell(col_cat - 4, rij_h, sectie_label, 0, 0, 'L')
+            self.set_xy(x0 + col_cat, y + 0.5)
+            self.cell(col_12m, rij_h, eur(sectie_totaal), 0, 0, 'R')
+            self.set_xy(x0 + col_cat + col_12m, y + 0.5)
+            self.cell(col_pm, rij_h, eur(sectie_totaal / n_mnd), 0, 0, 'R')
+            y += rij_h + 0.5
+
+            # Categorieën (gesorteerd op absoluut bedrag, groot → klein)
+            sorted_cats = sorted(cats.items(), key=lambda x: -abs(float(x[1])))
+            even = True
+            for cat, bedrag in sorted_cats:
+                bedrag_f = float(bedrag)
+                if abs(bedrag_f) < 1:
+                    continue
+
+                if y + rij_h > 270:
+                    self.add_page()
+                    self._section_title('Categorie-overzicht (vervolg)')
+                    y = self.get_y() + 2
+
+                # Alternerende achtergrond
+                if even:
+                    self.set_fill_color(247, 246, 242)
+                    self.rect(x0, y, tabel_w, rij_h, 'F')
+                even = not even
+
+                # Dunne lijn
+                self.set_draw_color(230, 228, 220)
+                self.line(x0, y + rij_h, x0 + tabel_w, y + rij_h)
+
+                # Categorie naam
+                self.set_font(self.DATA, '', 7)
+                self.set_text_color(60, 60, 80)
+                self.set_xy(x0 + 8, y + 0.5)
+                self.cell(col_cat - 8, rij_h, cat[:45], 0, 0, 'L')
+
+                # 12m bedrag
+                self.set_font(self.DATA, '', 7)
+                bedrag_kleur = (26, 107, 60) if bedrag_f > 0 else (60, 60, 80)
+                self.set_text_color(*bedrag_kleur)
+                self.set_xy(x0 + col_cat, y + 0.5)
+                self.cell(col_12m, rij_h, eur(bedrag_f), 0, 0, 'R')
+
+                # P/m bedrag
+                self.set_xy(x0 + col_cat + col_12m, y + 0.5)
+                self.cell(col_pm, rij_h, eur(bedrag_f / n_mnd), 0, 0, 'R')
+
+                y += rij_h
+
+            y += 2  # ruimte tussen secties
+
+        # Netto-regel onderaan
+        if y + rij_h + 4 > 270:
+            self.add_page()
+            y = self.get_y() + 2
+
+        netto = sum(
+            sum(float(v) for v in cats.values())
+            for cats in cat_totalen.values()
+        )
+        self.set_draw_color(*GOLD)
+        self.set_line_width(0.6)
+        self.line(x0, y, x0 + tabel_w, y)
+        y += 2
+        self.set_fill_color(247, 246, 242)
+        self.rect(x0, y, tabel_w, rij_h + 1, 'F')
+        self.set_font(self.DATA, 'B', 8)
+        self.set_text_color(26, 26, 46)
+        self.set_xy(x0 + 4, y + 0.5)
+        self.cell(col_cat - 4, rij_h, 'Netto cashflow', 0, 0, 'L')
+        netto_kleur = (26, 107, 60) if netto >= 0 else (200, 0, 0)
+        self.set_text_color(*netto_kleur)
+        self.set_xy(x0 + col_cat, y + 0.5)
+        self.cell(col_12m, rij_h, eur(netto), 0, 0, 'R')
+        self.set_xy(x0 + col_cat + col_12m, y + 0.5)
+        self.cell(col_pm, rij_h, eur(netto / n_mnd), 0, 0, 'R')
+
     def analyse_page(self, analyse: dict):
         """Pagina met AI-analyse: samenvatting, sterke punten, etc."""
         self.add_page()
@@ -6015,6 +6154,10 @@ def genereer_pdf(rapport: dict) -> bytes:
     pdf.add_page()
     pdf.cover_page(feiten, datum, jaartotalen=jaartotalen, maandoverzicht=maandoverzicht,
                    ground_truth=ground_truth, gate=gate)
+
+    # Pagina 1b: Categorie-overzicht (alle inkomsten & uitgaven)
+    if ground_truth and ground_truth.get('categorie_totalen_12m'):
+        pdf.categorie_overzicht_page(ground_truth)
 
     # Pagina 2: Analyse & Inzichten
     if analyse and analyse.get('samenvatting'):

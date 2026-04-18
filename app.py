@@ -5371,9 +5371,13 @@ class RapportPDF(FPDF):
                 if bedrag_pm < 10:
                     continue
                 base_label = _SRC_LABELS.get(sf, sf.replace('_', ' ').title())
+                # Toon de ONTVANGER (van wie is het inkomen), niet de betaler
+                ontvanger = data.get('ontvanger', '')
                 tp = data.get('tegenpartij', '')
-                if tp:
-                    # Verkort tegenpartij: max 18 tekens
+                if ontvanger:
+                    persoon_short = ontvanger[:18].strip()
+                    label = f"{base_label} ({persoon_short})"
+                elif tp:
                     tp_short = tp[:18].strip()
                     label = f"{base_label} ({tp_short})"
                 else:
@@ -6700,6 +6704,49 @@ def _bouw_ground_truth(merged_data: dict, feiten: dict, rapportperiode: dict,
     totaal_eind = sum(f['saldo']['eindsaldo'] for f in feiten.values())
 
     # Income source breakdown (V3: expliciete bronopbouw + confidence)
+    # Stap 1: Bouw rekening → rekeninghouder mapping
+    # De rekeninghouder wordt afgeleid uit INTERNE transfers: bij overboekingen
+    # tussen eigen rekeningen verschijnt de naam van de houder als tegenpartij.
+    rek_naar_persoon = {}  # {rekeningnummer: persoonsnaam}
+    if 'Rekeningnummer' in df.columns and 'tegenpartij_naam' in df.columns:
+        df_intern = df[df.get('is_intern', False)]
+        if len(df_intern) > 0:
+            # Bij interne overboekingen: de tegenpartij_naam = naam rekeninghouder
+            # van de ANDERE rekening. Dus: Tegenrekening → tegenpartij_naam
+            if 'Tegenrekening' in df_intern.columns:
+                for _, row in df_intern.iterrows():
+                    teg_rek = str(row.get('Tegenrekening', '')).strip()
+                    tp_naam = str(row.get('tegenpartij_naam', '')).strip()
+                    if teg_rek and tp_naam and len(tp_naam) >= 3:
+                        # Filter banknamen eruit
+                        tp_lower = tp_naam.lower()
+                        if not any(skip in tp_lower for skip in [
+                            'rekening', 'spaar', 'betaal', 'jongeren', 'tanken',
+                            'ondernemers', 'zakelijk', 'deposito',
+                        ]):
+                            if teg_rek not in rek_naar_persoon:
+                                rek_naar_persoon[teg_rek] = tp_naam
+        # Fallback: als een rekening geen match heeft, probeer de meest
+        # voorkomende tegenpartij_naam bij UITGAANDE interne transfers
+        alle_rekeningen = set(df['Rekeningnummer'].unique())
+        for rek in alle_rekeningen:
+            if rek not in rek_naar_persoon:
+                # Kijk naar uitgaande interne transfers VAN deze rekening
+                rek_intern = df_intern[df_intern['Rekeningnummer'] == rek]
+                if len(rek_intern) > 0 and 'tegenpartij_naam' in rek_intern.columns:
+                    namen = rek_intern['tegenpartij_naam'].dropna()
+                    namen = namen[namen.str.strip() != '']
+                    namen = namen[~namen.str.lower().str.contains(
+                        'rekening|spaar|betaal|jongeren|tanken|ondernemers|zakelijk|deposito',
+                        na=False
+                    )]
+                    if len(namen) > 0:
+                        # Dit is de naam van de ANDERE persoon, niet van deze rekening
+                        # Sla op als "indirect" — we kennen de andere, niet deze
+                        pass
+
+    logger.info(f"Rekening→persoon mapping: {rek_naar_persoon}")
+
     income_sources = {}
     if 'source_family' in df.columns:
         df_income = df[(df['regel_sectie'] == 'inkomsten') & (~df.get('is_intern', False))]
@@ -6707,7 +6754,6 @@ def _bouw_ground_truth(merged_data: dict, feiten: dict, rapportperiode: dict,
             if pd.notna(sf):
                 conf_vals = groep['regel_confidence'].dropna()
                 gem_conf = float(conf_vals.mean()) if len(conf_vals) > 0 else 0.0
-                # Vertrouwenslabel: groen ≥0.80, geel ≥0.50, rood <0.50
                 if gem_conf >= 0.80:
                     vertrouwen = 'hoog'
                 elif gem_conf >= 0.50:
@@ -6721,6 +6767,12 @@ def _bouw_ground_truth(merged_data: dict, feiten: dict, rapportperiode: dict,
                     namen = namen[namen.str.strip() != '']
                     if len(namen) > 0:
                         hoofd_tegenpartij = namen.value_counts().index[0]
+                # Bepaal ONTVANGER: welk huishoudlid ontvangt dit inkomen?
+                # Gebaseerd op welke rekening het binnenkomt
+                ontvanger = ''
+                if 'Rekeningnummer' in groep.columns:
+                    hoofd_rek = groep['Rekeningnummer'].value_counts().index[0]
+                    ontvanger = rek_naar_persoon.get(str(hoofd_rek), '')
                 income_sources[str(sf)] = {
                     'bedrag_12m': round(float(groep['bedrag'].sum()), 2),
                     'transacties': len(groep),
@@ -6728,6 +6780,7 @@ def _bouw_ground_truth(merged_data: dict, feiten: dict, rapportperiode: dict,
                     'gem_confidence': round(gem_conf, 2),
                     'vertrouwen': vertrouwen,
                     'tegenpartij': hoofd_tegenpartij,
+                    'ontvanger': ontvanger,
                 }
 
     # Vertrouwensindicatoren per sectie

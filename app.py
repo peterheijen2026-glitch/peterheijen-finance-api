@@ -1134,8 +1134,9 @@ def _detecteer_huishoudleden(df: pd.DataFrame) -> pd.DataFrame:
 #   Laag 1: Party Resolution — bepaalt WIE de tegenpartij is
 #   Laag 2: Economic Inflow Classification — bepaalt WAT de transactie is
 #
-# Party types: own_account, household_related_party, business_related_party,
-#   known_external_counterparty, unresolved_private_counterparty
+# Counterparty roles (V2): own_account, household_related_party, employer_or_payroll,
+#   business_counterparty, government, merchant, broker_or_investment_platform,
+#   lender_or_mortgage_party, card_settlement, unknown
 #
 # Signaalklassen:
 #   STERK: S2 (multi-IBAN linking), S4 (bidirectioneel), S8 (eigen FI), S10 (merchant)
@@ -1226,13 +1227,20 @@ def extract_achternaam(naam: str) -> str:
 
 def _resolve_related_parties(df: pd.DataFrame, eigen_rekeningen: set,
                              eigen_fi_ibans: set = None) -> pd.DataFrame:
-    """Related Party Resolution — bepaalt party_type per tegenpartij.
+    """Related Party Resolution V2 — bepaalt counterparty_role per tegenpartij.
 
-    Implementeert de RPR v1.3 beslislogica:
-      Fase 1: Definitieve labels (own_account, eigen FI, merchant)
-      Fase 2: Household (vereist STERK signaal S2 of S4)
-      Fase 3: Business-related (S9 + S1 + extra bewijs)
-      Fase 4: Default (known_external of unresolved_private)
+    10 specifieke rollen (Generic Financial Integrity Engine):
+      own_account, household_related_party, employer_or_payroll,
+      business_counterparty, government, merchant,
+      broker_or_investment_platform, lender_or_mortgage_party,
+      card_settlement, unknown
+
+    Implementeert 5-fase beslislogica:
+      Fase 1: Definitieve labels op naam/IBAN (own_account, government, broker,
+              lender, card_settlement, merchant)
+      Fase 2: Household (S2/S4/achternaam+gedrag)
+      Fase 3: Business (S9 rechtsvorm + extra bewijs → employer_or_payroll of business_counterparty)
+      Fase 4: Default (unknown)
 
     Voegt kolom 'party_type' toe aan df.
     """
@@ -1297,7 +1305,7 @@ def _resolve_related_parties(df: pd.DataFrame, eigen_rekeningen: set,
 
     if not heeft_tegenrek:
         logger.info("RPR: geen Tegenrekening kolom — skip party resolution")
-        df.loc[df['party_type'].isna(), 'party_type'] = 'unresolved_private_counterparty'
+        df.loc[df['party_type'].isna(), 'party_type'] = 'unknown'
         return df
 
     # =========================================================
@@ -1345,33 +1353,60 @@ def _resolve_related_parties(df: pd.DataFrame, eigen_rekeningen: set,
     for iban, data in iban_data.items():
         signals = []
 
-        # --- FASE 1: Definitieve labels ---
+        # --- FASE 1: Definitieve labels (naam/IBAN-based) ---
 
-        # own_account: IBAN ∈ eigen_rekeningen
+        # 1A: own_account — IBAN ∈ eigen_rekeningen
         if iban in eigen_rek_norm:
             iban_party_type[iban] = 'own_account'
             signals.append('OWN_ACCOUNT')
             iban_signals[iban] = signals
             continue
 
-        # S8: eigen financieel domein
+        # 1B: broker_or_investment_platform — eigen financieel domein (Saxo, DeGiro, etc.)
         if iban in eigen_fi_ibans:
-            iban_party_type[iban] = 'own_account'
+            iban_party_type[iban] = 'broker_or_investment_platform'
             signals.append('S8_eigen_fi')
             iban_signals[iban] = signals
             continue
 
-        # S10: merchant mapping match
-        is_merchant = False
-        for zoekterm in bekende_merchants_set:
-            if zoekterm in data['omschr_sample']:
-                is_merchant = True
-                break
+        # 1C: government — overheidsinstanties
+        is_government = any(kw in data['omschr_sample'] for kw in OVERHEID_KEYWORDS)
+        if is_government:
+            iban_party_type[iban] = 'government'
+            signals.append('GOVERNMENT_KEYWORD')
+            iban_signals[iban] = signals
+            continue
+
+        # 1D: card_settlement — creditcard-maatschappijen
+        is_card = any(kw in data['omschr_sample'] for kw in CARD_SETTLEMENT_KEYWORDS)
+        if is_card:
+            iban_party_type[iban] = 'card_settlement'
+            signals.append('CARD_SETTLEMENT')
+            iban_signals[iban] = signals
+            continue
+
+        # 1E: broker_or_investment_platform — FI keyword (geen IBAN match maar naam)
+        is_broker = any(kw in data['omschr_sample'] for kw in FINANCIELE_INSTELLINGEN_KEYWORDS)
+        if is_broker:
+            iban_party_type[iban] = 'broker_or_investment_platform'
+            signals.append('BROKER_FI_KEYWORD')
+            iban_signals[iban] = signals
+            continue
+
+        # 1F: lender_or_mortgage_party — hypotheek/leningverstrekkers
+        is_lender = any(kw in data['omschr_sample'] for kw in LENDER_KEYWORDS_COUNTERPARTY)
+        if is_lender:
+            iban_party_type[iban] = 'lender_or_mortgage_party'
+            signals.append('LENDER_KEYWORD')
+            iban_signals[iban] = signals
+            continue
+
+        # 1G: merchant — bekende winkels/dienstverleners
+        is_merchant = any(zoekterm in data['omschr_sample'] for zoekterm in bekende_merchants_set)
         if is_merchant:
-            iban_party_type[iban] = 'known_external_counterparty'
+            iban_party_type[iban] = 'merchant'
             signals.append('S10_merchant')
             iban_signals[iban] = signals
-            iban_party_type[iban] = 'known_external_counterparty'
             continue
 
         # --- Signalen detecteren ---
@@ -1477,30 +1512,31 @@ def _resolve_related_parties(df: pd.DataFrame, eigen_rekeningen: set,
             iban_signals[iban] = signals
             continue
 
-        # --- FASE 3: Business-related ---
+        # --- FASE 3: Business / Employer ---
         if s9 and s1:
-            # Candidate: S9 + S1 — check voor extra bewijs
+            # S9 (rechtsvorm) + S1 (achternaam) — check voor extra bewijs
             salaris_keywords = ['SALARIS', 'LOON', 'MANAGEMENTFEE', 'MANAGEMENT FEE',
                                 'VERGOEDING', 'HONORARIUM']
             has_keyword = any(kw in data['omschr_sample'] for kw in salaris_keywords)
             has_extra = has_keyword or s4 or s6
 
             if has_extra:
-                iban_party_type[iban] = 'business_related_party'
-                signals.append('EXTRA_BEWIJS')
+                # Sterk bewijs: eigen BV, salary keywords → employer_or_payroll
+                iban_party_type[iban] = 'employer_or_payroll'
+                signals.append('EMPLOYER_EXTRA_BEWIJS')
             else:
-                # S9 + S1 zonder extra bewijs → known_external (behandel als werkgever)
-                iban_party_type[iban] = 'known_external_counterparty'
+                # S9 + S1 zonder extra bewijs → business_counterparty
+                iban_party_type[iban] = 'business_counterparty'
             iban_signals[iban] = signals
             continue
 
         # --- FASE 4: Default ---
         if s9:
-            # Rechtsvorm zonder naamoverlap → known_external
-            iban_party_type[iban] = 'known_external_counterparty'
+            # Rechtsvorm zonder naamoverlap → business_counterparty
+            iban_party_type[iban] = 'business_counterparty'
         else:
-            # Geen signalen of alleen zwak/middel → unresolved_private
-            iban_party_type[iban] = 'unresolved_private_counterparty'
+            # Geen signalen of alleen zwak/middel → unknown
+            iban_party_type[iban] = 'unknown'
 
         iban_signals[iban] = signals
 
@@ -1511,8 +1547,8 @@ def _resolve_related_parties(df: pd.DataFrame, eigen_rekeningen: set,
         mask = df['_tegen_norm'] == iban
         df.loc[mask, 'party_type'] = pt
 
-    # Transacties zonder IBAN → unresolved_private
-    df.loc[df['party_type'].isna(), 'party_type'] = 'unresolved_private_counterparty'
+    # Transacties zonder IBAN → unknown
+    df.loc[df['party_type'].isna(), 'party_type'] = 'unknown'
 
     # V3: household_related_party → NIET meer is_intern, maar eigen sectie 'onderling_neutraal'
     # Ze moeten zichtbaar zijn in het rapport (ONDERLING/NEUTRAAL) maar NIET als salary/income
@@ -1542,7 +1578,8 @@ def _resolve_related_parties(df: pd.DataFrame, eigen_rekeningen: set,
         sigs = iban_signals.get(iban, [])
         namen = iban_data.get(iban, {}).get('namen', set())
         naam_str = ', '.join(list(namen)[:2]) if namen else '?'
-        if pt in ('household_related_party', 'business_related_party'):
+        if pt in ('household_related_party', 'employer_or_payroll', 'business_counterparty',
+                  'government', 'broker_or_investment_platform', 'lender_or_mortgage_party', 'card_settlement'):
             logger.info(f"RPR DETAIL: {iban[:20]} ({naam_str[:30]}) → {pt} [{', '.join(sigs)}]")
 
     return df
@@ -2165,10 +2202,14 @@ def _detecteer_vast_inkomen(df: pd.DataFrame) -> pd.DataFrame:
     if len(df_kandidaat) == 0:
         return df
 
-    # === V3 HARDE REGELS: party_types die NOOIT salary/income mogen zijn ===
+    # === V3 HARDE REGELS: counterparty roles die NOOIT salary/income mogen zijn ===
     _VERBODEN_SALARY_PARTY_TYPES = {
         'household_related_party',
         'own_account',
+        'merchant',                       # winkels/dienstverleners → nooit salaris
+        'broker_or_investment_platform',   # beleggingsplatform → nooit salaris
+        'lender_or_mortgage_party',        # hypotheek/lening → nooit salaris
+        'card_settlement',                 # creditcard → nooit salaris
     }
 
     # Bekende merchants uitsluiten
@@ -2800,12 +2841,12 @@ def _uncertainty_gate(row, bidi_ibans):
 
     # 8. Bidirectioneel IBAN → je stuurt ook geld naar deze partij
     if iban and iban in bidi_ibans:
-        if party_type == 'unresolved_private_counterparty':
+        if party_type == 'unknown':
             return 'Onderlinge betaling (privépersoon)'
         return 'Onzeker positief (bidirectioneel)'
 
     # 9. Privépersoon (geen rechtsvorm, geen bedrijf)
-    if party_type == 'unresolved_private_counterparty':
+    if party_type == 'unknown':
         if bedrag < 100:
             return 'Onderlinge betaling (klein bedrag)'
         elif bedrag < 500:
@@ -2850,6 +2891,28 @@ FINANCIELE_INSTELLINGEN_KEYWORDS = [
     'FUNDING CIRCLE', 'COLLIN CROWDFUND',
     # Spaar/deposito
     'RAISIN', 'SAVEDO', 'LEASEPLAN BANK', 'KNAB SPAAR',
+]
+
+# =====================================================================
+# COUNTERPARTY ROLE DETECTION — Keyword sets per rol
+# =====================================================================
+
+# Creditcard-maatschappijen → card_settlement (nooit inkomen, nooit kosten)
+CARD_SETTLEMENT_KEYWORDS = [
+    'ICS/INT CARD', 'ICS ', 'INTERNATIONAL CARD SERVICES',
+    'VISA CARD', 'MASTERCARD', 'AMERICAN EXPRESS', 'AMEX',
+    'ADYEN', 'WORLDLINE', 'BUCKAROO',
+]
+
+# Hypotheek/lening-verstrekkers → lender_or_mortgage_party
+# ALLEEN dedicated hypotheek-/leningmaatschappijen, NIET multi-role (NN, Aegon, ASR)
+# want die kunnen ook verzekeringen uitkeren. Multi-role partijen staan in MERCHANT_MAPPING.
+LENDER_KEYWORDS_COUNTERPARTY = [
+    'OBVION', 'FLORIUS', 'WOONFONDS', 'MUNT HYPOTHEKEN', 'VISTA HYPOTHEKEN',
+    'ABN AMRO HYPOTHEEK', 'ING HYPOTHEEK', 'RABO HYPOTHEEK',
+    'ASR HYPOTHEEK',
+    'WONINGCORPORATIE', 'VESTIA', 'YMERE', 'EIGEN HAARD',
+    'DE ALLIANTIE', 'WOONSTAD', 'PORTAAL',
 ]
 
 # Investment income keywords — ALLEEN deze mogen als beleggingsinkomen tellen
@@ -3002,6 +3065,13 @@ def _classify_positive_inflows(df: pd.DataFrame, eigen_fi_ibans: set = None,
     if 'inflow_type' not in df.columns:
         df['inflow_type'] = None
 
+    # V2: flow_type kolom (multi-axis spec) — credit/debit/internal
+    if 'flow_type' not in df.columns:
+        df['flow_type'] = df['bedrag'].apply(
+            lambda b: 'credit' if float(b) > 0 else ('debit' if float(b) < 0 else 'zero')
+        )
+        df.loc[df['is_intern'] == True, 'flow_type'] = 'internal'
+
     # === LOOKUPS BOUWEN ===
 
     # Bekende merchants (voor rent classifier exclusion + refund detection)
@@ -3064,11 +3134,46 @@ def _classify_positive_inflows(df: pd.DataFrame, eigen_fi_ibans: set = None,
         iban = _normaliseer_iban(str(row.get('Tegenrekening', ''))) if heeft_tegenrek else ''
         naam = str(row.get('tegenpartij_naam', '')).upper() if 'tegenpartij_naam' in df.columns else ''
         tekst = omschr + ' ' + naam
+        pt = row.get('party_type', '') if 'party_type' in df.columns else ''
 
         classified = False
 
-        # A1: OVERHEID
-        if any(kw in tekst for kw in OVERHEID_KEYWORDS):
+        # A0: COUNTERPARTY ROLE SHORTCUT — als RPR al een specifieke rol heeft
+        # bepaald, gebruik die direct (No Guess Zone)
+        if pt == 'card_settlement':
+            _apply(idx, 'card_settlement', 'onderling_neutraal', 'Creditcard-afrekening', 0.90)
+            stats.setdefault('card_settlement', 0)
+            stats['card_settlement'] += 1
+            herclassificaties.append((idx, 'Laag A', 'card_settlement', 'Creditcard-afrekening', f'party_type=card_settlement'))
+            classified = True
+        elif pt == 'lender_or_mortgage_party':
+            _apply(idx, 'loan_inflow', 'sparen_beleggen', 'Lening/Hypotheek (uitbetaling)', 0.85)
+            stats.setdefault('loan_inflow', 0)
+            stats['loan_inflow'] = stats.get('loan_inflow', 0) + 1
+            herclassificaties.append((idx, 'Laag A', 'loan_inflow', 'Lening/Hypotheek (uitbetaling)', f'party_type=lender_or_mortgage_party'))
+            classified = True
+        elif pt == 'broker_or_investment_platform':
+            if any(kw in tekst for kw in INVESTMENT_INCOME_KEYWORDS):
+                _apply(idx, 'investment_income', 'inkomsten', 'Beleggingsinkomen', 0.90)
+                stats['investment_income'] += 1
+                herclassificaties.append((idx, 'Laag A', 'investment_income', 'Beleggingsinkomen', f'party_type=broker + dividend-keyword'))
+            else:
+                if any(kw in tekst for kw in ['BITVAVO', 'COINBASE', 'KRAKEN', 'BINANCE', 'BYBIT']):
+                    cat = 'Crypto (terugstorting)'
+                elif any(kw in tekst for kw in ['MINTOS', 'LENDAHAND', 'PEERBERRY', 'BONDORA',
+                                                 'TWINO', 'OCTOBER', 'FUNDING CIRCLE', 'COLLIN']):
+                    cat = 'Crowdlending (terugbetaling)'
+                elif 'BRAND NEW DAY' in tekst:
+                    cat = 'Pensioen (terugstorting)'
+                else:
+                    cat = 'Effectenrekening (terugstorting)'
+                _apply(idx, 'asset_withdrawal', 'sparen_beleggen', cat, 0.95)
+                stats['asset_withdrawal'] += 1
+                herclassificaties.append((idx, 'Laag A', 'asset_withdrawal', cat, f'party_type=broker'))
+            classified = True
+
+        # A1: OVERHEID (keyword of party_type=government)
+        elif pt == 'government' or any(kw in tekst for kw in OVERHEID_KEYWORDS):
             if 'BELASTINGDIENST' in tekst or 'BELASTING DIENST' in tekst:
                 cat = 'Belastingteruggave'
             elif 'UWV' in tekst:
@@ -3202,11 +3307,12 @@ def _classify_positive_inflows(df: pd.DataFrame, eigen_fi_ibans: set = None,
                 refund_handled.add(idx)
 
         # B2: Rent + Salary classifiers (per groep, gated by party_type)
-        # RPR v1.3 classifier-toegang matrix:
-        #   own_account / household → al uitgesloten (is_intern)
-        #   business_related → salary only
-        #   known_external → rent + salary + benefits
-        #   unresolved_private → rent ONLY
+        # RPR V2 classifier-toegang matrix:
+        #   own_account / household → al uitgesloten (is_intern / onderling_neutraal)
+        #   employer_or_payroll → salary (deterministic)
+        #   business_counterparty → salary + rent
+        #   government / merchant / broker / lender / card → al Fase 1
+        #   unknown → rent ONLY
         rent_handled = set()
         salary_handled = set()
         has_party_type = 'party_type' in df.columns
@@ -3215,15 +3321,21 @@ def _classify_positive_inflows(df: pd.DataFrame, eigen_fi_ibans: set = None,
             # Determine party_type for this group
             if has_party_type:
                 pt_values = df.loc[groep.index, 'party_type'].dropna().unique()
-                party_type = pt_values[0] if len(pt_values) > 0 else 'unresolved_private_counterparty'
+                party_type = pt_values[0] if len(pt_values) > 0 else 'unknown'
             else:
-                party_type = 'unresolved_private_counterparty'
+                party_type = 'unknown'
 
-            # --- Salary classifier (for business_related and known_external) ---
-            # business_related → salary only (no rent, no benefits)
-            # known_external → salary + rent + benefits
-            allow_salary = party_type in ('business_related_party', 'known_external_counterparty')
-            allow_rent = party_type in ('known_external_counterparty', 'unresolved_private_counterparty')
+            # --- Classifier gating matrix (V2 counterparty roles) ---
+            # employer_or_payroll → salary (deterministic, high confidence)
+            # business_counterparty → salary + rent
+            # government → SKIP (already handled in Fase 1 Laag A)
+            # merchant → SKIP (refunds only, never salary/rent)
+            # broker_or_investment_platform → SKIP (already handled in Fase 1 Laag A)
+            # lender_or_mortgage_party → SKIP (already handled)
+            # card_settlement → SKIP (internal)
+            # unknown → rent only (no salary from unknown parties)
+            allow_salary = party_type in ('employer_or_payroll', 'business_counterparty')
+            allow_rent = party_type in ('business_counterparty', 'unknown')
 
             if allow_salary:
                 # Simple salary detection: check for salary keywords in the group
@@ -3253,7 +3365,7 @@ def _classify_positive_inflows(df: pd.DataFrame, eigen_fi_ibans: set = None,
                         # Determine subcategorie
                         if has_salary_kw and any(kw in tekst_alle for kw in ['MANAGEMENTFEE', 'MANAGEMENT FEE']):
                             cat = 'DGA-loon/Managementfee'
-                        elif party_type == 'business_related_party':
+                        elif party_type == 'employer_or_payroll':
                             cat = 'DGA-loon/Managementfee'
                         else:
                             cat = 'Netto salaris'
@@ -3261,9 +3373,17 @@ def _classify_positive_inflows(df: pd.DataFrame, eigen_fi_ibans: set = None,
                         for gidx in groep.index:
                             _apply(gidx, 'salary_income', 'inkomsten', cat, 0.85)
                             salary_handled.add(gidx)
+                            # Promotie: bevestig counterparty role als employer_or_payroll
+                            if party_type != 'employer_or_payroll':
+                                df.at[gidx, 'party_type'] = 'employer_or_payroll'
                         stats.setdefault('salary_likely', 0)
                         stats['salary_likely'] = stats.get('salary_likely', 0) + len(groep)
                         naam_sample = str(groep.iloc[0].get('tegenpartij_naam', groep.iloc[0]['Omschrijving']))[:30]
+                        if party_type != 'employer_or_payroll':
+                            logger.info(
+                                f"ROLE PROMOTIE: {groep_key[:30]} ({naam_sample}) "
+                                f"{party_type} → employer_or_payroll (salary bevestigd)"
+                            )
                         logger.info(
                             f"SALARY CLASSIFIER: LIKELY — {groep_key[:30]} ({naam_sample}) → {cat} — "
                             f"{n_tx} tx, mediaan EUR {mediaan:,.0f}, party_type={party_type}"
@@ -3272,7 +3392,7 @@ def _classify_positive_inflows(df: pd.DataFrame, eigen_fi_ibans: set = None,
                                                  cat, f'Salary classifier LIKELY (party_type={party_type})'))
                         continue  # Skip rent classifier for this group
 
-            # --- Rent classifier (for known_external and unresolved_private) ---
+            # --- Rent classifier (for business_counterparty and unknown) ---
             if not allow_rent:
                 # business_related without salary match → uncertainty gate
                 logger.info(
@@ -3651,21 +3771,25 @@ def _post_classificatie_reconciliatie(df: pd.DataFrame, feiten: dict) -> dict:
             })
             status = 'RED'
 
-    # Grocery/merchant in income check
-    merchant_in_income = df[
-        (df['party_type'] == 'merchant') &
-        (df['regel_sectie'] == 'inkomsten') &
-        (df['bedrag'] > 0)
-    ] if 'party_type' in df.columns else pd.DataFrame()
-    if len(merchant_in_income) > 0:
-        checks.append({
-            'type': 'MERCHANT_ALS_INKOMEN',
-            'aantal': len(merchant_in_income),
-            'status': 'ORANGE',
-            'detail': f'{len(merchant_in_income)} merchant-transacties in inkomsten-sectie'
-        })
-        if status == 'GREEN':
-            status = 'ORANGE'
+    # Counterparty role integrity checks — rollen die NOOIT in inkomsten mogen staan
+    _NOOIT_INKOMEN_ROLLEN = {'merchant', 'broker_or_investment_platform', 'card_settlement',
+                              'lender_or_mortgage_party'}
+    if 'party_type' in df.columns:
+        fout_in_inkomen = df[
+            (df['party_type'].isin(_NOOIT_INKOMEN_ROLLEN)) &
+            (df['regel_sectie'] == 'inkomsten') &
+            (df['bedrag'] > 0)
+        ]
+        if len(fout_in_inkomen) > 0:
+            per_rol = fout_in_inkomen['party_type'].value_counts().to_dict()
+            detail_parts = [f'{n}x {rol}' for rol, n in per_rol.items()]
+            checks.append({
+                'type': 'COUNTERPARTY_ROLE_ALS_INKOMEN',
+                'aantal': len(fout_in_inkomen),
+                'status': 'RED',
+                'detail': f'{len(fout_in_inkomen)} transacties met verkeerde rol in inkomsten: {", ".join(detail_parts)}'
+            })
+            status = 'RED'
 
     logger.info(
         f"V3-RECONCILIATIE: status={status}, {len(checks)} checks, "
@@ -6669,7 +6793,21 @@ def _no_send_gate(ground_truth: dict, reconciliatie: dict, analyse: dict,
                 f"{', '.join(onbekende_bedragen[:5])}"
             )
 
-    # Regel 4: Classificatie-kwaliteit
+    # Regel 4: Jaar-totaal ≠ som van maanden (consistency check)
+    maand_sectie = ground_truth.get('maand_sectie_totalen', {})
+    for sectie, jaar_totaal in sectie_totalen.items():
+        maand_som = sum(
+            maand_data.get(sectie, 0)
+            for maand_data in maand_sectie.values()
+        )
+        if abs(jaar_totaal) > 10 and abs(maand_som - jaar_totaal) > max(1.0, abs(jaar_totaal) * 0.01):
+            kleur = 'RED'
+            redenen.append(
+                f"JAARTOTAAL ≠ SOM MAANDEN: {sectie} jaar={jaar_totaal:,.0f} vs som={maand_som:,.0f} "
+                f"(verschil EUR {abs(maand_som - jaar_totaal):,.0f})"
+            )
+
+    # Regel 5: Classificatie-kwaliteit
     pct_rule = kwaliteit.get('pct_rule_based', 0)
     if pct_rule < 40:
         if kleur == 'GREEN':

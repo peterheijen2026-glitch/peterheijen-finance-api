@@ -5341,41 +5341,36 @@ class RapportPDF(FPDF):
         maanden = sorted(volle_maanden) if volle_maanden else sorted(maandoverzicht.keys())
         n_mnd = max(len(maanden), 1)
 
-        # --- Consolidatielogica: < €500/jaar → overige, tenzij gem > €500/mnd ---
+        # --- Consolidatielogica: top-N per sectie, rest → Overig ---
+        # Max rijen per sectie om op 1 pagina te passen
         _SECTIE_CONFIG = [
-            ('inkomsten',        'INKOMSTEN',          (26, 107, 60)),
-            ('vaste_lasten',     'VASTE LASTEN',       (74, 85, 104)),
-            ('variabele_kosten', 'VARIABELE KOSTEN',   (100, 100, 120)),
-            ('sparen_beleggen',  'SPAREN & BELEGGEN',  (26, 90, 140)),
+            ('inkomsten',        'INKOMSTEN',          (26, 107, 60),   6),
+            ('vaste_lasten',     'VASTE LASTEN',       (74, 85, 104),   10),
+            ('variabele_kosten', 'VARIABELE KOSTEN',   (100, 100, 120), 12),
+            ('sparen_beleggen',  'SPAREN & BELEGGEN',  (26, 90, 140),   5),
         ]
 
-        def _consolideer(cats_dict, sectie_label):
-            """Consolideer kleine categorieën naar 'Overige'."""
-            groot = {}
-            overig_totaal = 0.0
-            for cat, bedrag in cats_dict.items():
-                b = abs(float(bedrag))
-                gem_pm = b / n_mnd
-                if b >= 500 or gem_pm > 500:
-                    groot[cat] = float(bedrag)
-                else:
-                    overig_totaal += float(bedrag)
-            # Sorteer op absoluut bedrag (groot → klein)
-            sorted_items = sorted(groot.items(), key=lambda x: -abs(x[1]))
+        def _consolideer(cats_dict, sectie_label, max_cats=15):
+            """Consolideer: top-N op absoluut bedrag, rest → Overig."""
+            alle = sorted(cats_dict.items(), key=lambda x: -abs(float(x[1])))
+            groot = alle[:max_cats]
+            rest = alle[max_cats:]
+            overig_totaal = sum(float(v) for _, v in rest)
+            result = [(k, float(v)) for k, v in groot]
             if abs(overig_totaal) >= 1:
-                sorted_items.append((f'Overig', overig_totaal))
-            return sorted_items
+                result.append(('Overig', overig_totaal))
+            return result
 
         # Bouw rijstructuur op
         rows = []  # [(label, sectie_key_or_special, is_header, is_total)]
 
         rows.append(('Beginsaldo', '_beginsaldo', False, True))
 
-        for sectie_key, sectie_label, kleur in _SECTIE_CONFIG:
+        for sectie_key, sectie_label, kleur, max_cats in _SECTIE_CONFIG:
             cats = cat_totalen.get(sectie_key, {})
             if not cats:
                 continue
-            cons = _consolideer(cats, sectie_label)
+            cons = _consolideer(cats, sectie_label, max_cats)
             rows.append((sectie_label, sectie_key, True, False))
             for cat_name, _ in cons:
                 rows.append((cat_name, sectie_key, False, False))
@@ -5387,7 +5382,7 @@ class RapportPDF(FPDF):
         maand_cat_data = {}
         for maand in maanden:
             maand_cat_data[maand] = {}
-            for sectie_key, _, _ in _SECTIE_CONFIG:
+            for sectie_key, _, _, _ in _SECTIE_CONFIG:
                 maand_cat_data[maand][sectie_key] = maandoverzicht.get(maand, {}).get(sectie_key, {})
 
         # Consolideer ook op maandniveau
@@ -5402,10 +5397,10 @@ class RapportPDF(FPDF):
 
         # Bewaar geconsolideerde cats per sectie voor lookup
         cons_per_sectie = {}
-        for sectie_key, _, _ in _SECTIE_CONFIG:
+        for sectie_key, _, _, max_cats in _SECTIE_CONFIG:
             cats = cat_totalen.get(sectie_key, {})
             if cats:
-                cons_per_sectie[sectie_key] = _consolideer(cats, sectie_key)
+                cons_per_sectie[sectie_key] = _consolideer(cats, sectie_key, max_cats)
 
         # --- Bereken saldo per maand ---
         saldo_data = ground_truth.get('saldo', {})
@@ -5416,7 +5411,7 @@ class RapportPDF(FPDF):
         maand_netto = {}
         for maand in maanden:
             netto = 0
-            for sectie_key, _, _ in _SECTIE_CONFIG:
+            for sectie_key, _, _, _ in _SECTIE_CONFIG:
                 cats = maandoverzicht.get(maand, {}).get(sectie_key, {})
                 netto += sum(float(v) for v in cats.values())
             # onderling_neutraal ook meenemen
@@ -5448,7 +5443,7 @@ class RapportPDF(FPDF):
         col_label = 48  # categorienaam
         n_months = len(maanden)
         col_month = (usable_w - col_label) / n_months if n_months > 0 else 18
-        rij_h = 3.3
+        rij_h = 3.0
 
         # Titel
         self.set_font(self.HEADING, '', 10)
@@ -5495,10 +5490,9 @@ class RapportPDF(FPDF):
         row_idx = 0
 
         for row_label, row_key, is_header, is_total in rows:
-            # Paginagrens check
-            if y + rij_h > page_h - 10:
-                self.add_page(orientation='L')
-                y = margin_t + 4
+            # Stop als we de pagina-ondergrens bereiken (niet overlopen)
+            if y + rij_h > page_h - 12:
+                break
 
             if is_total:
                 # Beginsaldo / Eindsaldo regel
@@ -5523,7 +5517,7 @@ class RapportPDF(FPDF):
             elif is_header:
                 # Sectie-header
                 cur_sectie_key = row_key
-                kleur = next((k for sk, _, k in _SECTIE_CONFIG if sk == row_key), (100, 100, 100))
+                kleur = next((k for sk, _, k, _ in _SECTIE_CONFIG if sk == row_key), (100, 100, 100))
                 self.set_fill_color(*kleur)
                 self.rect(margin_l, y, usable_w, rij_h, 'F')
                 self.set_font(self.DATA, 'B', 5)

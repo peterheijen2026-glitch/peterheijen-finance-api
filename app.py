@@ -5285,16 +5285,18 @@ class RapportPDF(FPDF):
 
     def header(self):
         if self.page_no() > 1:
+            # Detecteer landscape vs portrait
+            pw = self.w  # actuele paginabreedte (297 landscape, 210 portrait)
             self.set_fill_color(*INK)
-            self.rect(0, 0, 210, 14, 'F')
-            self.set_font(self.DATA, 'B', 8)
+            self.rect(0, 0, pw, 8, 'F')
+            self.set_font(self.DATA, 'B', 6)
             self.set_text_color(*WHITE)
-            self.set_xy(10, 4)
-            self.cell(0, 6, 'PeterHeijen.com  |  Financieel Rapport', 0, 0, 'L')
-            self.set_font(self.DATA, '', 7)
-            self.set_xy(10, 4)
-            self.cell(190, 6, f'Pagina {self.page_no()}', 0, 0, 'R')
-            self.set_y(18)
+            self.set_xy(8, 2)
+            self.cell(0, 4, 'PeterHeijen.com  |  Financieel Rapport', 0, 0, 'L')
+            self.set_font(self.DATA, '', 6)
+            self.set_xy(8, 2)
+            self.cell(pw - 16, 4, f'Pagina {self.page_no()}', 0, 0, 'R')
+            self.set_y(10)
         else:
             self.set_y(10)
 
@@ -5647,7 +5649,7 @@ class RapportPDF(FPDF):
         page_h = 210
         margin_l = 8
         margin_r = 5
-        margin_t = 12
+        margin_t = 11  # Na de header bar (8mm) + kleine marge
         usable_w = page_w - margin_l - margin_r  # ~284
 
         # Kolom-breedtes

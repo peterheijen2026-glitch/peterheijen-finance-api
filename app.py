@@ -4596,8 +4596,9 @@ def _genereer_strategische_inzichten(ground_truth: dict, df: pd.DataFrame) -> di
     - signalen: lijst van strategische observaties
     - cashflow_trend: maandelijkse trend data
     """
-    # Gebruik rapport_totalen als single source of truth
+    # Gebruik rapport_totalen + executive_buckets als single source of truth
     rt = ground_truth.get('rapport_totalen', {})
+    eb = ground_truth.get('executive_buckets', {})
     sectie_totalen = ground_truth.get('sectie_totalen_12m', {})
     n_mnd = ground_truth.get('periode', {}).get('n_mnd', 12)
     income_sources = ground_truth.get('income_sources', {})
@@ -5892,15 +5893,15 @@ class RapportPDF(FPDF):
         self.multi_cell(180, 5, samenvatting, 0, 'L')
 
         # ===================================================================
-        # 7 BELANGRIJKSTE BEVINDINGEN
+        # 7 BELANGRIJKSTE BEVINDINGEN — leunt 100% op executive_buckets
         # ===================================================================
         n_maanden = max(n_mnd, 1)
+        eb = ground_truth.get('executive_buckets', {}) if ground_truth else {}
+        ratios = eb.get('_ratios', {})
 
-        # --- Bucket definities ---
-        # Bereken 7 bevindingen uit ground_truth
         bevindingen = []
 
-        # 1. Inkomensbronnen
+        # 1. Inkomensbronnen (uit income_sources, niet zelf berekenen)
         income_sources = ground_truth.get('income_sources', {}) if ground_truth else {}
         if income_sources:
             top_bronnen = sorted(income_sources.items(), key=lambda x: -abs(x[1].get('bedrag_12m', 0)))[:3]
@@ -5922,39 +5923,42 @@ class RapportPDF(FPDF):
                     bron_delen.append(f"{label}: {eur(pm)}/mnd")
             bevindingen.append(f"De belangrijkste inkomensbronnen zijn: {', '.join(bron_delen)}.")
 
-        # 2. Grootste vaste last
-        vl = cat_totalen.get('vaste_lasten', {})
-        if vl:
-            top_vl = max(vl.items(), key=lambda x: abs(float(x[1])))
+        # 2. Kerninkomen vs aanvullend (uit executive_buckets)
+        kern = eb.get('kerninkomen', {})
+        aanv = eb.get('aanvullende_instroom', {})
+        if kern.get('bedrag_12m', 0) > 0:
             bevindingen.append(
-                f"De grootste vaste last is {top_vl[0]} met {eur(abs(float(top_vl[1])) / n_maanden)}/mnd "
-                f"({eur(abs(float(top_vl[1])))} per jaar)."
+                f"Het kerninkomen bedraagt {eur(kern['bedrag_pm'])}/mnd ({eur(kern['bedrag_12m'])}/jaar)."
+                + (f" Daarnaast is er {eur(aanv['bedrag_pm'])}/mnd aan aanvullende instroom (teruggaven/toeslagen)."
+                   if aanv.get('bedrag_12m', 0) > 100 else "")
             )
 
-        # 3. Woonquote — gebruik rapport_totalen (bruto inkomen, niet alle positieve bedragen)
-        pm_ink = rt.get('bruto_inkomen_pm', 1) if rt.get('bruto_inkomen_pm', 0) > 0 else 1
-        woonlasten_cats = {'Hypotheek/Huur', 'Huur/Hypotheek', 'VvE',
-                           'Gemeentebelasting/OZB/Waterschapsbelasting',
-                           'Gemeentelijke heffingen', 'Water', 'Energie'}
-        pm_woon = sum(abs(float(vl.get(c, 0))) for c in woonlasten_cats) / n_maanden
-        woonquote = round(pm_woon / pm_ink * 100, 1) if pm_ink > 0 else 0
-        bevindingen.append(f"De woonquote bedraagt {woonquote}% van het bruto-inkomen ({eur(pm_woon)}/mnd aan woonlasten).")
+        # 3. Woonquote (uit executive_buckets ratios)
+        woon = eb.get('woonlasten', {})
+        woonquote = ratios.get('woonquote', 0)
+        bevindingen.append(
+            f"De woonquote bedraagt {woonquote}% van het bruto-inkomen "
+            f"({eur(woon.get('bedrag_pm', 0))}/mnd aan woonlasten)."
+        )
 
-        # 4. Spaarquote
-        sp = cat_totalen.get('sparen_beleggen', {})
-        pm_sparen = abs(sum(float(v) for v in sp.values())) / n_maanden if sp else 0
-        spaarquote = round(pm_sparen / pm_ink * 100, 1) if pm_ink > 0 else 0
-        bevindingen.append(f"Er gaat {eur(pm_sparen)}/mnd naar sparen en beleggen ({spaarquote}% van het inkomen).")
+        # 4. Spaarquote (uit executive_buckets)
+        spaar = eb.get('netto_allocatie_vermogen', {})
+        spaarquote = ratios.get('spaarquote', 0)
+        bevindingen.append(
+            f"Er gaat {eur(spaar.get('bedrag_pm', 0))}/mnd naar vermogensopbouw "
+            f"({spaarquote}% van het inkomen)."
+        )
 
-        # 5. Variabele kosten
+        # 5. Discretionaire uitgaven (uit executive_buckets)
+        disc = eb.get('leefkosten_discretionair', {})
         vk = cat_totalen.get('variabele_kosten', {})
+        top_vk_tekst = ""
         if vk:
             top_vk = max(vk.items(), key=lambda x: abs(float(x[1])))
-            pm_vk_totaal = abs(sum(float(v) for v in vk.values())) / n_maanden
-            bevindingen.append(
-                f"De variabele kosten bedragen gemiddeld {eur(pm_vk_totaal)}/mnd. "
-                f"Grootste post: {top_vk[0]} ({eur(abs(float(top_vk[1])) / n_maanden)}/mnd)."
-            )
+            top_vk_tekst = f" Grootste post: {top_vk[0]} ({eur(abs(float(top_vk[1])) / n_maanden)}/mnd)."
+        bevindingen.append(
+            f"De discretionaire uitgaven bedragen {eur(disc.get('bedrag_pm', 0))}/mnd.{top_vk_tekst}"
+        )
 
         # 6. Saldo-ontwikkeling
         delta = eind_saldo - begin_saldo
@@ -5963,16 +5967,13 @@ class RapportPDF(FPDF):
         else:
             bevindingen.append(f"Het vermogen is in {n_maanden} maanden afgenomen met {eur(abs(delta))}.")
 
-        # 7. Belastingdruk
-        belasting_cats = {
-            'Inkomstenbelasting/Voorlopige aanslag', 'Inkomstenbelasting',
-            'Vennootschapsbelasting (VPB)', 'BTW/Omzetbelasting',
-            'Loonheffing', 'ZVW-premie', 'Motorrijtuigenbelasting (MRB)',
-            'Overige belastingen',
-        }
-        pm_belasting = sum(abs(float(vl.get(c, 0))) for c in belasting_cats) / n_maanden
-        belasting_pct = round(pm_belasting / pm_ink * 100, 1) if pm_ink > 0 else 0
-        bevindingen.append(f"De belastingdruk bedraagt {eur(pm_belasting)}/mnd ({belasting_pct}% van het inkomen).")
+        # 7. Belastingdruk (uit executive_buckets)
+        bel = eb.get('belastingdruk', {})
+        bel_pct = ratios.get('belastingdruk_pct', 0)
+        bevindingen.append(
+            f"De belastingdruk bedraagt {eur(bel.get('bedrag_pm', 0))}/mnd "
+            f"({bel_pct}% van het inkomen)."
+        )
 
         # Teken de bevindingen
         y = self.get_y() + 6
@@ -7440,19 +7441,101 @@ def _bouw_ground_truth(merged_data: dict, feiten: dict, rapportperiode: dict,
         for cats in combined_jaar.values()
     ), 2)
 
+    # =========================================================================
+    # GRANULAIRE EXECUTIVE BUCKETS — afgeleid uit categorie_totalen
+    # =========================================================================
+    # Woonlasten: hypotheek/huur + energie + water + VvE + gemeentelijke heffingen
+    _WOONLASTEN_CATS = {
+        'Hypotheek/Huur', 'Huur/Hypotheek', 'VvE',
+        'Gemeentebelasting/OZB/Waterschapsbelasting',
+        'Gemeentelijke heffingen', 'Water', 'Energie',
+    }
+    # Belastingdruk: alle belasting-categorieën (alleen betalingen, niet teruggaven)
+    _BELASTING_CATS = {
+        'Inkomstenbelasting/Voorlopige aanslag', 'Inkomstenbelasting',
+        'Vennootschapsbelasting (VPB)', 'BTW/Omzetbelasting',
+        'Loonheffing', 'ZVW-premie', 'Motorrijtuigenbelasting (MRB)',
+        'Overige belastingen',
+    }
+    # Vaste leefkosten: verzekeringen, abonnementen, etc.
+    _VASTE_LEEFKOSTEN_CATS = {
+        'Verzekeringen', 'Zorgverzekering', 'Telefoon/Internet',
+        'Abonnementen/Streaming', 'Lidmaatschap/Contributie',
+        'Kinderopvang', 'School/Opleiding',
+    }
+    # Alle vaste_lasten categorieën die NIET woonlasten, NIET belasting, NIET vaste leefkosten zijn
+    # → die vallen in "overige vaste lasten" (wordt bij vaste leefkosten opgeteld)
+
+    vl_cats = combined_jaar.get('vaste_lasten', {})
+    vk_cats = combined_jaar.get('variabele_kosten', {})
+
+    woonlasten_12m = round(abs(sum(float(vl_cats.get(c, 0)) for c in _WOONLASTEN_CATS)), 2)
+    belastingdruk_12m = round(abs(sum(float(vl_cats.get(c, 0)) for c in _BELASTING_CATS)), 2)
+
+    # Vaste leefkosten = expliciet benoemde + alle overige vaste lasten die niet woon/belasting zijn
+    vaste_leefkosten_expliciet = abs(sum(float(vl_cats.get(c, 0)) for c in _VASTE_LEEFKOSTEN_CATS))
+    overige_vaste = abs(sum(
+        float(v) for c, v in vl_cats.items()
+        if c not in _WOONLASTEN_CATS and c not in _BELASTING_CATS and c not in _VASTE_LEEFKOSTEN_CATS
+    ))
+    leefkosten_vast_12m = round(vaste_leefkosten_expliciet + overige_vaste, 2)
+
+    # Discretionaire leefkosten = alle variabele kosten
+    leefkosten_discretionair_12m = variabele_kosten_12m
+
+    # Netto allocatie naar vermogen = sparen + beleggen (negatief = geld gaat erheen = goed)
+    netto_allocatie_vermogen_12m = round(abs(sparen_beleggen_12m), 2) if sparen_beleggen_12m < 0 else 0
+    # Als sparen_beleggen positief: geld komt terug van vermogen → niet-kerninstroom
+    niet_kerninstroom_12m = round(sparen_beleggen_12m, 2) if sparen_beleggen_12m > 0 else 0
+
+    # Review/onzeker: categorieën met "Onzeker" of "Review" in de naam
+    review_onzeker_12m = round(abs(sum(
+        float(v) for sectie_cats in combined_jaar.values()
+        for c, v in sectie_cats.items()
+        if 'onzeker' in c.lower() or 'review' in c.lower()
+    )), 2)
+
+    # Saldo
+    begin_saldo = round(totaal_begin, 2)
+    eind_saldo = round(totaal_eind, 2)
+    netto_saldo_mutatie_12m = round(eind_saldo - begin_saldo, 2)
+
+    # Aanvullende structurele instroom (teruggaven belasting in inkomsten-sectie)
+    aanvullende_instroom_12m = round(sum(
+        float(v) for c, v in combined_jaar.get('inkomsten', {}).items()
+        if 'teruggave' in c.lower() or 'toeslagen' in c.lower()
+    ), 2)
+    # Kerninkomen = bruto inkomen minus aanvullende instroom
+    kerninkomen_12m = round(inkomsten_12m - aanvullende_instroom_12m, 2)
+
     rapport_totalen = {
+        # --- Sectie-niveau (backward compatible) ---
         'bruto_inkomen_12m': inkomsten_12m,
         'bruto_inkomen_pm': round(inkomsten_12m / n_mnd, 2) if n_mnd > 0 else 0,
         'vaste_lasten_12m': vaste_lasten_12m,
         'vaste_lasten_pm': round(vaste_lasten_12m / n_mnd, 2) if n_mnd > 0 else 0,
         'variabele_kosten_12m': variabele_kosten_12m,
         'variabele_kosten_pm': round(variabele_kosten_12m / n_mnd, 2) if n_mnd > 0 else 0,
-        'sparen_beleggen_12m': sparen_beleggen_12m,  # negatief = netto storting
+        'sparen_beleggen_12m': sparen_beleggen_12m,
         'netto_beschikbaar_12m': netto_beschikbaar_12m,
         'netto_beschikbaar_pm': round(netto_beschikbaar_12m / n_mnd, 2) if n_mnd > 0 else 0,
-        # Totaal geldstromen (voor saldoverloop, NIET "inkomen" noemen!)
+        # --- Totaal geldstromen (voor saldoverloop, NIET "inkomen" noemen!) ---
         'totaal_positief_12m': totaal_positief_12m,
         'totaal_negatief_12m': totaal_negatief_12m,
+        # --- Executive buckets (granulaire economische lens) ---
+        'kerninkomen_12m': kerninkomen_12m,
+        'aanvullende_instroom_12m': aanvullende_instroom_12m,
+        'belastingdruk_12m': belastingdruk_12m,
+        'woonlasten_12m': woonlasten_12m,
+        'leefkosten_vast_12m': leefkosten_vast_12m,
+        'leefkosten_discretionair_12m': leefkosten_discretionair_12m,
+        'netto_allocatie_vermogen_12m': netto_allocatie_vermogen_12m,
+        'niet_kerninstroom_12m': niet_kerninstroom_12m,
+        'review_onzeker_12m': review_onzeker_12m,
+        # --- Saldo ---
+        'begin_saldo': begin_saldo,
+        'eind_saldo': eind_saldo,
+        'netto_saldo_mutatie_12m': netto_saldo_mutatie_12m,
     }
 
     ground_truth = {
@@ -7492,6 +7575,109 @@ def _bouw_ground_truth(merged_data: dict, feiten: dict, rapportperiode: dict,
                 f"variabel={rapport_totalen['variabele_kosten_12m']:,.2f}")
 
     return ground_truth
+
+
+def _bouw_executive_buckets(ground_truth: dict) -> dict:
+    """Laag 4: Bouw executive buckets voor pagina 1 uit rapport_totalen.
+
+    Dit is de ENIGE bron voor pagina-1 metrics. Geen losse herberekeningen.
+    Retourneert een dict met 7 buckets + subtotalen.
+    """
+    rt = ground_truth.get('rapport_totalen', {})
+    n_mnd = ground_truth.get('periode', {}).get('n_mnd', 12) or 12
+
+    buckets = {
+        # 1. Kerninkomen (salaris, DGA-loon, huur — zonder teruggaven/toeslagen)
+        'kerninkomen': {
+            'label': 'Kerninkomen',
+            'bedrag_12m': rt.get('kerninkomen_12m', 0),
+            'bedrag_pm': round(rt.get('kerninkomen_12m', 0) / n_mnd, 2),
+            'toelichting': 'Structureel inkomen uit arbeid, onderneming of vastgoed',
+        },
+        # 2. Aanvullende structurele instroom (teruggaven, toeslagen)
+        'aanvullende_instroom': {
+            'label': 'Aanvullende instroom',
+            'bedrag_12m': rt.get('aanvullende_instroom_12m', 0),
+            'bedrag_pm': round(rt.get('aanvullende_instroom_12m', 0) / n_mnd, 2),
+            'toelichting': 'Belastingteruggaven, toeslagen en overige instroom',
+        },
+        # 3. Belastingdruk
+        'belastingdruk': {
+            'label': 'Belastingdruk',
+            'bedrag_12m': rt.get('belastingdruk_12m', 0),
+            'bedrag_pm': round(rt.get('belastingdruk_12m', 0) / n_mnd, 2),
+            'toelichting': 'IB, VPB, BTW, loonheffing, ZVW, MRB',
+        },
+        # 4. Woonlasten
+        'woonlasten': {
+            'label': 'Woonlasten',
+            'bedrag_12m': rt.get('woonlasten_12m', 0),
+            'bedrag_pm': round(rt.get('woonlasten_12m', 0) / n_mnd, 2),
+            'toelichting': 'Hypotheek/huur, energie, water, VvE, gemeentelijke heffingen',
+        },
+        # 5a. Vaste leefkosten
+        'leefkosten_vast': {
+            'label': 'Vaste leefkosten',
+            'bedrag_12m': rt.get('leefkosten_vast_12m', 0),
+            'bedrag_pm': round(rt.get('leefkosten_vast_12m', 0) / n_mnd, 2),
+            'toelichting': 'Verzekeringen, abonnementen, kinderopvang, overige vaste lasten',
+        },
+        # 5b. Discretionaire leefkosten
+        'leefkosten_discretionair': {
+            'label': 'Discretionaire uitgaven',
+            'bedrag_12m': rt.get('leefkosten_discretionair_12m', 0),
+            'bedrag_pm': round(rt.get('leefkosten_discretionair_12m', 0) / n_mnd, 2),
+            'toelichting': 'Boodschappen, horeca, kleding, vrije tijd, overige variabele kosten',
+        },
+        # 6. Netto allocatie naar vermogen
+        'netto_allocatie_vermogen': {
+            'label': 'Netto allocatie vermogen',
+            'bedrag_12m': rt.get('netto_allocatie_vermogen_12m', 0),
+            'bedrag_pm': round(rt.get('netto_allocatie_vermogen_12m', 0) / n_mnd, 2),
+            'toelichting': 'Netto storting naar sparen en beleggen',
+        },
+        # 7a. Niet-kerninstroom (broker terugstortingen, spaar-terugboekingen)
+        'niet_kerninstroom': {
+            'label': 'Buiten kernbeeld: instroom',
+            'bedrag_12m': rt.get('niet_kerninstroom_12m', 0),
+            'bedrag_pm': round(rt.get('niet_kerninstroom_12m', 0) / n_mnd, 2),
+            'toelichting': 'Terugstortingen van beleggingen, spaar-terugboekingen',
+        },
+        # 7b. Review/onzeker
+        'review_onzeker': {
+            'label': 'Buiten kernbeeld: review',
+            'bedrag_12m': rt.get('review_onzeker_12m', 0),
+            'bedrag_pm': round(rt.get('review_onzeker_12m', 0) / n_mnd, 2),
+            'toelichting': 'Posten die handmatige review vereisen',
+        },
+    }
+
+    # Subtotalen voor snelle lookups
+    totaal_uitgaven = (
+        buckets['belastingdruk']['bedrag_12m']
+        + buckets['woonlasten']['bedrag_12m']
+        + buckets['leefkosten_vast']['bedrag_12m']
+        + buckets['leefkosten_discretionair']['bedrag_12m']
+    )
+    buckets['_totaal_uitgaven_12m'] = round(totaal_uitgaven, 2)
+    buckets['_bruto_inkomen_12m'] = rt.get('bruto_inkomen_12m', 0)
+
+    # Ratios (allen op basis van bruto inkomen, nooit totaal_positief)
+    bruto = rt.get('bruto_inkomen_12m', 1) or 1  # voorkom /0
+    buckets['_ratios'] = {
+        'woonquote': round(buckets['woonlasten']['bedrag_12m'] / bruto * 100, 1),
+        'belastingdruk_pct': round(buckets['belastingdruk']['bedrag_12m'] / bruto * 100, 1),
+        'spaarquote': round(buckets['netto_allocatie_vermogen']['bedrag_12m'] / bruto * 100, 1),
+        'vaste_lasten_pct': round(
+            (buckets['woonlasten']['bedrag_12m'] + buckets['leefkosten_vast']['bedrag_12m']
+             + buckets['belastingdruk']['bedrag_12m']) / bruto * 100, 1),
+    }
+
+    ground_truth['executive_buckets'] = buckets
+    logger.info(f"  Executive buckets: woonlasten={buckets['woonlasten']['bedrag_12m']:,.2f}, "
+                f"belasting={buckets['belastingdruk']['bedrag_12m']:,.2f}, "
+                f"kerninkomen={buckets['kerninkomen']['bedrag_12m']:,.2f}")
+    return buckets
 
 
 def _valideer_ground_truth(ground_truth: dict) -> list:
@@ -7568,6 +7754,46 @@ def _valideer_ground_truth(ground_truth: dict) -> list:
     # CHECK 7: Geen negatief bruto inkomen
     if bruto < 0:
         issues.append(('ERROR', f"Negatief bruto inkomen ({bruto:,.2f}) — classificatiefout"))
+
+    # CHECK 8: Executive buckets sluiten aan op rapport_totalen
+    eb = ground_truth.get('executive_buckets', {})
+    if eb:
+        # Vaste lasten moet splitsen in woonlasten + belasting + vaste leefkosten
+        eb_vaste = (
+            eb.get('woonlasten', {}).get('bedrag_12m', 0)
+            + eb.get('belastingdruk', {}).get('bedrag_12m', 0)
+            + eb.get('leefkosten_vast', {}).get('bedrag_12m', 0)
+        )
+        rt_vaste = rt.get('vaste_lasten_12m', 0)
+        if abs(eb_vaste - rt_vaste) > 1:
+            issues.append(('WARNING', f"Executive buckets vaste lasten ({eb_vaste:,.2f}) ≠ "
+                           f"rapport_totalen.vaste_lasten ({rt_vaste:,.2f})"))
+
+        # Discretionair moet == variabele kosten
+        eb_disc = eb.get('leefkosten_discretionair', {}).get('bedrag_12m', 0)
+        rt_var = rt.get('variabele_kosten_12m', 0)
+        if abs(eb_disc - rt_var) > 1:
+            issues.append(('WARNING', f"Executive buckets discretionair ({eb_disc:,.2f}) ≠ "
+                           f"rapport_totalen.variabele_kosten ({rt_var:,.2f})"))
+
+        # Kern + aanvullend moet == bruto inkomen
+        eb_ink = (
+            eb.get('kerninkomen', {}).get('bedrag_12m', 0)
+            + eb.get('aanvullende_instroom', {}).get('bedrag_12m', 0)
+        )
+        if abs(eb_ink - bruto) > 1:
+            issues.append(('WARNING', f"Executive buckets inkomen ({eb_ink:,.2f}) ≠ "
+                           f"rapport_totalen.bruto_inkomen ({bruto:,.2f})"))
+
+    # CHECK 9: Richtinglogica — belastingbetalingen moeten negatief zijn in bron
+    for sectie_cats in ct.values():
+        for cat_name, val in sectie_cats.items():
+            fval = float(val)
+            # Asset withdrawal mag niet in inkomsten staan
+            if 'terugstorting' in cat_name.lower() and cat_name in ct.get('inkomsten', {}):
+                if fval > 100:
+                    issues.append(('WARNING', f"'{cat_name}' ({fval:,.2f}) staat in inkomsten — "
+                                   "mogelijke asset withdrawal leakage"))
 
     for severity, msg in issues:
         logger.warning(f"GROUND TRUTH {severity}: {msg}")
@@ -8235,6 +8461,11 @@ def _run_rapport_pipeline(job_id: str, bestanden: list, email: str,
             df=df,
         )
         logger.info(f"[{job_id}] Ground truth V3 gebouwd: {len(ground_truth['periode']['volle_maanden'])} volle maanden")
+
+        # 4a0. Executive bucket aggregator — Laag 4
+        update('Executive buckets berekenen...', 71)
+        _bouw_executive_buckets(ground_truth)
+        logger.info(f"[{job_id}] Executive buckets gebouwd")
 
         # 4a1. Deterministische cross-checks op ground truth
         update('Cross-checks uitvoeren op ground truth...', 72)

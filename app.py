@@ -5380,20 +5380,37 @@ def _vraag_gemini(prompt: str, model: str) -> tuple:
 
     api_key = os.environ.get('GOOGLE_AI_API_KEY')
     if not api_key:
-        raise ValueError("GOOGLE_AI_API_KEY niet geconfigureerd — stel in via Railway Variables")
+        raise ValueError("Gemini is niet beschikbaar: GOOGLE_AI_API_KEY niet geconfigureerd. Kies een ander model.")
 
     genai.configure(api_key=api_key)
 
     logger.info(f"Gemini aanroepen ({model}), prompt: {len(prompt)} tekens (~{len(prompt)//4} tokens)")
 
-    gen_model = genai.GenerativeModel(model)
-    response = gen_model.generate_content(
-        prompt,
-        generation_config=genai.types.GenerationConfig(
-            max_output_tokens=32000,
-            temperature=0.1,
-        ),
-    )
+    try:
+        gen_model = genai.GenerativeModel(model)
+        response = gen_model.generate_content(
+            prompt,
+            generation_config=genai.types.GenerationConfig(
+                max_output_tokens=32000,
+                temperature=0.1,
+            ),
+        )
+    except Exception as e:
+        err_str = str(e)
+        logger.error(f"Gemini API fout: {err_str[:500]}")
+        if '429' in err_str or 'quota' in err_str.lower():
+            raise ValueError(
+                f"Gemini API quota overschreden voor {model}. "
+                "Dit betekent dat de gratis tier geen capaciteit heeft voor dit model. "
+                "Schakel billing in bij Google AI Studio of kies een ander model (Claude Opus 4.7 of GPT 5.4)."
+            )
+        elif '404' in err_str or 'not found' in err_str.lower():
+            raise ValueError(
+                f"Gemini model '{model}' bestaat niet of is niet beschikbaar. "
+                "Kies een ander model."
+            )
+        else:
+            raise ValueError(f"Gemini API fout: {err_str[:200]}")
 
     tekst = response.text
     # Gemini usage metadata
@@ -7943,9 +7960,13 @@ def _run_rapport_pipeline(job_id: str, bestanden: list, email: str, ai_categoriz
 
     except Exception as e:
         logger.error(f"[{job_id}] Pipeline FOUT: {type(e).__name__}: {e}")
+        # Nette foutmelding voor de gebruiker — geen ruwe stacktraces
+        err_msg = str(e)
+        if len(err_msg) > 300:
+            err_msg = err_msg[:300] + '...'
         with jobs_lock:
             jobs[job_id]['status'] = 'fout'
-            jobs[job_id]['error'] = str(e)
+            jobs[job_id]['error'] = err_msg
             jobs[job_id]['voortgang'] = 0
 
 

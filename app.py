@@ -4279,213 +4279,182 @@ Totaal afschrijvingen (verzending eigen rekening): EUR {bedrag_intern_uit:,.2f}
 Deze tellen NIET mee als inkomen of uitgave. Ze worden apart in het rapport vermeld.
 """
 
-    return f"""Je bent een financieel analist voor vermogende particulieren en DGA's in Nederland.
+    return f"""Acteer als een uiterst nauwkeurige financieel analist voor vermogende particulieren en DGA's in Nederland.
+Analyseer elke transactie regel voor regel en wijs deze toe aan exact een categorie uit de onderstaande lijst.
 Hieronder staan {len(df_ai_only)} banktransacties die JIJ moet classificeren.
 {rule_samenvatting}{eigen_rek_tekst}{intern_tekst}
 
-## BELANGRIJK
-- Alle transacties hieronder zijn nog NIET geclassificeerd. Classificeer ze allemaal.
-- Er zijn daarnaast {n_preclassified} transacties al apart geclassificeerd (zie samenvatting hierboven).
-  Die worden automatisch samengevoegd — jij hoeft daar NIETS mee te doen.
+## CONTEXT
+- Er zijn {n_preclassified} transacties al deterministisch geclassificeerd (zie samenvatting hierboven). Die worden automatisch samengevoegd — jij hoeft daar NIETS mee te doen.
+- De TOTALEN in de GRONDWAARHEID-sectie zijn wiskundig berekend en 100% correct. Gebruik die cijfers, reken NIETS zelf.
 
-## REGELS
-1. Categoriseer ELKE transactie in precies één categorie uit onderstaande lijst.
-   Gebruik EXACT deze categorienamen (niet afwijken, niet samenvoegen, niet verzinnen).
-   "Overig" categorieën zijn een LAATSTE REDMIDDEL en mogen MAXIMAAL 3% van het totaalbedrag per sectie bevatten.
-   ALS JE TWIJFELT: kies de MEEST WAARSCHIJNLIJKE specifieke categorie. Overig is FOUT tenzij het echt nergens past.
-   DENK NA: elke transactie heeft een tegenpartij met een naam. Zoek de naam op in de omschrijving en bepaal
-   het type bedrijf. Een verzekering → juiste verzekeringscategorie. Een winkel → juiste winkelcategorie.
-   Een medische praktijk → juiste medische categorie. Wees niet lui met "Overig".
-   SPECIFIEK VOOR "Overig inkomen": dit mag MAXIMAAL 5% van totaal inkomsten zijn.
-   Als een positief bedrag niet duidelijk van een werkgever/overheid/huurder komt:
-   → Geld van een B.V./bedrijf met regelmatig patroon → Freelance/Opdrachten
-   → Geld terug van een bedrijf waar je eerder betaalde → Terugbetaling/Refund (variabele_kosten)
-   → Geld van broker/beleggingsplatform → Effectenrekening (terugstorting) (sparen_beleggen)
-   → Eenmalig onbekend bedrag → Freelance/Opdrachten OF Overig inkomen (alleen als het echt inkomen lijkt)
-
-## INFLOW CLASSIFICATIE — KRITIEK
-Een positief bedrag is NIET automatisch inkomen! Er zijn 6 types positieve transacties:
-1. INKOMEN: salaris, pensioen, huur, freelance → sectie inkomsten
-2. OVERHEID: belastingteruggave, toeslagen, UWV → sectie inkomsten
-3. VERMOGENSMUTATIE: geld terug van broker/crowdlending/crypto → sectie sparen_beleggen
-4. TERUGBETALING: refund, storno, retour van winkel → sectie variabele_kosten (als negatieve kosten)
-5. TRANSFER: eigen rekening, Tikkie → intern
-6. VERZEKERING: schadevergoeding, uitkering verzekeraar → sectie inkomsten (aparte categorie)
-
-ALLE positieve transacties zijn AL door het systeem geclassificeerd — inclusief onzekere inflows.
-De transacties hieronder zijn alleen nog NEGATIEVE (uitgaven) die jij moet classificeren,
-plus eventueel een paar positieve die door de AI gevalideerd moeten worden.
-Je hoeft je NIET druk te maken over inkomen — dat is al deterministisch berekend.
-Focus op het correct classificeren van UITGAVEN in de juiste kosten-categorie.
-
-## CONSISTENTIE — KRITIEK
-- Dezelfde tegenpartij MOET ALTIJD dezelfde categorie krijgen.
-- Zoek patronen: als "Sevi B.V." 12x voorkomt met vast bedrag, classificeer ze ALLEMAAL hetzelfde.
-- RICHTING: Positief bedrag van een winkel/tankstation = Retour/Terugbetaling, NIET een inkomstencategorie.
-  Positief bedrag van een B.V./Stichting/werkgever = wél inkomen.
+## KERNREGELS
+1. Gebruik UITSLUITEND de categorienamen uit de lijst hieronder. Verzin geen nieuwe categorieen.
+2. RICHTING: Let altijd op of het bedrag positief (bij) of negatief (af) is.
+   - Negatief bedrag = uitgave of vermogensoverdracht (naar vaste lasten, variabele kosten, of sparen/beleggen).
+   - Positief bedrag van een winkel/tankstation/webshop = Terugbetaling/Refund, NOOIT inkomen.
+   - Positief bedrag van een B.V./Stichting/werkgever/overheid = inkomen.
+   - Positief bedrag van broker/crowdlending/crypto = vermogensmutatie (sparen_beleggen), GEEN inkomen.
+3. BETALINGSVERWERKERS: Let op tussenpartijen zoals Adyen, Stichting Mollie Payments, Buckaroo, Pay.nl, Stripe.
+   De naam van de verwerker is NIET de categorie — kijk naar de rest van de omschrijving om de werkelijke winkel of dienst te achterhalen.
+4. SPAARDETECTIE: Een overboeking met omschrijvingen als "spaarpot", "buffer", "spaarrekening", "deposito" = Spaarrekening.
+   Transacties naar bekende brokers (DeGiro, Saxo, IBKR, Meesman) of crypto-exchanges = Effectenrekening of Crypto.
+5. CONSISTENTIE: Dezelfde tegenpartij (of dezelfde IBAN) MOET ALTIJD dezelfde categorie krijgen. Zoek patronen.
+6. ANTI-OVERIG: "Overig" categorieen zijn een LAATSTE REDMIDDEL (max 3% per sectie). Doorloop bij twijfel:
+   a. Staat er een bedrijfsnaam? Zoek wat voor bedrijf het is.
+   b. Bevat de omschrijving een aanwijzing? (verzekering, tandarts, apotheek, garage, etc.)
+   c. Is het BEA/GEA? Kijk naar de locatie/winkelnaam.
+   d. Komt dezelfde tegenpartij vaker voor? Vast bedrag = vaste lasten, wisselend = variabel.
+   e. Kijk naar het bedrag: <EUR50 onbekend = Boodschappen/Huishoudelijk. EUR50-500 = Kleding/Onderhoud/Elektronica. >EUR500 = Vakantie/Meubels/Auto.
+   Pas na deze 5 stappen mag je "Overig" gebruiken.
 
 ## TRANSACTIEFORMAAT
-Elke transactie heeft het formaat: datum|rekening|bedrag|omschrijving[|IBAN:tegenrekening][|REGEL:sectie:categorie]
-De omschrijving is gestructureerd als "Tegenpartij — Kenmerk" (bv "Sevi B.V. — 2025 12 Sevi").
-Als IBAN beschikbaar is, gebruik deze voor consistentie: dezelfde IBAN = altijd dezelfde categorie.
-Let op: sommige transacties hebben nog ruwe bankomschrijvingen — lees dan de HELE tekst om de naam te vinden.
+datum|rekening|bedrag|omschrijving[|IBAN:tegenrekening]
+Omschrijving is vaak "Tegenpartij — Kenmerk" (bv "Sevi B.V. — 2025 12 Sevi"). Sommige transacties hebben ruwe bankomschrijvingen — lees dan de HELE tekst.
 
-2. INKOMSTEN (11 categorieën — ALLEEN echt verdiend geld):
-   - Netto salaris (loon van werkgever of eigen BV)
-   - UWV/Uitkeringen (WW, WIA, Ziektewet, bijstand)
-   - DGA-loon/Managementfee (vanuit eigen BV)
-   - Huurinkomsten (ontvangen huur van huurders)
-   - Toeslagen (zorgtoeslag, huurtoeslag, kindgebonden budget)
-   - Belastingteruggave (teruggave IB, BTW, voorlopige aanslag)
-   - Kinderbijslag/Kindregelingen
-   - Freelance/Opdrachten (losse inkomsten, facturen)
-   - Verzekeringsuitkering (schadevergoeding, letselschade, uitkering)
-   - Beleggingsinkomen (dividend, rente — ALLEEN daadwerkelijke opbrengst, NIET terugstortingen)
-   - Overig inkomen (STRIKT: alleen echt inkomen dat nergens anders past, NOOIT terugbetalingen/refunds)
+## CATEGORIEEN
 
-3. VASTE LASTEN (20 categorieën):
-   - Hypotheek/Huur
-   - Energie (gas, elektra, warmte)
-   - Water
-   - Gemeentebelasting/OZB/Waterschapsbelasting
-   - Zorgverzekering (basis + aanvullend)
-   - Inkomstenbelasting/Voorlopige aanslag
-   - BTW/Omzetbelasting
-   - Overige belastingen (erfbelasting, schenkbelasting)
-   - Autoverzekering
-   - Woonverzekering/Inboedel
-   - Overige verzekeringen (reis, aansprakelijkheid, uitvaart)
-   - Internet/TV (Ziggo, KPN, glasvezel)
-   - Mobiele telefonie
-   - Streaming/Digitaal (Netflix, Spotify, Disney+, iCloud)
-   - Overige abonnementen (krant, tijdschrift, software)
-   - Kinderopvang/BSO/School
-   - Contributie/Lidmaatschap (sport, vereniging)
-   - Donaties/Goede doelen
-   - Bankkosten
-   - Overige vaste lasten
+### INKOMSTEN (11 categorieen — ALLEEN echt verdiend/ontvangen geld)
+- Netto salaris
+- UWV/Uitkeringen
+- DGA-loon/Managementfee (vanuit eigen BV met "Holding"/"Management" in naam)
+- Huurinkomsten
+- Toeslagen (zorgtoeslag, huurtoeslag, kindgebonden budget)
+- Belastingteruggave
+- Kinderbijslag/Kindregelingen
+- Freelance/Opdrachten
+- Verzekeringsuitkering
+- Beleggingsinkomen (dividend, rente — NIET terugstortingen van broker)
+- Overig inkomen (STRIKT: max 5% van totaal inkomsten, NOOIT refunds/terugboekingen)
 
-4. VARIABELE KOSTEN (30 categorieën):
-   - Boodschappen/Supermarkt (Albert Heijn, Jumbo, Lidl etc.)
-   - Drogist (Etos, Kruidvat)
-   - Restaurant/Uit eten
-   - Café/Drinken
-   - Afhaal/Bezorging (Thuisbezorgd, Uber Eats)
-   - Benzine/Diesel/Laden
-   - OV/Trein (NS, OV-chipkaart)
-   - Parkeren
-   - Taxi/Uber
-   - Auto-onderhoud/APK
-   - Kleding
-   - Schoenen
-   - Huisarts/Tandarts/Specialist
-   - Apotheek/Medicijnen
-   - Ziekenhuiskosten/Eigen risico
-   - Fysiotherapie/Alternatief
-   - Brillen/Lenzen
-   - Huishoudelijke artikelen
-   - Meubels/Inrichting
-   - Tuin/Buiten
-   - Onderhoud woning/Klussen
-   - Elektronica/Gadgets (bol.com, Coolblue, Amazon)
-   - Boeken/Media
-   - Sport/Fitness
-   - Uitjes/Attracties/Bioscoop
-   - Vakantie/Reizen (accommodatie, vluchten, activiteiten)
-   - Cadeaus
-   - School/Studie/Cursussen
-   - Huisdieren
-   - Terugbetaling/Refund (retour, storno, cashback — positief bedrag van een winkel/webshop)
-   - Overig variabel
+### VASTE LASTEN (20 categorieen)
+- Hypotheek/Huur
+- Energie (gas, elektra, warmte)
+- Water
+- Gemeentebelasting/OZB/Waterschapsbelasting
+- Zorgverzekering (basis + aanvullend)
+- Inkomstenbelasting/Voorlopige aanslag
+- BTW/Omzetbelasting
+- Overige belastingen (erfbelasting, schenkbelasting, MRB)
+- Autoverzekering
+- Woonverzekering/Inboedel
+- Overige verzekeringen (reis, aansprakelijkheid, uitvaart)
+- Internet/TV (Ziggo, KPN, glasvezel)
+- Mobiele telefonie
+- Streaming/Digitaal (Netflix, Spotify, Disney+, iCloud)
+- Overige abonnementen (krant, tijdschrift, software)
+- Kinderopvang/BSO/School
+- Contributie/Lidmaatschap (sport, vereniging)
+- Donaties/Goede doelen
+- Bankkosten
+- Overige vaste lasten
 
-5. SPAREN & BELEGGEN (14 categorieën — inclusief terugstortingen):
-   - Effectenrekening (stortingen NAAR Saxo, DeGiro, IBKR = negatief bedrag)
-   - Effectenrekening (terugstorting) (geld TERUG van broker → positief bedrag, GEEN inkomen!)
-   - Crowdlending (stortingen naar Mintos, Lendahand, PeerBerry = negatief)
-   - Crowdlending (terugbetaling) (aflossingen/terugbetalingen van crowdlending = positief, GEEN inkomen!)
-   - Crypto (terugstorting) (geld terug van crypto-exchange = positief, GEEN inkomen!)
-   - Pensioenopbouw (Brand New Day, lijfrente)
-   - Pensioen (terugstorting) (geld terug van pensioenfonds = positief)
-   - Kindersparen
-   - Spaarrekening
-   - Crypto
-   - Vastgoedinvestering
-   - Beleggingsfonds/ETF
-   - Levensverzekering/Kapitaalverzekering
-   - Overig sparen/beleggen
+### VARIABELE KOSTEN (30 categorieen)
+- Boodschappen/Supermarkt
+- Drogist (Etos, Kruidvat)
+- Restaurant/Uit eten
+- Cafe/Drinken
+- Afhaal/Bezorging (Thuisbezorgd, Uber Eats)
+- Benzine/Diesel/Laden
+- OV/Trein (NS, OV-chipkaart)
+- Parkeren
+- Taxi/Uber
+- Auto-onderhoud/APK
+- Kleding
+- Schoenen
+- Huisarts/Tandarts/Specialist
+- Apotheek/Medicijnen
+- Ziekenhuiskosten/Eigen risico
+- Fysiotherapie/Alternatief
+- Brillen/Lenzen
+- Huishoudelijke artikelen
+- Meubels/Inrichting
+- Tuin/Buiten
+- Onderhoud woning/Klussen
+- Elektronica/Gadgets
+- Boeken/Media
+- Sport/Fitness
+- Uitjes/Attracties/Bioscoop
+- Vakantie/Reizen
+- Cadeaus
+- School/Studie/Cursussen
+- Huisdieren
+- Terugbetaling/Refund (positief bedrag van winkel/webshop: retour, storno, cashback)
+- Overig variabel
 
-6. INTERNE VERSCHUIVINGEN:
-   - Overboekingen eigen rekeningen (tussen eigen privé-, ondernemers-, spaar- en beleggingsrekeningen)
+### SPAREN & BELEGGEN (14 categorieen)
+- Effectenrekening (negatief = storting NAAR broker)
+- Effectenrekening (terugstorting) (positief = geld TERUG van broker, GEEN inkomen)
+- Crowdlending (negatief = storting)
+- Crowdlending (terugbetaling) (positief = aflossing/terugbetaling, GEEN inkomen)
+- Crypto (negatief = storting)
+- Crypto (terugstorting) (positief = geld terug, GEEN inkomen)
+- Pensioenopbouw (Brand New Day, lijfrente)
+- Pensioen (terugstorting)
+- Kindersparen
+- Spaarrekening
+- Vastgoedinvestering
+- Beleggingsfonds/ETF
+- Levensverzekering/Kapitaalverzekering
+- Overig sparen/beleggen
 
-## BELASTINGDIENST — BETALINGSKENMERKEN HERKENNEN
-Nederlandse belastingbetalingen bevatten een betalingskenmerk in de omschrijving.
-Gebruik deze kenmerken om het TYPE belasting te bepalen:
-- "IB" of "Inkomstenbelasting" of "Inkomstenbel" of "voorlopige aanslag IB" → Inkomstenbelasting/Voorlopige aanslag
-- "OB" of "Omzetbelasting" of "BTW" → BTW/Omzetbelasting
-- "MRB" of "Motorrijtuigenbelasting" of "wegenbelasting" → Overige belastingen
-- "ZVW" of "Zorgverzekeringswet" of "bijdrage Zvw" → Zorgverzekering
-- "Toeslagen" of "zorgtoeslag" of "huurtoeslag" of "kindgebonden" → Toeslagen (als INKOMSTEN)
-- "WOZ" of "OZB" of "gemeentelijke belasting" of "waterschapsbelasting" → Gemeentebelasting/OZB/Waterschapsbelasting
-- "Erfbelasting" of "schenkbelasting" → Overige belastingen
-- Belastingdienst TERUGGAVE (positief bedrag) → Belastingteruggave (als INKOMSTEN)
-- Belastingdienst BETALING (negatief bedrag) → juiste belastingcategorie hierboven
+### INTERNE VERSCHUIVINGEN
+- Overboekingen eigen rekeningen
 
-## CATEGORISATIE-HINTS (generiek voor Nederlandse huishoudens)
-- UWV → UWV/Uitkeringen
-- Saxo Bank / DeGiro / IBKR → Effectenrekening
-- Mintos / Lendahand / PeerBerry → Crowdlending
-- Brand New Day → Pensioenopbouw
-- bol.com / Coolblue / Amazon → Elektronica/Gadgets (tenzij duidelijk anders)
-- Albert Heijn / Jumbo / Lidl / Plus / Dirk → Boodschappen/Supermarkt
-- Etos / Kruidvat → Drogist
-- Ziggo / KPN / T-Mobile → Internet/TV of Mobiele telefonie (op basis van bedrag/context)
-- CZ Groep / Zilveren Kruis / Menzis → Zorgverzekering
-- Frank Energie / Vattenfall / Eneco / Essent / Budget Energie → Energie
-- Vitens / Brabant Water / PWN / Dunea → Water
-- Netflix / Spotify / Disney / Apple / iCloud / YouTube Premium → Streaming/Digitaal
-- NS / OV-chipkaart / Connexxion / Arriva → OV/Trein
-- Shell / BP / TotalEnergies / Tango / Tinq → Benzine/Diesel/Laden
-- BEA/GEA transacties bij restaurants/eetgelegenheden → Restaurant/Uit eten
-- BEA/GEA transacties bij tankstations → Benzine/Diesel/Laden
-- BEA/GEA transacties bij supermarkten → Boodschappen/Supermarkt
-- BEA/GEA transacties bij kledingwinkels (H&M, Zara, C&A, Primark) → Kleding
-- GIVT / KWF / Partij voor de Dieren / Rode Kruis / Oxfam → Donaties/Goede doelen
-- Thuisbezorgd / Uber Eats / Deliveroo → Afhaal/Bezorging
-- Uber / Bolt (taxi) → Taxi/Uber
-- Booking.com / Airbnb / Transavia / KLM / Ryanair → Vakantie/Reizen
-- Action / HEMA / IKEA huishoudelijk → Huishoudelijke artikelen
-- IKEA meubels/inrichting → Meubels/Inrichting
-- Apotheek / BENU → Apotheek/Medicijnen
-- SALARIS/LOON UIT B.V.: Een vast maandelijks bedrag van een B.V. (bevat "B.V." of "BV" in de naam) is waarschijnlijk salaris. Als de B.V.-naam "Holding" of "Management" bevat → classificeer als "DGA-loon/Managementfee". Anders → classificeer als "Netto salaris". Neem NIET aan dat iemand eigenaar is van een B.V. alleen omdat die persoon geld ontvangt.
-- HUURINKOMSTEN HERKENNING: Regelmatige (maandelijkse) bijschrijvingen van dezelfde persoon met een vast bedrag zijn waarschijnlijk huurinkomsten.
+## HERKENNINGSREGELS
 
-## NEDERLANDSE FINANCIELE CONTEXT
-- HYPOTHEEK-GEKOPPELDE VERZEKERINGEN: Maandelijkse betalingen aan ASR, Nationale-Nederlanden, Aegon, Delta Lloyd, VIVAT, Reaal, a.s.r., NN Group die een levensverzekering of kapitaalverzekering betreffen, zijn in Nederland bijna altijd onderdeel van een hypotheekconstructie (spaarhypotheek, beleggingshypotheek). Categoriseer als Hypotheek/Huur, NIET als Sparen & Beleggen. Vermeld in de analyse dat het waarschijnlijk een hypotheek-gekoppelde verzekering betreft.
-- INTERNE VERSCHUIVINGEN: Overboekingen tussen eigen rekeningen zijn AL verwijderd uit de transactielijst. Ze tellen NIET mee als inkomen of uitgave. Categoriseer NOOIT een transactie als "Overig inkomen" als het eigenlijk een interne overboeking is.
-- SALARIS UIT B.V.: Een maandelijks vast bedrag van een BV (herkenbaar aan "B.V." of "BV" in de naam) is waarschijnlijk salaris of DGA-loon, niet "Overig inkomen". Alleen als "Holding" of "Management" in de naam staat → "DGA-loon/Managementfee". Anders → "Netto salaris".
-- CREDITCARD-AFLOSSING: Een betaling aan een creditcardmaatschappij (ICS, VISA, Mastercard, American Express) is geen consumptie maar een aflossing. Categoriseer als Interne verschuivingen of negeer als de onderliggende transacties al apart staan.
+### Belastingdienst (bepaal type op betalingskenmerk)
+- "IB"/"Inkomstenbelasting"/"voorlopige aanslag IB" = Inkomstenbelasting/Voorlopige aanslag
+- "OB"/"Omzetbelasting"/"BTW" = BTW/Omzetbelasting
+- "MRB"/"Motorrijtuigenbelasting" = Overige belastingen
+- "ZVW"/"Zorgverzekeringswet" = Zorgverzekering
+- "Toeslagen"/"zorgtoeslag"/"huurtoeslag" = Toeslagen (INKOMSTEN)
+- "WOZ"/"OZB"/"waterschapsbelasting" = Gemeentebelasting/OZB/Waterschapsbelasting
+- Belastingdienst met POSITIEF bedrag = Belastingteruggave (INKOMSTEN)
 
-## BELANGRIJKE PRINCIPES
-- De TOTALEN hieronder zijn wiskundig berekend en 100% correct. Gebruik deze cijfers, reken NIETS zelf.
-- "Overig" categorieën mogen MAXIMAAL 3% van het totaalbedrag per sectie bevatten. Als er veel in "Overig" dreigt te belanden, zoek dan HARDER naar een passende categorie.
-- Wees SPECIFIEK: gebruik je kennis van Nederlandse bedrijfsnamen, winkelketens en dienstverleners.
-- Bij twijfel tussen twee categorieën: kies de meest specifieke.
-- Online aankopen (bol.com etc.) zijn NIET automatisch "Overig" — categoriseer op basis van wat er waarschijnlijk gekocht is.
-- Elke transactie met een herkenbare tegenpartij MOET in een specifieke categorie, NOOIT in "Overig".
-- Bekijk het bedrag: kleine bedragen bij een onbekende tegenpartij passen vaak bij Boodschappen, Huishoudelijke artikelen, of Café. Grotere bedragen bij onbekenden passen vaak bij Onderhoud woning, Meubels, of Vakantie.
-- BV-eigendom: zeg ALLEEN "uw BV" als de BV voorkomt in de CATEGORISATIE-HINTS als eigen BV van de gebruiker. Als een BV NIET in de hints staat, beschrijf dan alleen de feitelijke geldstroom zonder eigendom aan te nemen. Een betaling AAN een BV betekent NIET dat de gebruiker eigenaar is.
+### Nederlandse bedrijven (categorie-lookup)
+- Albert Heijn/Jumbo/Lidl/Plus/Dirk = Boodschappen/Supermarkt
+- Etos/Kruidvat = Drogist
+- Shell/BP/TotalEnergies/Tango/Tinq = Benzine/Diesel/Laden
+- NS/OV-chipkaart/Connexxon/Arriva = OV/Trein
+- Ziggo/KPN/T-Mobile = Internet/TV of Mobiele telefonie (op basis van bedrag/context)
+- CZ/Zilveren Kruis/Menzis/VGZ = Zorgverzekering
+- Frank Energie/Vattenfall/Eneco/Essent = Energie
+- Vitens/Brabant Water/PWN/Dunea = Water
+- Netflix/Spotify/Disney+/Apple/iCloud = Streaming/Digitaal
+- Thuisbezorgd/Uber Eats/Deliveroo = Afhaal/Bezorging
+- Uber/Bolt (taxi) = Taxi/Uber
+- Booking.com/Airbnb/Transavia/KLM/Ryanair = Vakantie/Reizen
+- bol.com/Coolblue/Amazon = Elektronica/Gadgets (tenzij duidelijk anders)
+- GIVT/KWF/Rode Kruis/Oxfam = Donaties/Goede doelen
+- H&M/Zara/C&A/Primark = Kleding
+- Action/HEMA = Huishoudelijke artikelen
+- IKEA = Meubels/Inrichting (of Huishoudelijke artikelen bij klein bedrag)
+- Apotheek/BENU = Apotheek/Medicijnen
+- Saxo Bank/DeGiro/IBKR/Meesman = Effectenrekening
+- Mintos/Lendahand/PeerBerry = Crowdlending
+- Brand New Day = Pensioenopbouw
+- UWV = UWV/Uitkeringen
+- ASR/Nationale-Nederlanden/Aegon/Delta Lloyd/Reaal: check context — levensverzekering bij hypotheek = Hypotheek/Huur
 
-## ANTI-OVERIG PROTOCOL
-Voordat je een transactie als "Overige vaste lasten", "Overig variabel", of "Overig inkomen" classificeert,
-doorloop je VERPLICHT deze checklist:
-1. Staat er een bedrijfsnaam in de omschrijving? → Zoek wat voor bedrijf het is.
-2. Bevat de omschrijving een aanwijzing? (verzekering, tandarts, apotheek, garage, school, etc.)
-3. Is het een BEA/GEA transactie? → Kijk naar de locatie/winkelnaam erna.
-4. Komt dezelfde tegenpartij vaker voor? → Kijk naar het patroon (vast bedrag = vaste lasten, wisselend = variabel).
-5. Wat is het bedrag? Klein (< €50) bij onbekend → waarschijnlijk Boodschappen of Huishoudelijke artikelen.
-   Middelgroot (€50-€500) → waarschijnlijk Onderhoud/Klussen, Meubels, Kleding, of Elektronica.
-   Groot (> €500) → waarschijnlijk Vakantie, Auto-onderhoud, of Meubels/Inrichting.
-ALLEEN als je na alle 5 stappen ECHT geen categorie kunt vinden, mag je "Overig" gebruiken.
+### BEA/GEA transacties (pinbetalingen)
+Kijk ALTIJD naar de winkelnaam NA "BEA" of "GEA":
+- Bij supermarkt = Boodschappen/Supermarkt
+- Bij tankstation = Benzine/Diesel/Laden
+- Bij restaurant/eetgelegenheid = Restaurant/Uit eten
+- Bij kledingwinkel = Kleding
+
+### Salaris uit B.V.
+- Vast maandelijks bedrag van een B.V. = waarschijnlijk salaris
+- "Holding"/"Management" in naam = DGA-loon/Managementfee
+- Anders = Netto salaris
+- Zeg NOOIT "uw BV" tenzij de BV expliciet als eigen BV is aangemerkt
+
+### Creditcard-aflossing
+ICS/VISA/Mastercard/American Express = Interne verschuivingen (geen consumptie)
+
+### Hypotheek-gekoppelde verzekeringen
+Maandelijkse betalingen aan ASR/NN/Aegon/Delta Lloyd voor levensverzekering/kapitaalverzekering = Hypotheek/Huur (onderdeel spaarhypotheek), NIET Sparen & Beleggen
 
 ## TOP TEGENPARTIJEN
 {json.dumps(top, indent=2, ensure_ascii=False)}

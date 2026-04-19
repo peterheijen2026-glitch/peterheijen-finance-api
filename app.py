@@ -6986,17 +6986,20 @@ def _bouw_ground_truth(merged_data: dict, feiten: dict, rapportperiode: dict,
                     bestaand = combined_jaar[sectie].get(cat, 0)
                     combined_jaar[sectie][cat] = round(bestaand + float(bedrag), 2)
 
-    # Bereken sectie-totalen (alleen volle maanden)
-    sectie_totalen_12m = {}
-    for sectie, cats in combined_jaar.items():
-        sectie_totalen_12m[sectie] = round(sum(float(v) for v in cats.values()), 2)
-
     # Per-maand sectie-totalen
     maand_sectie_totalen = {}
     for maand, secties in combined_maand.items():
         maand_sectie_totalen[maand] = {}
         for sectie, cats in secties.items():
             maand_sectie_totalen[maand][sectie] = round(sum(float(v) for v in cats.values()), 2)
+
+    # Bereken sectie-totalen als SOM VAN MAANDEN (niet uit AI-jaartotalen)
+    # Dit garandeert dat sectie_totalen_12m == sum(maand_sectie_totalen)
+    # en voorkomt JAARTOTAAL ≠ SOM MAANDEN gate-blokkade
+    sectie_totalen_12m = {}
+    for maand_data in maand_sectie_totalen.values():
+        for sectie, totaal in maand_data.items():
+            sectie_totalen_12m[sectie] = round(sectie_totalen_12m.get(sectie, 0) + totaal, 2)
 
     # Saldo per rekening per maand
     saldo_per_rekening = {}

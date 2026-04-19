@@ -6085,7 +6085,7 @@ class RapportPDF(FPDF):
         # Max rijen per sectie om op 1 pagina te passen
         _SECTIE_CONFIG = [
             ('inkomsten',        'INKOMSTEN',          (26, 107, 60),   6),
-            ('vaste_lasten',     'VASTE LASTEN',       (74, 85, 104),   10),
+            ('vaste_lasten',     'VASTE LASTEN',       (74, 85, 104),   14),
             ('variabele_kosten', 'VARIABELE KOSTEN',   (100, 100, 120), 12),
             ('sparen_beleggen',  'SPAREN & BELEGGEN',  (26, 90, 140),   5),
         ]
@@ -6167,23 +6167,23 @@ class RapportPDF(FPDF):
             running += maand_netto[maand]
         maand_eindsaldo = {m: round(maand_beginsaldo[m] + maand_netto[m], 2) for m in maanden}
 
-        # --- LAYOUT: landscape pagina ---
-        # Bewaar huidige orientatie en stel landscape in
-        self.add_page(orientation='L')
+        # --- LAYOUT: portrait A4 pagina ---
+        self.add_page()  # portrait (default)
 
-        # Dimensies landscape A4: 297 x 210
-        page_w = 297
-        page_h = 210
-        margin_l = 8
-        margin_r = 5
-        margin_t = 11  # Na de header bar (8mm) + kleine marge
-        usable_w = page_w - margin_l - margin_r  # ~284
+        # Dimensies portrait A4: 210 x 297
+        page_w = 210
+        page_h = 297
+        margin_l = 6
+        margin_r = 4
+        margin_t = 11
+        usable_w = page_w - margin_l - margin_r  # ~200
 
-        # Kolom-breedtes
-        col_label = 48  # categorienaam
+        # Kolom-breedtes: smaller voor portrait
+        col_label = 34  # categorienaam (compact)
+        col_totaal = 13  # totaalkolom rechts
         n_months = len(maanden)
-        col_month = (usable_w - col_label) / n_months if n_months > 0 else 18
-        rij_h = 3.0
+        col_month = (usable_w - col_label - col_totaal) / n_months if n_months > 0 else 12
+        rij_h = 3.2
 
         # Titel
         self.set_font(self.HEADING, '', 10)
@@ -6192,7 +6192,7 @@ class RapportPDF(FPDF):
         self.cell(0, 5, 'Maandelijks Cashflow Overzicht', 0, 0, 'L')
         self.set_draw_color(*GOLD)
         self.set_line_width(0.5)
-        self.line(margin_l, margin_t + 5.5, margin_l + 80, margin_t + 5.5)
+        self.line(margin_l, margin_t + 5.5, margin_l + 70, margin_t + 5.5)
 
         y = margin_t + 8
 
@@ -6205,15 +6205,14 @@ class RapportPDF(FPDF):
                 return f"{v/1000:,.1f}k".replace(',', '.')
             return f"{v:,.0f}".replace(',', '.')
 
-        # --- KOLOMKOPPEN: maandlabels ---
+        # --- KOLOMKOPPEN: maandlabels + TOTAAL ---
         self.set_fill_color(26, 26, 46)
         self.rect(margin_l, y, usable_w, rij_h + 1, 'F')
-        self.set_font(self.DATA, 'B', 5)
+        self.set_font(self.DATA, 'B', 4.5)
         self.set_text_color(255, 255, 255)
-        self.set_xy(margin_l + 2, y + 0.5)
-        self.cell(col_label - 2, rij_h, '', 0, 0, 'L')
+        self.set_xy(margin_l + 1, y + 0.5)
+        self.cell(col_label - 1, rij_h, '', 0, 0, 'L')
         for i, maand in enumerate(maanden):
-            # Maandnaam kort: "apr'25"
             try:
                 parts = maand.split('-')
                 maand_namen = ['jan','feb','mrt','apr','mei','jun','jul','aug','sep','okt','nov','dec']
@@ -6223,25 +6222,50 @@ class RapportPDF(FPDF):
             x = margin_l + col_label + i * col_month
             self.set_xy(x, y + 0.5)
             self.cell(col_month, rij_h, label, 0, 0, 'R')
+        # Totaal header
+        x_totaal = margin_l + col_label + n_months * col_month
+        self.set_fill_color(26, 26, 46)
+        self.set_xy(x_totaal, y + 0.5)
+        self.set_font(self.DATA, 'B', 4.5)
+        self.set_text_color(212, 175, 55)  # GOLD text
+        self.cell(col_totaal, rij_h, 'TOTAAL', 0, 0, 'R')
         y += rij_h + 1
+
+        # --- Helper: totaal voor een rij over alle maanden ---
+        def _row_totaal(row_key, row_label, cur_sk, cons):
+            """Bereken totaal over alle maanden voor een rij."""
+            t = 0
+            for maand in maanden:
+                if row_key == '_beginsaldo':
+                    return maand_beginsaldo.get(maanden[0], 0)  # begin = eerste maand
+                elif row_key == '_eindsaldo':
+                    return maand_eindsaldo.get(maanden[-1], 0)  # eind = laatste maand
+                else:
+                    t += _get_cat_month(maand, cur_sk, row_label, cons)
+            return t
+
+        # --- Verticale scheidingslijn voor totaalkolom ---
+        totaal_x_start = margin_l + col_label + n_months * col_month - 0.5
 
         # --- RIJEN TEKENEN ---
         cur_sectie_key = None
         row_idx = 0
 
         for row_label, row_key, is_header, is_total in rows:
-            # Stop als we de pagina-ondergrens bereiken (niet overlopen)
-            if y + rij_h > page_h - 12:
+            if y + rij_h > page_h - 10:
                 break
 
             if is_total:
                 # Beginsaldo / Eindsaldo regel
                 self.set_fill_color(240, 238, 232)
                 self.rect(margin_l, y, usable_w, rij_h, 'F')
-                self.set_font(self.DATA, 'B', 5)
+                # Totaalkolom donkerder achtergrond
+                self.set_fill_color(228, 224, 216)
+                self.rect(totaal_x_start + 0.5, y, col_totaal + 1, rij_h, 'F')
+                self.set_font(self.DATA, 'B', 4.5)
                 self.set_text_color(26, 26, 46)
-                self.set_xy(margin_l + 2, y + 0.3)
-                self.cell(col_label - 2, rij_h, row_label, 0, 0, 'L')
+                self.set_xy(margin_l + 1, y + 0.3)
+                self.cell(col_label - 1, rij_h, row_label, 0, 0, 'L')
 
                 for i, maand in enumerate(maanden):
                     if row_key == '_beginsaldo':
@@ -6252,6 +6276,16 @@ class RapportPDF(FPDF):
                     self.set_xy(x, y + 0.3)
                     self.set_text_color(26, 26, 46)
                     self.cell(col_month, rij_h, _eur_k(val), 0, 0, 'R')
+
+                # Totaalkolom: begin=eerste, eind=laatste
+                if row_key == '_beginsaldo':
+                    tot_val = maand_beginsaldo.get(maanden[0], 0) if maanden else 0
+                else:
+                    tot_val = maand_eindsaldo.get(maanden[-1], 0) if maanden else 0
+                self.set_xy(x_totaal, y + 0.3)
+                self.set_font(self.DATA, 'B', 4.5)
+                self.set_text_color(26, 26, 46)
+                self.cell(col_totaal, rij_h, _eur_k(tot_val), 0, 0, 'R')
                 y += rij_h + 0.5
 
             elif is_header:
@@ -6260,18 +6294,25 @@ class RapportPDF(FPDF):
                 kleur = next((k for sk, _, k, _ in _SECTIE_CONFIG if sk == row_key), (100, 100, 100))
                 self.set_fill_color(*kleur)
                 self.rect(margin_l, y, usable_w, rij_h, 'F')
-                self.set_font(self.DATA, 'B', 5)
+                self.set_font(self.DATA, 'B', 4.5)
                 self.set_text_color(255, 255, 255)
-                self.set_xy(margin_l + 2, y + 0.3)
-                self.cell(col_label - 2, rij_h, row_label, 0, 0, 'L')
+                self.set_xy(margin_l + 1, y + 0.3)
+                self.cell(col_label - 1, rij_h, row_label, 0, 0, 'L')
 
                 # Sectie-totalen per maand
+                sectie_jaar_totaal = 0
                 for i, maand in enumerate(maanden):
                     cats = maandoverzicht.get(maand, {}).get(row_key, {})
                     totaal = sum(float(v) for v in cats.values())
+                    sectie_jaar_totaal += totaal
                     x = margin_l + col_label + i * col_month
                     self.set_xy(x, y + 0.3)
                     self.cell(col_month, rij_h, _eur_k(totaal), 0, 0, 'R')
+
+                # Totaalkolom voor sectie
+                self.set_xy(x_totaal, y + 0.3)
+                self.set_font(self.DATA, 'B', 4.5)
+                self.cell(col_totaal, rij_h, _eur_k(sectie_jaar_totaal), 0, 0, 'R')
                 y += rij_h
                 row_idx = 0
 
@@ -6280,19 +6321,27 @@ class RapportPDF(FPDF):
                 if row_idx % 2 == 0:
                     self.set_fill_color(250, 249, 246)
                     self.rect(margin_l, y, usable_w, rij_h, 'F')
+                # Totaalkolom licht accent
+                if row_idx % 2 == 0:
+                    self.set_fill_color(245, 243, 238)
+                    self.rect(totaal_x_start + 0.5, y, col_totaal + 1, rij_h, 'F')
 
                 # Dunne lijn
                 self.set_draw_color(235, 233, 228)
                 self.line(margin_l, y + rij_h, margin_l + usable_w, y + rij_h)
 
-                self.set_font(self.DATA, '', 4.5)
+                self.set_font(self.DATA, '', 4)
                 self.set_text_color(80, 80, 100)
-                self.set_xy(margin_l + 4, y + 0.3)
-                self.cell(col_label - 4, rij_h, row_label[:30], 0, 0, 'L')
+                self.set_xy(margin_l + 3, y + 0.3)
+                # Truncate label om te passen in smallere kolom
+                display_label = row_label[:26] if len(row_label) > 26 else row_label
+                self.cell(col_label - 3, rij_h, display_label, 0, 0, 'L')
 
                 cons = cons_per_sectie.get(cur_sectie_key, [])
+                cat_jaar_totaal = 0
                 for i, maand in enumerate(maanden):
                     val = _get_cat_month(maand, cur_sectie_key, row_label, cons)
+                    cat_jaar_totaal += val
                     x = margin_l + col_label + i * col_month
                     self.set_xy(x, y + 0.3)
                     if val > 0:
@@ -6303,8 +6352,24 @@ class RapportPDF(FPDF):
                         self.set_text_color(180, 180, 180)
                     self.cell(col_month, rij_h, _eur_k(val), 0, 0, 'R')
 
+                # Totaalkolom
+                self.set_xy(x_totaal, y + 0.3)
+                self.set_font(self.DATA, 'B', 4)
+                if cat_jaar_totaal > 0:
+                    self.set_text_color(26, 107, 60)
+                elif cat_jaar_totaal < 0:
+                    self.set_text_color(60, 60, 80)
+                else:
+                    self.set_text_color(180, 180, 180)
+                self.cell(col_totaal, rij_h, _eur_k(cat_jaar_totaal), 0, 0, 'R')
+
                 y += rij_h
                 row_idx += 1
+
+        # Verticale scheidingslijn totaalkolom
+        self.set_draw_color(*GOLD)
+        self.set_line_width(0.3)
+        self.line(totaal_x_start + 0.5, margin_t + 8, totaal_x_start + 0.5, y)
 
         # Gouden lijn voor eindsaldo
         if rows and rows[-1][1] == '_eindsaldo':

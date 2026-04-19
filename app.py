@@ -5405,21 +5405,73 @@ def _vraag_openai(prompt: str, model: str) -> dict:
     return tekst, tokens_in, tokens_out
 
 
-# Model configuratie:
-# AI_PROVIDER = 'claude' of 'openai'
-# CLAUDE_MODEL = 'claude-opus-4-6' (default)
-# OPENAI_MODEL = 'gpt-5.4' (default)
-# Kwaliteit > snelheid. Altijd het slimste model.
+def _vraag_gemini(prompt: str, model: str) -> tuple:
+    """Roep Google Gemini API aan."""
+    import google.generativeai as genai
 
-def vraag_ai(prompt: str) -> dict:
-    """Generieke AI-aanroep — kiest automatisch Claude of GPT op basis van AI_PROVIDER env var."""
-    provider = os.environ.get('AI_PROVIDER', 'claude').lower()
+    api_key = os.environ.get('GOOGLE_AI_API_KEY')
+    if not api_key:
+        raise ValueError("GOOGLE_AI_API_KEY niet geconfigureerd — stel in via Railway Variables")
+
+    genai.configure(api_key=api_key)
+
+    logger.info(f"Gemini aanroepen ({model}), prompt: {len(prompt)} tekens (~{len(prompt)//4} tokens)")
+
+    gen_model = genai.GenerativeModel(model)
+    response = gen_model.generate_content(
+        prompt,
+        generation_config=genai.types.GenerationConfig(
+            max_output_tokens=32000,
+            temperature=0.1,
+        ),
+    )
+
+    tekst = response.text
+    # Gemini usage metadata
+    tokens_in = getattr(response.usage_metadata, 'prompt_token_count', 0) if response.usage_metadata else 0
+    tokens_out = getattr(response.usage_metadata, 'candidates_token_count', 0) if response.usage_metadata else 0
+    logger.info(f"Gemini klaar: {tokens_in} in, {tokens_out} out")
+
+    return tekst, tokens_in, tokens_out
+
+
+# ---------------------------------------------------------------------------
+# Model configuratie & selectie
+# ---------------------------------------------------------------------------
+# Beschikbare categorizers (frontend value → provider + model):
+_AI_CATEGORIZERS = {
+    'claude_opus_47': ('claude', 'claude-opus-4-7'),
+    'claude_opus_46': ('claude', 'claude-opus-4-6'),
+    'openai_gpt54':   ('openai', 'gpt-5.4'),
+    'gemini_25_pro':  ('gemini', 'gemini-2.5-pro'),
+}
+
+def vraag_ai(prompt: str, categorizer: str = None) -> dict:
+    """Generieke AI-aanroep — kiest model op basis van categorizer parameter.
+
+    categorizer: een key uit _AI_CATEGORIZERS (bijv. 'claude_opus_47').
+    Als None: valt terug op env vars AI_PROVIDER/CLAUDE_MODEL (backward compatible).
+    """
+    if categorizer and categorizer in _AI_CATEGORIZERS:
+        provider, model = _AI_CATEGORIZERS[categorizer]
+    elif categorizer and categorizer == 'shortcut_excel':
+        # Shortcut flow wordt apart afgehandeld, niet via deze functie
+        raise ValueError("Shortcut Excel flow moet apart worden afgehandeld")
+    else:
+        # Backward compatible: env vars
+        provider = os.environ.get('AI_PROVIDER', 'claude').lower()
+        if provider == 'openai':
+            model = os.environ.get('OPENAI_MODEL', 'gpt-5.4')
+        elif provider == 'gemini':
+            model = os.environ.get('GEMINI_MODEL', 'gemini-2.5-pro')
+        else:
+            model = os.environ.get('CLAUDE_MODEL', 'claude-opus-4-7')
 
     if provider == 'openai':
-        model = os.environ.get('OPENAI_MODEL', 'gpt-5.4')
         tekst, tokens_in, tokens_out = _vraag_openai(prompt, model)
+    elif provider == 'gemini':
+        tekst, tokens_in, tokens_out = _vraag_gemini(prompt, model)
     else:
-        model = os.environ.get('CLAUDE_MODEL', 'claude-opus-4-6')
         tekst, tokens_in, tokens_out = _vraag_claude(prompt, model)
 
     # Parse JSON uit response
@@ -5448,8 +5500,8 @@ def vraag_ai(prompt: str) -> dict:
 
 
 # Backward compatible alias
-def vraag_claude(prompt: str) -> dict:
-    return vraag_ai(prompt)
+def vraag_claude(prompt: str, categorizer: str = None) -> dict:
+    return vraag_ai(prompt, categorizer=categorizer)
 
 
 # ---------------------------------------------------------------------------
@@ -7636,10 +7688,11 @@ def _bouw_audit_package(ground_truth: dict, gate_result: dict, kwaliteit: dict,
     }
 
 
-def _run_rapport_pipeline(job_id: str, bestanden: list, email: str):
+def _run_rapport_pipeline(job_id: str, bestanden: list, email: str, ai_categorizer: str = 'claude_opus_47'):
     """Achtergrond-thread: volledige pipeline upload → analyse → PDF → email.
 
     bestanden: list van (inhoud_bytes, bestandsnaam) tuples.
+    ai_categorizer: welk AI-model voor classificatie (key uit _AI_CATEGORIZERS).
     Schrijft voortgang naar jobs[job_id] zodat de status-endpoint het kan serveren.
     Draait NIET in een HTTP-request — dus geen proxy timeout meer.
     """
@@ -7773,12 +7826,12 @@ def _run_rapport_pipeline(job_id: str, bestanden: list, email: str):
         logger.info(f"[{job_id}] Voorlopige ground truth gebouwd (rule-based only)")
 
         # 3. AI categoriseren + analyseren (langste stap: 30s-300s)
-        provider = os.environ.get('AI_PROVIDER', 'claude').lower()
-        model_naam = os.environ.get('OPENAI_MODEL', 'gpt-5.4') if provider == 'openai' else os.environ.get('CLAUDE_MODEL', 'claude-opus-4-6')
+        cat_info = _AI_CATEGORIZERS.get(ai_categorizer, ('claude', 'claude-opus-4-7'))
+        model_naam = cat_info[1]
         update(f'AI analyseert uw transacties ({model_naam})...', 35)
         prompt = bouw_prompt(df, feiten, top, eigen_rekeningen=eigen_rekeningen, ground_truth=pre_ground_truth)
-        logger.info(f"[{job_id}] Prompt: {len(prompt)} tekens, {len(df)} transacties")
-        claude_result = vraag_claude(prompt)
+        logger.info(f"[{job_id}] Prompt: {len(prompt)} tekens, {len(df)} transacties, categorizer={ai_categorizer}")
+        claude_result = vraag_claude(prompt, categorizer=ai_categorizer)
 
         if not claude_result.get('data'):
             raise ValueError(f"AI-analyse ongeldig: {claude_result.get('error', 'onbekend')}")
@@ -7928,17 +7981,21 @@ def _run_rapport_pipeline(job_id: str, bestanden: list, email: str):
 
 
 @app.post("/rapport")
-async def rapport(bestanden: Optional[List[UploadFile]] = None, bestand: Optional[UploadFile] = None, email: str = Form(...)):
+async def rapport(bestanden: Optional[List[UploadFile]] = None, bestand: Optional[UploadFile] = None,
+                  email: str = Form(...), ai_categorizer: str = Form('claude_opus_47')):
     """Start de rapport-pipeline als achtergrond-job.
 
     Accepteert één of meerdere bestanden:
       - 'bestanden' (meerdere files) of 'bestand' (enkele file, backward compatible)
 
+    ai_categorizer: keuze uit 'claude_opus_47', 'claude_opus_46', 'openai_gpt54',
+                    'gemini_25_pro', 'shortcut_excel'.
+
     Retourneert DIRECT (< 1 sec) met een job_id.
     Client pollt /rapport/{job_id}/status voor voortgang.
     """
     job_id = str(uuid.uuid4())[:8]
-    logger.info(f"[{job_id}] Rapport aangevraagd voor {email}")
+    logger.info(f"[{job_id}] Rapport aangevraagd voor {email}, categorizer={ai_categorizer}")
 
     # Verzamel alle bestanden (support zowel 'bestanden' als 'bestand' veld)
     uploads = []
@@ -7986,7 +8043,7 @@ async def rapport(bestanden: Optional[List[UploadFile]] = None, bestand: Optiona
     # Start achtergrond-thread
     thread = threading.Thread(
         target=_run_rapport_pipeline,
-        args=(job_id, bestanden_data, email),
+        args=(job_id, bestanden_data, email, ai_categorizer),
         daemon=True,
     )
     thread.start()
@@ -7994,6 +8051,7 @@ async def rapport(bestanden: Optional[List[UploadFile]] = None, bestand: Optiona
     return {
         'job_id': job_id,
         'status': 'gestart',
+        'categorizer': ai_categorizer,
     }
 
 

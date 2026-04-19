@@ -5443,7 +5443,7 @@ _AI_CATEGORIZERS = {
     'claude_opus_47': ('claude', 'claude-opus-4-7'),
     'claude_opus_46': ('claude', 'claude-opus-4-6'),
     'openai_gpt54':   ('openai', 'gpt-5.4'),
-    'gemini_25_pro':  ('gemini', 'gemini-2.5-pro'),
+    'gemini_31_pro':  ('gemini', 'gemini-3.1-pro-preview'),
 }
 
 def vraag_ai(prompt: str, categorizer: str = None) -> dict:
@@ -5463,7 +5463,7 @@ def vraag_ai(prompt: str, categorizer: str = None) -> dict:
         if provider == 'openai':
             model = os.environ.get('OPENAI_MODEL', 'gpt-5.4')
         elif provider == 'gemini':
-            model = os.environ.get('GEMINI_MODEL', 'gemini-2.5-pro')
+            model = os.environ.get('GEMINI_MODEL', 'gemini-3.1-pro-preview')
         else:
             model = os.environ.get('CLAUDE_MODEL', 'claude-opus-4-7')
 

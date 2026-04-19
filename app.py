@@ -4596,14 +4596,16 @@ def _genereer_strategische_inzichten(ground_truth: dict, df: pd.DataFrame) -> di
     - signalen: lijst van strategische observaties
     - cashflow_trend: maandelijkse trend data
     """
+    # Gebruik rapport_totalen als single source of truth
+    rt = ground_truth.get('rapport_totalen', {})
     sectie_totalen = ground_truth.get('sectie_totalen_12m', {})
     n_mnd = ground_truth.get('periode', {}).get('n_mnd', 12)
     income_sources = ground_truth.get('income_sources', {})
     maand_sectie = ground_truth.get('maand_sectie_totalen', {})
 
-    inkomsten = abs(sectie_totalen.get('inkomsten', 0))
-    vaste_lasten = abs(sectie_totalen.get('vaste_lasten', 0))
-    variabele = abs(sectie_totalen.get('variabele_kosten', 0))
+    inkomsten = rt.get('bruto_inkomen_12m', abs(sectie_totalen.get('inkomsten', 0)))
+    vaste_lasten = rt.get('vaste_lasten_12m', abs(sectie_totalen.get('vaste_lasten', 0)))
+    variabele = rt.get('variabele_kosten_12m', abs(sectie_totalen.get('variabele_kosten', 0)))
     sparen = abs(sectie_totalen.get('sparen_beleggen', 0))
     totaal_uit = vaste_lasten + variabele
 
@@ -4612,7 +4614,7 @@ def _genereer_strategische_inzichten(ground_truth: dict, df: pd.DataFrame) -> di
 
     # Spaarquote: (inkomsten - uitgaven) / inkomsten
     if inkomsten > 0:
-        netto_cashflow = inkomsten - totaal_uit
+        netto_cashflow = rt.get('netto_beschikbaar_12m', inkomsten - totaal_uit)
         spaarquote = netto_cashflow / inkomsten
         kengetallen['spaarquote'] = round(spaarquote * 100, 1)
         kengetallen['netto_cashflow_pm'] = round(netto_cashflow / max(n_mnd, 1), 0)
@@ -5579,6 +5581,111 @@ def vraag_claude(prompt: str, categorizer: str = None) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# AI AUDITOR — onafhankelijke sanity check op ground truth
+# ---------------------------------------------------------------------------
+
+_AUDITOR_MODELS = {
+    'openai_gpt54': ('openai', 'gpt-5.4'),
+    'claude_opus_47': ('claude', 'claude-opus-4-7'),
+    'gemini_31_pro': ('gemini', 'gemini-3.1-pro-preview'),
+    'none': (None, None),
+}
+
+
+def _ai_auditor(ground_truth: dict, auditor_model: str = 'openai_gpt54') -> dict:
+    """Onafhankelijke AI sanity check op het eindrapport.
+
+    Stuurt de rapport_totalen, sectie_totalen en top-categorieën naar een AI
+    met de opdracht: controleer op inconsistenties, onrealistische verhoudingen,
+    en logische fouten. Retourneert dict met status + bevindingen.
+    """
+    if auditor_model == 'none' or auditor_model not in _AUDITOR_MODELS:
+        return {'status': 'skipped', 'issues': [], 'model': auditor_model}
+
+    rt = ground_truth.get('rapport_totalen', {})
+    st = ground_truth.get('sectie_totalen_12m', {})
+    ct = ground_truth.get('categorie_totalen_12m', {})
+    n_mnd = ground_truth.get('periode', {}).get('n_mnd', 12)
+    saldo = ground_truth.get('saldo', {})
+    income_sources = ground_truth.get('income_sources', {})
+
+    # Bouw compact overzicht voor de auditor
+    cat_overzicht = {}
+    for sectie, cats in ct.items():
+        top_cats = sorted(cats.items(), key=lambda x: -abs(float(x[1])))[:8]
+        cat_overzicht[sectie] = {k: round(float(v), 2) for k, v in top_cats}
+
+    src_overzicht = {}
+    for sf, data in income_sources.items():
+        src_overzicht[sf] = round(abs(data.get('bedrag_12m', 0)), 2)
+
+    audit_data = {
+        'periode_maanden': n_mnd,
+        'rapport_totalen': rt,
+        'sectie_totalen_12m': {k: round(v, 2) for k, v in st.items()},
+        'top_categorieen_per_sectie': cat_overzicht,
+        'income_sources': src_overzicht,
+        'saldo_begin': saldo.get('totaal_begin', 0),
+        'saldo_eind': saldo.get('totaal_eind', 0),
+    }
+
+    prompt = f"""Je bent een onafhankelijke financiële auditor. Je controleert een automatisch gegenereerd
+huishoudrapport op fouten en inconsistenties VOORDAT het naar de klant gaat.
+
+GEGEVENS:
+{json.dumps(audit_data, indent=2, ensure_ascii=False)}
+
+CONTROLEER:
+1. Kloppen de rapport_totalen met de sectie_totalen? (bruto_inkomen moet gelijk zijn aan sectie inkomsten)
+2. Zijn de ratio's realistisch? (vaste lasten < 100% inkomen, spaarquote < 100%)
+3. Klopt het saldo? (begin + netto alle secties ≈ eind)
+4. Zijn income_sources consistent met bruto_inkomen?
+5. Zijn er verdachte patronen? (bijv. enorm hoge variabele kosten, nul inkomen maar wel uitgaven)
+6. Zijn broker-terugstortingen correct behandeld? (moeten NIET bij inkomen staan)
+
+ANTWOORD in exact dit JSON formaat:
+{{
+  "status": "ok" of "issues_found",
+  "confidence": 0.0-1.0,
+  "issues": [
+    {{"severity": "error" of "warning", "beschrijving": "..."}}
+  ],
+  "samenvatting": "1 zin conclusie"
+}}
+
+Wees streng maar realistisch. Een huishouden met €150k+ inkomen en €80k vaste lasten is ongebruikelijk maar niet per se fout voor een DGA."""
+
+    try:
+        result = vraag_ai(prompt, categorizer=auditor_model)
+        data = result.get('data')
+        if data and isinstance(data, dict):
+            data['model'] = result.get('model', auditor_model)
+            return data
+        # Probeer raw te parsen
+        raw = result.get('raw', '')
+        if raw:
+            import json as _json
+            try:
+                parsed = _json.loads(raw)
+                parsed['model'] = result.get('model', auditor_model)
+                return parsed
+            except _json.JSONDecodeError:
+                pass
+        return {
+            'status': 'error',
+            'issues': [{'severity': 'warning', 'beschrijving': f'Auditor gaf geen geldig antwoord'}],
+            'model': auditor_model,
+        }
+    except Exception as e:
+        logger.error(f"AI Auditor fout: {e}")
+        return {
+            'status': 'error',
+            'issues': [{'severity': 'warning', 'beschrijving': f'Auditor fout: {str(e)[:100]}'}],
+            'model': auditor_model,
+        }
+
+
+# ---------------------------------------------------------------------------
 # STAP 4: PDF RAPPORT GENEREREN
 # ---------------------------------------------------------------------------
 
@@ -5751,16 +5858,11 @@ class RapportPDF(FPDF):
             else:
                 rek_beschrijvingen.append(f"rekening ...{iban_kort}")
 
-        # Totaal inkomsten en uitgaven
+        # Totaal inkomsten en uitgaven — uit rapport_totalen (single source of truth)
         cat_totalen = ground_truth.get('categorie_totalen_12m', {}) if ground_truth else {}
-        totaal_in = sum(
-            sum(max(float(v), 0) for v in cats.values())
-            for cats in cat_totalen.values()
-        )
-        totaal_uit = sum(
-            sum(min(float(v), 0) for v in cats.values())
-            for cats in cat_totalen.values()
-        )
+        rt = ground_truth.get('rapport_totalen', {}) if ground_truth else {}
+        totaal_in = rt.get('bruto_inkomen_12m', 0)
+        totaal_uit = -(rt.get('vaste_lasten_12m', 0) + rt.get('variabele_kosten_12m', 0))
         saldo_data = ground_truth.get('saldo', {}) if ground_truth else {}
         begin_saldo = saldo_data.get('totaal_begin', 0)
         eind_saldo = saldo_data.get('totaal_eind', 0)
@@ -5782,7 +5884,8 @@ class RapportPDF(FPDF):
 
         self.set_xy(15, y)
         samenvatting = (
-            f"In deze periode is in totaal {eur(totaal_in)} binnengekomen en {eur(abs(totaal_uit))} uitgegeven. "
+            f"Het bruto-inkomen bedroeg {eur(totaal_in)} over deze periode, "
+            f"de totale vaste lasten en variabele kosten waren {eur(abs(totaal_uit))}. "
             f"Het gecombineerde saldo veranderde van {eur(begin_saldo)} naar {eur(eind_saldo)} "
             f"({'+' if eind_saldo >= begin_saldo else ''}{eur(eind_saldo - begin_saldo)})."
         )
@@ -5828,9 +5931,8 @@ class RapportPDF(FPDF):
                 f"({eur(abs(float(top_vl[1])))} per jaar)."
             )
 
-        # 3. Woonquote
-        totaal_ink = sum(max(float(v), 0) for cats in cat_totalen.values() for v in cats.values())
-        pm_ink = totaal_ink / n_maanden if n_maanden > 0 else 1
+        # 3. Woonquote — gebruik rapport_totalen (bruto inkomen, niet alle positieve bedragen)
+        pm_ink = rt.get('bruto_inkomen_pm', 1) if rt.get('bruto_inkomen_pm', 0) > 0 else 1
         woonlasten_cats = {'Hypotheek/Huur', 'Huur/Hypotheek', 'VvE',
                            'Gemeentebelasting/OZB/Waterschapsbelasting',
                            'Gemeentelijke heffingen', 'Water', 'Energie'}
@@ -6180,9 +6282,10 @@ class RapportPDF(FPDF):
 
         # Kolom-breedtes: smaller voor portrait
         col_label = 34  # categorienaam (compact)
-        col_totaal = 13  # totaalkolom rechts
+        col_totaal = 14  # totaalkolom rechts (iets breder voor getallen)
+        col_sep = 1.0    # separator tussen maanden en totaal
         n_months = len(maanden)
-        col_month = (usable_w - col_label - col_totaal) / n_months if n_months > 0 else 12
+        col_month = (usable_w - col_label - col_totaal - col_sep) / n_months if n_months > 0 else 12
         rij_h = 3.2
 
         # Titel
@@ -6222,13 +6325,14 @@ class RapportPDF(FPDF):
             x = margin_l + col_label + i * col_month
             self.set_xy(x, y + 0.5)
             self.cell(col_month, rij_h, label, 0, 0, 'R')
-        # Totaal header
-        x_totaal = margin_l + col_label + n_months * col_month
-        self.set_fill_color(26, 26, 46)
+        # Totaal header — donkerder achtergrond met gouden tekst
+        x_totaal = margin_l + col_label + n_months * col_month + col_sep
+        self.set_fill_color(18, 18, 36)  # donkerder dan de header
+        self.rect(x_totaal - 0.5, y, col_totaal + 0.5, rij_h + 1, 'F')
         self.set_xy(x_totaal, y + 0.5)
         self.set_font(self.DATA, 'B', 4.5)
         self.set_text_color(212, 175, 55)  # GOLD text
-        self.cell(col_totaal, rij_h, 'TOTAAL', 0, 0, 'R')
+        self.cell(col_totaal - 1, rij_h, 'TOTAAL', 0, 0, 'R')
         y += rij_h + 1
 
         # --- Helper: totaal voor een rij over alle maanden ---
@@ -6245,7 +6349,7 @@ class RapportPDF(FPDF):
             return t
 
         # --- Verticale scheidingslijn voor totaalkolom ---
-        totaal_x_start = margin_l + col_label + n_months * col_month - 0.5
+        totaal_x_start = margin_l + col_label + n_months * col_month + col_sep - 0.5
 
         # --- RIJEN TEKENEN ---
         cur_sectie_key = None
@@ -6258,10 +6362,10 @@ class RapportPDF(FPDF):
             if is_total:
                 # Beginsaldo / Eindsaldo regel
                 self.set_fill_color(240, 238, 232)
-                self.rect(margin_l, y, usable_w, rij_h, 'F')
+                self.rect(margin_l, y, usable_w - col_totaal - col_sep, rij_h, 'F')
                 # Totaalkolom donkerder achtergrond
-                self.set_fill_color(228, 224, 216)
-                self.rect(totaal_x_start + 0.5, y, col_totaal + 1, rij_h, 'F')
+                self.set_fill_color(225, 220, 210)
+                self.rect(totaal_x_start, y, col_totaal + 1, rij_h, 'F')
                 self.set_font(self.DATA, 'B', 4.5)
                 self.set_text_color(26, 26, 46)
                 self.set_xy(margin_l + 1, y + 0.3)
@@ -6285,7 +6389,7 @@ class RapportPDF(FPDF):
                 self.set_xy(x_totaal, y + 0.3)
                 self.set_font(self.DATA, 'B', 4.5)
                 self.set_text_color(26, 26, 46)
-                self.cell(col_totaal, rij_h, _eur_k(tot_val), 0, 0, 'R')
+                self.cell(col_totaal - 1, rij_h, _eur_k(tot_val), 0, 0, 'R')
                 y += rij_h + 0.5
 
             elif is_header:
@@ -6309,10 +6413,13 @@ class RapportPDF(FPDF):
                     self.set_xy(x, y + 0.3)
                     self.cell(col_month, rij_h, _eur_k(totaal), 0, 0, 'R')
 
-                # Totaalkolom voor sectie
+                # Totaalkolom voor sectie — zelfde kleur als header
+                self.set_fill_color(*kleur)
+                self.rect(totaal_x_start, y, col_totaal + 1, rij_h, 'F')
                 self.set_xy(x_totaal, y + 0.3)
                 self.set_font(self.DATA, 'B', 4.5)
-                self.cell(col_totaal, rij_h, _eur_k(sectie_jaar_totaal), 0, 0, 'R')
+                self.set_text_color(255, 255, 255)
+                self.cell(col_totaal - 1, rij_h, _eur_k(sectie_jaar_totaal), 0, 0, 'R')
                 y += rij_h
                 row_idx = 0
 
@@ -6322,9 +6429,8 @@ class RapportPDF(FPDF):
                     self.set_fill_color(250, 249, 246)
                     self.rect(margin_l, y, usable_w, rij_h, 'F')
                 # Totaalkolom licht accent
-                if row_idx % 2 == 0:
-                    self.set_fill_color(245, 243, 238)
-                    self.rect(totaal_x_start + 0.5, y, col_totaal + 1, rij_h, 'F')
+                self.set_fill_color(242, 240, 234) if row_idx % 2 == 0 else self.set_fill_color(248, 246, 242)
+                self.rect(totaal_x_start, y, col_totaal + 1, rij_h, 'F')
 
                 # Dunne lijn
                 self.set_draw_color(235, 233, 228)
@@ -6352,7 +6458,7 @@ class RapportPDF(FPDF):
                         self.set_text_color(180, 180, 180)
                     self.cell(col_month, rij_h, _eur_k(val), 0, 0, 'R')
 
-                # Totaalkolom
+                # Totaalkolom — consistente positie
                 self.set_xy(x_totaal, y + 0.3)
                 self.set_font(self.DATA, 'B', 4)
                 if cat_jaar_totaal > 0:
@@ -6361,7 +6467,7 @@ class RapportPDF(FPDF):
                     self.set_text_color(60, 60, 80)
                 else:
                     self.set_text_color(180, 180, 180)
-                self.cell(col_totaal, rij_h, _eur_k(cat_jaar_totaal), 0, 0, 'R')
+                self.cell(col_totaal - 1, rij_h, _eur_k(cat_jaar_totaal), 0, 0, 'R')
 
                 y += rij_h
                 row_idx += 1
@@ -7309,6 +7415,46 @@ def _bouw_ground_truth(merged_data: dict, feiten: dict, rapportperiode: dict,
                 'vertrouwen': 'hoog' if gem >= 0.80 else ('medium' if gem >= 0.50 else 'laag'),
             }
 
+    # =========================================================================
+    # rapport_totalen: SINGLE SOURCE OF TRUTH voor alle pagina's
+    # =========================================================================
+    # Bruto inkomen = ALLEEN sectie "inkomsten" (salaris, DGA-loon, huur, etc.)
+    # Broker-terugstortingen, refunds, spaarrekening-mutaties zijn GEEN inkomen.
+    # Die vallen onder sparen_beleggen of variabele_kosten (terugbetaling).
+    inkomsten_12m = round(sectie_totalen_12m.get('inkomsten', 0), 2)
+    vaste_lasten_12m = round(abs(sectie_totalen_12m.get('vaste_lasten', 0)), 2)
+    variabele_kosten_12m = round(abs(sectie_totalen_12m.get('variabele_kosten', 0)), 2)
+    sparen_beleggen_12m = round(sectie_totalen_12m.get('sparen_beleggen', 0), 2)
+    onderling_neutraal_12m = round(sectie_totalen_12m.get('onderling_neutraal', 0), 2)
+
+    # Netto beschikbaar = inkomen - vaste lasten - variabele kosten
+    netto_beschikbaar_12m = round(inkomsten_12m - vaste_lasten_12m - variabele_kosten_12m, 2)
+
+    # Totaal positief/negatief over ALLE secties (voor saldoverloop, niet "inkomen")
+    totaal_positief_12m = round(sum(
+        sum(max(float(v), 0) for v in cats.values())
+        for cats in combined_jaar.values()
+    ), 2)
+    totaal_negatief_12m = round(sum(
+        sum(min(float(v), 0) for v in cats.values())
+        for cats in combined_jaar.values()
+    ), 2)
+
+    rapport_totalen = {
+        'bruto_inkomen_12m': inkomsten_12m,
+        'bruto_inkomen_pm': round(inkomsten_12m / n_mnd, 2) if n_mnd > 0 else 0,
+        'vaste_lasten_12m': vaste_lasten_12m,
+        'vaste_lasten_pm': round(vaste_lasten_12m / n_mnd, 2) if n_mnd > 0 else 0,
+        'variabele_kosten_12m': variabele_kosten_12m,
+        'variabele_kosten_pm': round(variabele_kosten_12m / n_mnd, 2) if n_mnd > 0 else 0,
+        'sparen_beleggen_12m': sparen_beleggen_12m,  # negatief = netto storting
+        'netto_beschikbaar_12m': netto_beschikbaar_12m,
+        'netto_beschikbaar_pm': round(netto_beschikbaar_12m / n_mnd, 2) if n_mnd > 0 else 0,
+        # Totaal geldstromen (voor saldoverloop, NIET "inkomen" noemen!)
+        'totaal_positief_12m': totaal_positief_12m,
+        'totaal_negatief_12m': totaal_negatief_12m,
+    }
+
     ground_truth = {
         'versie': 'V3',
         'periode': {
@@ -7322,6 +7468,7 @@ def _bouw_ground_truth(merged_data: dict, feiten: dict, rapportperiode: dict,
             'totaal_eind': round(totaal_eind, 2),
             'per_rekening': saldo_per_rekening,
         },
+        'rapport_totalen': rapport_totalen,
         'sectie_totalen_12m': sectie_totalen_12m,
         'sectie_gemiddelden_pm': {
             s: round(t / n_mnd, 2) for s, t in sectie_totalen_12m.items()
@@ -7340,8 +7487,92 @@ def _bouw_ground_truth(merged_data: dict, feiten: dict, rapportperiode: dict,
     for sectie, totaal in sectie_totalen_12m.items():
         logger.info(f"  {sectie}: EUR {totaal:,.2f}")
     logger.info(f"  Saldo: begin EUR {totaal_begin:,.2f} → eind EUR {totaal_eind:,.2f}")
+    logger.info(f"  rapport_totalen: inkomen={rapport_totalen['bruto_inkomen_12m']:,.2f}, "
+                f"vaste_lasten={rapport_totalen['vaste_lasten_12m']:,.2f}, "
+                f"variabel={rapport_totalen['variabele_kosten_12m']:,.2f}")
 
     return ground_truth
+
+
+def _valideer_ground_truth(ground_truth: dict) -> list:
+    """Deterministische cross-checks op ground_truth.
+
+    Draait NA ground_truth opbouw, VOOR PDF generatie.
+    Retourneert lijst met (severity, message) tuples.
+    severity = 'ERROR' (blokkeer) of 'WARNING' (disclaimer).
+    Auto-repareert waar mogelijk.
+    """
+    issues = []
+    rt = ground_truth.get('rapport_totalen', {})
+    st = ground_truth.get('sectie_totalen_12m', {})
+    ct = ground_truth.get('categorie_totalen_12m', {})
+    mst = ground_truth.get('maand_sectie_totalen', {})
+    saldo = ground_truth.get('saldo', {})
+    n_mnd = ground_truth.get('periode', {}).get('n_mnd', 12)
+
+    # CHECK 1: rapport_totalen.bruto_inkomen == sectie_totalen_12m.inkomsten
+    bruto = rt.get('bruto_inkomen_12m', 0)
+    sectie_ink = st.get('inkomsten', 0)
+    if abs(bruto - sectie_ink) > 1:
+        issues.append(('ERROR', f"rapport_totalen.bruto_inkomen ({bruto:,.2f}) ≠ "
+                       f"sectie_totalen.inkomsten ({sectie_ink:,.2f})"))
+
+    # CHECK 2: Per sectie: sum(categorieën) == sectie_totaal
+    for sectie in ['inkomsten', 'vaste_lasten', 'variabele_kosten', 'sparen_beleggen']:
+        cat_sum = sum(float(v) for v in ct.get(sectie, {}).values())
+        sectie_tot = st.get(sectie, 0)
+        if abs(cat_sum - sectie_tot) > 1:
+            issues.append(('WARNING', f"Sectie '{sectie}': cat_sum ({cat_sum:,.2f}) ≠ "
+                           f"sectie_totaal ({sectie_tot:,.2f}), delta={cat_sum - sectie_tot:,.2f}"))
+
+    # CHECK 3: Sum(maand_sectie_totalen per sectie) == sectie_totalen_12m
+    for sectie in ['inkomsten', 'vaste_lasten', 'variabele_kosten', 'sparen_beleggen']:
+        maand_sum = sum(
+            float(mdata.get(sectie, 0))
+            for mdata in mst.values()
+        )
+        sectie_tot = st.get(sectie, 0)
+        if abs(maand_sum - sectie_tot) > 1:
+            issues.append(('WARNING', f"SOM maanden '{sectie}' ({maand_sum:,.2f}) ≠ "
+                           f"sectie_totaal ({sectie_tot:,.2f})"))
+
+    # CHECK 4: Saldo-kloppendheid: begin + sum(alle netto) ≈ eind
+    totaal_begin = saldo.get('totaal_begin', 0)
+    totaal_eind = saldo.get('totaal_eind', 0)
+    som_netto = sum(st.get(s, 0) for s in st)
+    verwacht_eind = totaal_begin + som_netto
+    delta_saldo = abs(verwacht_eind - totaal_eind)
+    if delta_saldo > 50:  # €50 tolerantie voor afrondingen
+        issues.append(('WARNING', f"Saldo check: begin ({totaal_begin:,.2f}) + netto ({som_netto:,.2f}) "
+                       f"= {verwacht_eind:,.2f}, maar eind = {totaal_eind:,.2f} (delta {delta_saldo:,.2f})"))
+
+    # CHECK 5: Ratio's realistisch
+    if bruto > 0:
+        wl = rt.get('vaste_lasten_12m', 0)
+        woonquote = wl / bruto * 100
+        if woonquote > 150:
+            issues.append(('ERROR', f"Vaste lasten > 150% van inkomen ({woonquote:.1f}%) — "
+                           "waarschijnlijk classificatiefout"))
+    elif bruto == 0 and abs(st.get('vaste_lasten', 0)) > 1000:
+        issues.append(('ERROR', "Geen inkomen gedetecteerd maar wel vaste lasten — "
+                       "classificatiefout in inkomsten"))
+
+    # CHECK 6: income_sources som ≈ bruto inkomen
+    income_sources = ground_truth.get('income_sources', {})
+    if income_sources and bruto > 0:
+        src_sum = sum(abs(d.get('bedrag_12m', 0)) for d in income_sources.values())
+        if abs(src_sum - bruto) > bruto * 0.10:  # >10% verschil
+            issues.append(('WARNING', f"income_sources som ({src_sum:,.2f}) wijkt >10% af "
+                           f"van bruto inkomen ({bruto:,.2f})"))
+
+    # CHECK 7: Geen negatief bruto inkomen
+    if bruto < 0:
+        issues.append(('ERROR', f"Negatief bruto inkomen ({bruto:,.2f}) — classificatiefout"))
+
+    for severity, msg in issues:
+        logger.warning(f"GROUND TRUTH {severity}: {msg}")
+
+    return issues
 
 
 # ---------------------------------------------------------------------------
@@ -7832,11 +8063,14 @@ def _bouw_audit_package(ground_truth: dict, gate_result: dict, kwaliteit: dict,
     }
 
 
-def _run_rapport_pipeline(job_id: str, bestanden: list, email: str, ai_categorizer: str = 'claude_opus_47'):
+def _run_rapport_pipeline(job_id: str, bestanden: list, email: str,
+                          ai_categorizer: str = 'claude_opus_47',
+                          ai_auditor: str = 'none'):
     """Achtergrond-thread: volledige pipeline upload → analyse → PDF → email.
 
     bestanden: list van (inhoud_bytes, bestandsnaam) tuples.
     ai_categorizer: welk AI-model voor classificatie (key uit _AI_CATEGORIZERS).
+    ai_auditor: welk AI-model voor sanity check ('none' = overslaan).
     Schrijft voortgang naar jobs[job_id] zodat de status-endpoint het kan serveren.
     Draait NIET in een HTTP-request — dus geen proxy timeout meer.
     """
@@ -8002,6 +8236,40 @@ def _run_rapport_pipeline(job_id: str, bestanden: list, email: str, ai_categoriz
         )
         logger.info(f"[{job_id}] Ground truth V3 gebouwd: {len(ground_truth['periode']['volle_maanden'])} volle maanden")
 
+        # 4a1. Deterministische cross-checks op ground truth
+        update('Cross-checks uitvoeren op ground truth...', 72)
+        gt_issues = _valideer_ground_truth(ground_truth)
+        gt_errors = [msg for sev, msg in gt_issues if sev == 'ERROR']
+        gt_warnings = [msg for sev, msg in gt_issues if sev == 'WARNING']
+        if gt_errors:
+            logger.error(f"[{job_id}] Ground truth ERRORS: {gt_errors}")
+            # Niet direct blokkeren maar meenemen naar no-send gate
+        if gt_warnings:
+            logger.warning(f"[{job_id}] Ground truth WARNINGS: {gt_warnings}")
+        ground_truth['_cross_check_issues'] = gt_issues
+        update(f'Cross-checks: {len(gt_errors)} errors, {len(gt_warnings)} warnings', 73)
+
+        # 4a1b. AI Auditor — onafhankelijke sanity check (optioneel)
+        if ai_auditor and ai_auditor != 'none':
+            auditor_info = _AUDITOR_MODELS.get(ai_auditor, ('openai', 'gpt-5.4'))
+            update(f'AI Auditor ({auditor_info[1] or ai_auditor}) controleert rapport...', 74)
+            auditor_result = _ai_auditor(ground_truth, auditor_model=ai_auditor)
+            ground_truth['_auditor_result'] = auditor_result
+            a_status = auditor_result.get('status', 'unknown')
+            a_issues = auditor_result.get('issues', [])
+            if a_status == 'issues_found':
+                a_errors = [i for i in a_issues if i.get('severity') == 'error']
+                a_warns = [i for i in a_issues if i.get('severity') == 'warning']
+                update(f'AI Auditor: {len(a_errors)} errors, {len(a_warns)} warnings', 74)
+                for iss in a_issues:
+                    logger.warning(f"[{job_id}] AUDITOR {iss.get('severity', '?')}: {iss.get('beschrijving', '')}")
+            else:
+                update(f'AI Auditor: {a_status}', 74)
+                logger.info(f"[{job_id}] Auditor status={a_status}, samenvatting={auditor_result.get('samenvatting', '')}")
+        else:
+            ground_truth['_auditor_result'] = {'status': 'skipped', 'issues': []}
+            logger.info(f"[{job_id}] AI Auditor overgeslagen (ai_auditor={ai_auditor})")
+
         # 4a2. Strategische inzichten genereren
         update('Strategische inzichten berekenen...', 73)
         strategische_inzichten = _genereer_strategische_inzichten(ground_truth, df)
@@ -8130,7 +8398,8 @@ def _run_rapport_pipeline(job_id: str, bestanden: list, email: str, ai_categoriz
 
 @app.post("/rapport")
 async def rapport(bestanden: Optional[List[UploadFile]] = None, bestand: Optional[UploadFile] = None,
-                  email: str = Form(...), ai_categorizer: str = Form('claude_opus_47')):
+                  email: str = Form(...), ai_categorizer: str = Form('claude_opus_47'),
+                  ai_auditor: str = Form('none')):
     """Start de rapport-pipeline als achtergrond-job.
 
     Accepteert één of meerdere bestanden:
@@ -8143,7 +8412,7 @@ async def rapport(bestanden: Optional[List[UploadFile]] = None, bestand: Optiona
     Client pollt /rapport/{job_id}/status voor voortgang.
     """
     job_id = str(uuid.uuid4())[:8]
-    logger.info(f"[{job_id}] Rapport aangevraagd voor {email}, categorizer={ai_categorizer}")
+    logger.info(f"[{job_id}] Rapport aangevraagd voor {email}, categorizer={ai_categorizer}, auditor={ai_auditor}")
 
     # Verzamel alle bestanden (support zowel 'bestanden' als 'bestand' veld)
     uploads = []
@@ -8191,7 +8460,7 @@ async def rapport(bestanden: Optional[List[UploadFile]] = None, bestand: Optiona
     # Start achtergrond-thread
     thread = threading.Thread(
         target=_run_rapport_pipeline,
-        args=(job_id, bestanden_data, email, ai_categorizer),
+        args=(job_id, bestanden_data, email, ai_categorizer, ai_auditor),
         daemon=True,
     )
     thread.start()
@@ -8200,6 +8469,7 @@ async def rapport(bestanden: Optional[List[UploadFile]] = None, bestand: Optiona
         'job_id': job_id,
         'status': 'gestart',
         'categorizer': ai_categorizer,
+        'auditor': ai_auditor,
     }
 
 

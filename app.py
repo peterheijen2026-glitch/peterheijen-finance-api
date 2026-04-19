@@ -2135,6 +2135,57 @@ except ImportError:
     logger.warning("merchant_registry.py niet gevonden, alleen basis MERCHANT_MAPPING actief")
 
 
+# ---------------------------------------------------------------------------
+# Belastingdienst aanslagnummer letter-code detectie
+# Structuur: [BSN 9 cijfers].[Letter(s)].[Periode].[Status]
+# De letter(s) na het BSN bepalen het type belasting.
+# ---------------------------------------------------------------------------
+import re as _re
+
+_AANSLAGNUMMER_LETTER_MAP = {
+    'H': 'Inkomstenbelasting/Voorlopige aanslag',
+    'V': 'Vennootschapsbelasting (VPB)',
+    'B': 'BTW/Omzetbelasting',
+    'F': 'BTW/Omzetbelasting',           # Naheffingsaanslag OB
+    'O': 'BTW/Omzetbelasting',           # Teruggave OB
+    'L': 'Loonheffing',
+    'A': 'Loonheffing',                  # Naheffingsaanslag LH
+    'J': 'Loonheffing',                  # Teruggave LH
+    'W': 'ZVW-premie',
+    'M': 'Motorrijtuigenbelasting (MRB)',
+    'Y': 'Motorrijtuigenbelasting (MRB)', # Naheffingsaanslag MRB
+    'Z': 'Overige belastingen',
+}
+
+# Toeslagen: T1=kinderopvang, T2=huurtoeslag, T3=zorgtoeslag
+_TOESLAG_MAP = {
+    'T1': 'Toeslagen',
+    'T2': 'Toeslagen',
+    'T3': 'Toeslagen',
+}
+
+# Regex: 9 cijfers gevolgd door een of meer letters (optioneel met punt ervoor)
+# Voorbeelden: 123456789H40, 123456789.H.40.1, 123456789V20
+_AANSLAG_RE = _re.compile(r'\b(\d{9})\.?([A-Z][A-Z0-9]?)\.?\d')
+
+def _detecteer_belastingtype_uit_kenmerk(omschrijving: str) -> str | None:
+    """Extract belastingtype uit aanslagnummer betalingskenmerk in bankomschrijving.
+
+    Returns categorie-string of None als geen kenmerk gevonden.
+    """
+    m = _AANSLAG_RE.search(omschrijving)
+    if m:
+        letter_code = m.group(2)
+        # Check eerst toeslagen (T1, T2, T3)
+        if letter_code in _TOESLAG_MAP:
+            return _TOESLAG_MAP[letter_code]
+        # Dan enkelvoudige letter
+        first_letter = letter_code[0]
+        if first_letter in _AANSLAGNUMMER_LETTER_MAP:
+            return _AANSLAGNUMMER_LETTER_MAP[first_letter]
+    return None
+
+
 def _classificeer_rule_based(df: pd.DataFrame) -> pd.DataFrame:
     """Classificeer transacties op basis van harde regels VOORDAT de AI eraan te pas komt.
 
@@ -2161,27 +2212,53 @@ def _classificeer_rule_based(df: pd.DataFrame) -> pd.DataFrame:
         omschr = str(row.get('Omschrijving', '')).upper()
         bedrag = float(row.get('bedrag', 0))
 
-        # Speciaal geval: Belastingdienst
+        # Speciaal geval: Belastingdienst — uitsplitsing per belastingtype
         if 'BELASTINGDIENST' in omschr or 'BELASTING DIENST' in omschr:
-            if bedrag > 0:
+            # Stap 1: probeer belastingtype uit aanslagnummer kenmerk
+            kenmerk_type = _detecteer_belastingtype_uit_kenmerk(omschr)
+
+            # Stap 2: fallback op tekst-keywords als geen kenmerk gevonden
+            if kenmerk_type is None:
+                if 'IB' in omschr or 'INKOMSTENBELASTING' in omschr or 'INKOMSTENBEL' in omschr or 'VOORLOPIGE AANSLAG' in omschr:
+                    kenmerk_type = 'Inkomstenbelasting/Voorlopige aanslag'
+                elif 'VPB' in omschr or 'VENNOOTSCHAPSBELASTING' in omschr:
+                    kenmerk_type = 'Vennootschapsbelasting (VPB)'
+                elif 'OB' in omschr or 'OMZETBELASTING' in omschr or 'BTW' in omschr:
+                    kenmerk_type = 'BTW/Omzetbelasting'
+                elif 'LH' in omschr or 'LOONHEFFING' in omschr or 'LOONBELASTING' in omschr:
+                    kenmerk_type = 'Loonheffing'
+                elif 'ZVW' in omschr or 'ZORGVERZEKERINGSWET' in omschr:
+                    kenmerk_type = 'ZVW-premie'
+                elif 'MRB' in omschr or 'MOTORRIJTUIGEN' in omschr:
+                    kenmerk_type = 'Motorrijtuigenbelasting (MRB)'
+                elif 'TOESLAG' in omschr or 'ZORGTOESLAG' in omschr or 'HUURTOESLAG' in omschr:
+                    kenmerk_type = 'Toeslagen'
+
+            # Stap 3: bepaal sectie + categorie
+            if kenmerk_type == 'Toeslagen':
+                # Toeslagen zijn altijd inkomsten
                 df.at[idx, 'regel_sectie'] = 'inkomsten'
-                df.at[idx, 'regel_categorie'] = 'Belastingteruggave'
+                df.at[idx, 'regel_categorie'] = 'Toeslagen'
+                df.at[idx, 'regel_confidence'] = 0.95
+                df.at[idx, 'source_family'] = 'child_benefit'
+            elif bedrag > 0:
+                # Teruggave: specificeer welk type teruggave
+                df.at[idx, 'regel_sectie'] = 'inkomsten'
+                if kenmerk_type:
+                    df.at[idx, 'regel_categorie'] = f'Belastingteruggave ({kenmerk_type})'
+                else:
+                    df.at[idx, 'regel_categorie'] = 'Belastingteruggave'
                 df.at[idx, 'regel_confidence'] = 0.95
                 df.at[idx, 'source_family'] = 'tax_refund'
             else:
-                # Probeer type belasting te herkennen
-                if 'IB' in omschr or 'INKOMSTENBELASTING' in omschr or 'INKOMSTENBEL' in omschr:
-                    df.at[idx, 'regel_categorie'] = 'Inkomstenbelasting/Voorlopige aanslag'
-                elif 'OB' in omschr or 'OMZETBELASTING' in omschr or 'BTW' in omschr:
-                    df.at[idx, 'regel_categorie'] = 'BTW/Omzetbelasting'
-                elif 'ZVW' in omschr or 'ZORGVERZEKERINGSWET' in omschr:
-                    df.at[idx, 'regel_categorie'] = 'Zorgverzekering'
-                elif 'MRB' in omschr or 'MOTORRIJTUIGEN' in omschr:
-                    df.at[idx, 'regel_categorie'] = 'Overige belastingen'
+                # Betaling: gebruik gevonden type of default
+                if kenmerk_type:
+                    df.at[idx, 'regel_categorie'] = kenmerk_type
+                    df.at[idx, 'regel_confidence'] = 0.95  # kenmerk-based = hoge confidence
                 else:
-                    df.at[idx, 'regel_categorie'] = 'Inkomstenbelasting/Voorlopige aanslag'
+                    df.at[idx, 'regel_categorie'] = 'Overige belastingen'  # NIET meer default naar IB
+                    df.at[idx, 'regel_confidence'] = 0.70  # lagere confidence want onbekend type
                 df.at[idx, 'regel_sectie'] = 'vaste_lasten'
-                df.at[idx, 'regel_confidence'] = 0.90
             df.at[idx, 'classificatie_bron'] = 'rule'
             n_geclassificeerd += 1
             continue
@@ -3370,7 +3447,9 @@ def _classify_positive_inflows(df: pd.DataFrame, eigen_fi_ibans: set = None,
         # A1: OVERHEID (keyword of party_type=government)
         elif pt == 'government' or any(kw in tekst for kw in OVERHEID_KEYWORDS):
             if 'BELASTINGDIENST' in tekst or 'BELASTING DIENST' in tekst:
-                cat = 'Belastingteruggave'
+                # Probeer specifiek belastingtype uit aanslagnummer
+                _bt = _detecteer_belastingtype_uit_kenmerk(tekst)
+                cat = f'Belastingteruggave ({_bt})' if _bt and _bt != 'Toeslagen' else 'Belastingteruggave'
             elif 'UWV' in tekst:
                 cat = 'UWV/Uitkeringen'
             elif 'SVB' in tekst or 'KINDERBIJSLAG' in tekst:
@@ -4320,7 +4399,7 @@ Omschrijving is vaak "Tegenpartij — Kenmerk" (bv "Sevi B.V. — 2025 12 Sevi")
 - DGA-loon/Managementfee (vanuit eigen BV met "Holding"/"Management" in naam)
 - Huurinkomsten
 - Toeslagen (zorgtoeslag, huurtoeslag, kindgebonden budget)
-- Belastingteruggave
+- Belastingteruggave (specificeer type als bekend: IB, VPB, BTW, LH, ZVW, MRB)
 - Kinderbijslag/Kindregelingen
 - Freelance/Opdrachten
 - Verzekeringsuitkering
@@ -4334,8 +4413,12 @@ Omschrijving is vaak "Tegenpartij — Kenmerk" (bv "Sevi B.V. — 2025 12 Sevi")
 - Gemeentebelasting/OZB/Waterschapsbelasting
 - Zorgverzekering (basis + aanvullend)
 - Inkomstenbelasting/Voorlopige aanslag
+- Vennootschapsbelasting (VPB)
 - BTW/Omzetbelasting
-- Overige belastingen (erfbelasting, schenkbelasting, MRB)
+- Loonheffing
+- ZVW-premie
+- Motorrijtuigenbelasting (MRB)
+- Overige belastingen (erfbelasting, schenkbelasting)
 - Autoverzekering
 - Woonverzekering/Inboedel
 - Overige verzekeringen (reis, aansprakelijkheid, uitvaart)
@@ -4403,14 +4486,19 @@ Omschrijving is vaak "Tegenpartij — Kenmerk" (bv "Sevi B.V. — 2025 12 Sevi")
 
 ## HERKENNINGSREGELS
 
-### Belastingdienst (bepaal type op betalingskenmerk)
-- "IB"/"Inkomstenbelasting"/"voorlopige aanslag IB" = Inkomstenbelasting/Voorlopige aanslag
-- "OB"/"Omzetbelasting"/"BTW" = BTW/Omzetbelasting
-- "MRB"/"Motorrijtuigenbelasting" = Overige belastingen
-- "ZVW"/"Zorgverzekeringswet" = Zorgverzekering
-- "Toeslagen"/"zorgtoeslag"/"huurtoeslag" = Toeslagen (INKOMSTEN)
-- "WOZ"/"OZB"/"waterschapsbelasting" = Gemeentebelasting/OZB/Waterschapsbelasting
-- Belastingdienst met POSITIEF bedrag = Belastingteruggave (INKOMSTEN)
+### Belastingdienst (bepaal type op aanslagnummer betalingskenmerk)
+Let op het aanslagnummer in de omschrijving (9 cijfers + lettercode):
+- Letter H = Inkomstenbelasting/Voorlopige aanslag
+- Letter V = Vennootschapsbelasting (VPB)
+- Letter B/F/O = BTW/Omzetbelasting
+- Letter L/A/J = Loonheffing
+- Letter W = ZVW-premie
+- Letter M/Y = Motorrijtuigenbelasting (MRB)
+- Letter T1/T2/T3 = Toeslagen (INKOMSTEN, niet vaste lasten!)
+- Letter Z = Overige belastingen
+Fallback op tekst: "IB" = Inkomstenbelasting, "VPB" = Vennootschapsbelasting, "OB"/"BTW" = BTW/Omzetbelasting, "LH" = Loonheffing, "ZVW" = ZVW-premie, "MRB" = Motorrijtuigenbelasting
+- "WOZ"/"OZB"/"waterschapsbelasting" = Gemeentebelasting/OZB/Waterschapsbelasting (GEEN Belastingdienst)
+- Belastingdienst met POSITIEF bedrag = Belastingteruggave (specificeer type als bekend)
 
 ### Nederlandse bedrijven (categorie-lookup)
 - Albert Heijn/Jumbo/Lidl/Plus/Dirk = Boodschappen/Supermarkt
@@ -5774,7 +5862,12 @@ class RapportPDF(FPDF):
             bevindingen.append(f"Het vermogen is in {n_maanden} maanden afgenomen met {eur(abs(delta))}.")
 
         # 7. Belastingdruk
-        belasting_cats = {'Inkomstenbelasting/Voorlopige aanslag', 'Inkomstenbelasting'}
+        belasting_cats = {
+            'Inkomstenbelasting/Voorlopige aanslag', 'Inkomstenbelasting',
+            'Vennootschapsbelasting (VPB)', 'BTW/Omzetbelasting',
+            'Loonheffing', 'ZVW-premie', 'Motorrijtuigenbelasting (MRB)',
+            'Overige belastingen',
+        }
         pm_belasting = sum(abs(float(vl.get(c, 0))) for c in belasting_cats) / n_maanden
         belasting_pct = round(pm_belasting / pm_ink * 100, 1) if pm_ink > 0 else 0
         bevindingen.append(f"De belastingdruk bedraagt {eur(pm_belasting)}/mnd ({belasting_pct}% van het inkomen).")
